@@ -29,6 +29,7 @@ chmod +x "$BINARY"
 mkdir -p "$PKG_DIR/data/data/com.termux/files/usr/bin"
 cp "$BINARY" "$PKG_DIR/data/data/com.termux/files/usr/bin/opencode"
 chmod +x "$PKG_DIR/data/data/com.termux/files/usr/bin/opencode"
+mkdir -p "$PKG_DIR/DEBIAN"
 cp -a "$SCRIPT_DIR/DEBIAN/control" "$PKG_DIR/DEBIAN/control"
 
 mkdir -p "$OUT_DIR"
