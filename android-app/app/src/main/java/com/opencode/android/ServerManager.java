@@ -246,6 +246,25 @@ public class ServerManager {
         return f.delete();
     }
 
+    /** 写默认 opencode.jsonc 配置文件 (指定免费模型, 用户可在 Web UI 中改) */
+    private void writeDefaultConfig(File cfgDir) throws IOException {
+        File configFile = new File(cfgDir, "opencode/opencode.jsonc");
+        configFile.getParentFile().mkdirs();
+        if (configFile.exists()) {
+            Log.i(TAG, "config already exists, skipping default config");
+            return;
+        }
+        // 默认使用 opencode Zen 免费模型 (api.z.ai, 国内可直连, 无需 API Key)
+        // 用户可在 Web UI 设置中添加其他 provider
+        String config = "{\n" +
+            "  \"model\": \"opencode-zen/deepseek-v4-flash-free\"\n" +
+            "}\n";
+        try (OutputStream out = new FileOutputStream(configFile)) {
+            out.write(config.getBytes(StandardCharsets.UTF_8));
+        }
+        Log.i(TAG, "default config written: " + configFile.getAbsolutePath());
+    }
+
     /** 写 resolv.conf 到 patch 后的路径 (musl 从那里读 nameserver) */
     private void writeResolvConf() {
         File f = new File(dataRoot(), "resolv.conf");
@@ -335,6 +354,9 @@ public class ServerManager {
         cache.mkdirs();
         tmp.mkdirs();
         logFile = new File(root, "server.log");
+
+        // 写入默认 opencode 配置 (指定免费模型, 用户可在 Web UI 中改)
+        writeDefaultConfig(cfg);
 
         // 清理上次残留的 server 进程 (APP 被系统杀时子进程会成孤儿继续占端口)
         killStaleServer(root);
