@@ -37,13 +37,14 @@ jobs:
           cd android-app
           ./gradlew assembleDebug --no-daemon
 
-      - name: Upload APK (artifact)
+      - name: Upload APK (Actions Artifact)
         uses: actions/upload-artifact@v4
         with:
           name: opencode-android.apk
           path: android-app/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
 
-      - name: Publish GitHub Release (tag only)
+      - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
