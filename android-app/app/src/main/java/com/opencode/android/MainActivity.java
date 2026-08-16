@@ -151,10 +151,10 @@ public class MainActivity extends Activity {
             return;
         }
         embeddedMode = true;
-        statusView.setText("正在启动内置 OpenCode 服务器...\n(首次启动需解压二进制, 请稍候)");
+        statusView.setText("正在启动内置 OpenCode 服务器...\n(首次启动需解压 192MB 二进制, 请耐心等待 1~2 分钟)");
         embedded.start((ok, msg) -> {
             if (ok) {
-                pollHealth(30);
+                pollHealth(120);
             } else {
                 statusView.setText("内置服务器启动失败\n" + msg + "\n\n" +
                         "日志:\n" + embedded.getLogTail(1500) + "\n\n点击重试");
@@ -162,10 +162,11 @@ public class MainActivity extends Activity {
         });
     }
 
-    /** 每 1s ping 一次内置 server, 最多 seconds 秒 */
+    /** 每 1s ping 一次内置 server, 最多 seconds 秒 (首次启动含解压+加载 192MB 二进制, 放宽到 2 分钟) */
     private void pollHealth(final int seconds) {
         if (!polling.compareAndSet(false, true)) return;
-        statusView.setText("内置服务器启动中... " + embedded.serverUrl());
+        statusView.setText("内置服务器启动中... " + embedded.serverUrl() +
+                "\n(首次启动请耐心等待, 正在解压并加载 192MB 二进制)");
         final int[] waited = {0};
         handler.post(new Runnable() {
             @Override
@@ -202,7 +203,7 @@ public class MainActivity extends Activity {
             if (embeddedMode) {
                 if (embedded.isStarting()) {
                     // 正在启动中, 不要打断, 重新等一轮
-                    pollHealth(30);
+                    pollHealth(120);
                 } else {
                     embedded.stop();
                     embeddedConnect();

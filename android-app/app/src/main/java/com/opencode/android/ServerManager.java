@@ -179,10 +179,12 @@ public class ServerManager {
         File cfg = new File(root, "config");
         File data = new File(root, "data");
         File cache = new File(root, "cache");
+        File tmp = new File(root, "tmp");
         home.mkdirs();
         cfg.mkdirs();
         data.mkdirs();
         cache.mkdirs();
+        tmp.mkdirs();
         logFile = new File(root, "server.log");
 
         ProcessBuilder pb = new ProcessBuilder(
@@ -196,6 +198,7 @@ public class ServerManager {
         pb.environment().put("XDG_CONFIG_HOME", cfg.getAbsolutePath());
         pb.environment().put("XDG_DATA_HOME", data.getAbsolutePath());
         pb.environment().put("XDG_CACHE_HOME", cache.getAbsolutePath());
+        pb.environment().put("TMPDIR", tmp.getAbsolutePath());
         pb.environment().put("TERM", "xterm-256color");
 
         process = pb.start();
