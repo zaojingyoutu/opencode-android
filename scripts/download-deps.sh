@@ -2,7 +2,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OUT_DIR="$(cd "$(dirname "$0")/../deps" && pwd)"
+OUT_DIR="$(cd "$(dirname "$0")/.." && pwd)/deps"
 mkdir -p "$OUT_DIR"
 
 LATEST_API="https://api.github.com/repos/anomalyco/opencode/releases/latest"
