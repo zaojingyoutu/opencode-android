@@ -5,7 +5,7 @@ set -euo pipefail
 OUT_DIR="$(cd "$(dirname "$0")/../deps" && pwd)"
 mkdir -p "$OUT_DIR"
 
-LATEST_API="https://api.github.com/repos/sst/opencode/releases/latest"
+LATEST_API="https://api.github.com/repos/anomalyco/opencode/releases/latest"
 echo "Fetching latest release info..."
 RELEASE_JSON=$(curl -sL "$LATEST_API" -H "Accept: application/vnd.github+json")
 TAG=$(echo "$RELEASE_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])" 2>/dev/null)

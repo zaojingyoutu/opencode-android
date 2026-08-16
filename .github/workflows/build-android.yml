@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-android:
+  build-apk:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,16 +17,22 @@ jobs:
           java-version: 17
           distribution: temurin
 
-      - name: Grant execute permission
-        run: chmod +x android-app/gradlew
-        if: hashFiles('android-app/gradlew') != ''
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Download Gradle wrapper
+        run: |
+          mkdir -p android-app/gradle/wrapper
+          curl -sL --max-time 30 \
+            -o android-app/gradle/wrapper/gradle-wrapper.jar \
+            "https://raw.githubusercontent.com/gradle/gradle/v8.7.0/gradle/wrapper/gradle-wrapper.jar"
+          chmod +x android-app/gradlew
+          cd android-app && ./gradlew --version
 
       - name: Build APK
         run: |
           cd android-app
           ./gradlew assembleDebug --no-daemon
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -39,13 +45,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Termux .deb
+      - name: Download opencode binary
         run: |
-          sudo apt-get update && sudo apt-get install -y dpkg
-          ./termux-deb/build.sh
+          sudo apt-get update && sudo apt-get install -y dpkg curl
+          ./scripts/download-deps.sh
+
+      - name: Build Termux .deb
+        run: ./termux-deb/build.sh
 
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
           name: opencode-termux.deb
-          path: termux-deb/*.deb
+          path: termux-deb/output/*.deb
