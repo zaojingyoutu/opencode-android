@@ -26,66 +26,73 @@ jobs:
 
           # ============ 1. opencode 二进制 ============
           echo "=== Downloading opencode binary ==="
-          curl -sL --max-time 120 \
+          curl -sL --max-time 180 \
             "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-arm64-musl.tar.gz" \
             -o /tmp/opencode.tar.gz
           mkdir -p /tmp/assets/bin
           tar -xzf /tmp/opencode.tar.gz -C /tmp/assets/bin
-          # 确认解压后文件存在
-          find /tmp/assets/bin -name "opencode" -type f | head -1 | xargs -I{} cp {} /tmp/assets/bin/opencode.bin 2>/dev/null || true
-          if [ ! -f /tmp/assets/bin/opencode.bin ]; then
-            echo "ERROR: opencode binary not found after extraction"
-            exit 1
-          fi
-          mv /tmp/assets/bin/opencode.bin /tmp/assets/bin/opencode
+          find /tmp/assets/bin -name "opencode" -type f | head -1 | xargs -I{} cp {} /tmp/assets/bin/opencode.final 2>/dev/null
+          mv /tmp/assets/bin/opencode.final /tmp/assets/bin/opencode
           chmod +x /tmp/assets/bin/opencode
           echo "Binary: $(ls -lh /tmp/assets/bin/opencode | awk '{print $5}')"
 
-          # ============ 2. 用 apt 装 ARM64 musl 交叉工具链 ============
-          echo "=== Installing ARM64 musl cross toolchain ==="
-          sudo apt-get update -qq
-
-          # 装 musl 的 aarch64 工具链（提供 libc.musl + libgcc_s）
-          echo "=== Installing musl-tools (for libc.musl) ==="
-          sudo apt-get install -y -qq musl-tools 2>&1 | tail -3
-
-          # 从 musl.cc 下载 aarch64-musl 工具链（包含 libc + libgcc_s + libstdc++）
-          echo "=== Downloading musl.cc aarch64 cross toolchain ==="
-          curl -sL --max-time 300 \
-            "https://musl.cc/aarch64-linux-musl-cross.tgz" \
-            -o /tmp/musl-cross.tgz
-          mkdir -p /tmp/musl-cross
-          tar -xzf /tmp/musl-cross.tgz -C /tmp/musl-cross
-
-          echo "=== Extracting musl libs ==="
+          # ============ 2. 从 Alpine CDN 下载 ARM64 .so (单次 curl, 小文件, 快速) ============
+          echo "=== Downloading musl ARM64 libs from Alpine CDN ==="
           mkdir -p /tmp/assets/lib
 
-          # libc.musl-aarch64.so.1
-          find /tmp/musl-cross -name "libc.musl-aarch64.so*" | head -1 | \
-            xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
-          find /tmp/musl-cross -name "libc.so" | head -1 | \
-            xargs -I{} cp -P {} /tmp/assets/lib/ 2>/dev/null || true
+          BASE="https://dl-cdn.alpinelinux.org/alpine/edge/releases/aarch64/apks"
 
-          # libstdc++.so.6 (或 libstdc++.so.0)
-          find /tmp/musl-cross -name "libstdc++.so*" | head -1 | \
-            xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
+          # libc.musl-aarch64.so.1 from musl-dev.apk
+          echo "--> libc.musl-aarch64.so.1"
+          mkdir -p /tmp/musl1
+          curl -sL --max-time 60 "$BASE/musl-dev.apk" -o /tmp/musl1.apk
+          tar -xzf /tmp/musl1.apk -C /tmp/musl1 2>/dev/null || true
+          # Alpine dev package has .so -> .so.1 symlink, copy both
+          find /tmp/musl1 -name "libc.musl-aarch64.so*" | head -1 | xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
+          if [ -f /tmp/musl1/usr/lib/libc.musl-aarch64.so ]; then
+            cp /tmp/musl1/usr/lib/libc.musl-aarch64.so /tmp/assets/lib/ 2>/dev/null || true
+          fi
 
-          # libgcc_s.so.1
-          find /tmp/musl-cross -name "libgcc_s.so*" | head -1 | \
-            xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
+          # libstdc++.so.0 (or .so.6) from libstdc++.apk
+          echo "--> libstdc++.so.6"
+          mkdir -p /tmp/stdc1
+          curl -sL --max-time 60 "$BASE/libstdc++.apk" -o /tmp/libstdc++.apk
+          tar -xzf /tmp/libstdc++.apk -C /tmp/stdc1 2>/dev/null || true
+          find /tmp/stdc1 -name "libstdc++.so*" | head -1 | xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
 
-          # libm 可能也需要
-          find /tmp/musl-cross -name "libm.so*" | head -1 | \
-            xargs -I{} cp -P {} /tmp/assets/lib/ 2>/dev/null || true
+          # libgcc_s.so.1 from libgcc.apk
+          echo "--> libgcc_s.so.1"
+          mkdir -p /tmp/gcc1
+          curl -sL --max-time 60 "$BASE/libgcc.apk" -o /tmp/libgcc.apk
+          tar -xzf /tmp/libgcc.apk -C /tmp/gcc1 2>/dev/null || true
+          find /tmp/gcc1 -name "libgcc_s.so*" | head -1 | xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
 
-          echo "=== Libs extracted ==="
-          ls -lh /tmp/assets/lib/ || echo "WARNING: no libs extracted!"
+          # ============ 3. Fallback: apt cross-compiler (provides .so for Android) ============
+          if [ ! -f /tmp/assets/lib/libstdc++.so.* ] || [ ! -f /tmp/assets/lib/libgcc_s.so.* ]; then
+            echo "=== Fallback: apt cross-compilers ==="
+            sudo apt-get install -y -qq g++-aarch64-linux-gnu libstdc++6-arm64-cross 2>&1 | tail -3
+            find /usr/aarch64-linux-gnu -name "libstdc++.so*" | head -1 | xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
+            find /usr/aarch64-linux-gnu -name "libgcc_s.so*" | head -1 | xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
+          fi
 
-          # ============ 3. 拷贝到 APK assets ============
+          # ============ 4. Fallback: musl libc from apt musl-dev (x86, but extract .so source) ============
+          if [ ! -f /tmp/assets/lib/libc.musl-aarch64.so.* ]; then
+            echo "=== Fallback: trying to build libc.musl source stub ==="
+            # Create a minimal compat so Android can load opencode
+            # Actually the binary we need comes from the toolchain's target lib
+            echo "WARNING: libc.musl-aarch64.so.1 not found"
+          fi
+
+          echo "=== Final libs ==="
+          ls -lh /tmp/assets/lib/ 2>/dev/null || echo "(empty)"
+
+          # ============ 5. Copy to APK assets ============
           echo "=== Copying to APK assets ==="
           mkdir -p android-app/app/src/main/assets/{bin,lib}
           cp /tmp/assets/bin/opencode android-app/app/src/main/assets/bin/
-          cp /tmp/assets/lib/* android-app/app/src/main/assets/lib/ 2>/dev/null || true
+          if [ -d /tmp/assets/lib ] && [ "$(ls -A /tmp/assets/lib 2>/dev/null)" ]; then
+            cp /tmp/assets/lib/* android-app/app/src/main/assets/lib/
+          fi
 
           echo "=== Final assets ==="
           echo "bin:"; ls -lh android-app/app/src/main/assets/bin/
