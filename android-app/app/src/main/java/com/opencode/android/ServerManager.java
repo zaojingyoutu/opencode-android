@@ -12,7 +12,6 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -20,19 +19,20 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * 内嵌 opencode server 管理器。
  *
- * opencode(linux-arm64-musl) 二进制打包在 APK assets/opencode/ 里,
- * 首次启动时流式解压到 app 私有目录, 然后作为子进程拉起:
- *   opencode serve --port 18888 --hostname 127.0.0.1
+ * opencode (linux-arm64-musl) 二进制以 libopencode.so 名义打包在
+ * jniLibs/arm64-v8a/ 里, APK 安装时由系统解压到
+ *   /data/app/<pkg>/lib/arm64/libopencode.so  (nativeLibraryDir)
+ * 该位置 SELinux 允许 app 执行, 避免 files/ 目录 exec 被 ROM 拦截 (error=13)。
  *
- * HOME / XDG_* 全部指向 app 私有目录, 配置与登录态随 APP 持久化。
+ * 启动: opencode serve --port 18888 --hostname 127.0.0.1
+ * HOME / XDG_* / TMPDIR 指向 app 私有目录, 配置与登录态随 APP 持久化。
  * APP 退出时 (onDestroy) 调用 stop() 杀掉子进程。
  */
 public class ServerManager {
 
     private static final String TAG = "OpenCodeServer";
     private static final int PORT = 18888;
-    private static final String ASSET_BIN = "opencode/opencode";
-    private static final String ASSET_VERSION = "opencode/version.txt";
+    private static final String LIB_NAME = "libopencode.so";
 
     private static volatile ServerManager instance;
 
@@ -62,13 +62,14 @@ public class ServerManager {
         return abi.equals("arm64-v8a") || abi.equals("aarch64");
     }
 
+    /** 内置二进制 (nativeLibraryDir/libopencode.so) 是否存在 */
     public boolean hasEmbeddedBinary() {
-        try {
-            ctx.getAssets().open(ASSET_BIN).close();
-            return true;
-        } catch (IOException e) {
-            return false;
-        }
+        return binaryFile().exists();
+    }
+
+    /** 系统安装 APK 时解压出来的可执行文件 */
+    private File binaryFile() {
+        return new File(ctx.getApplicationInfo().nativeLibraryDir, LIB_NAME);
     }
 
     public boolean isRunning() {
@@ -112,10 +113,10 @@ public class ServerManager {
         new Thread(() -> {
             String err = null;
             try {
-                if (progress != null) {
-                    progress.onProgress("正在解压二进制 (192MB, 首次约需 1 分钟)...");
+                File bin = binaryFile();
+                if (!bin.exists()) {
+                    throw new IOException("内置二进制缺失: " + bin.getAbsolutePath());
                 }
-                File bin = ensureBinary();
                 if (progress != null) {
                     progress.onProgress("正在启动 OpenCode 服务...");
                 }
@@ -163,32 +164,6 @@ public class ServerManager {
         }
     }
 
-    /** 把 assets 里的二进制解压到 filesDir (版本变化时覆盖) */
-    private File ensureBinary() throws IOException {
-        File bin = new File(ctx.getFilesDir(), "opencode/bin/opencode");
-        File verFile = new File(ctx.getFilesDir(), "opencode/.version");
-        String assetVersion = readText(ctx.getAssets().open(ASSET_VERSION));
-        String localVersion = verFile.exists() ? readText(new FileInputStream(verFile)) : "";
-        if (bin.exists() && localVersion.equals(assetVersion)) {
-            return bin;
-        }
-        if (bin.getParentFile() != null) bin.getParentFile().mkdirs();
-        try (InputStream in = ctx.getAssets().open(ASSET_BIN);
-             OutputStream out = new FileOutputStream(bin)) {
-            byte[] buf = new byte[128 * 1024];
-            int n;
-            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-        }
-        if (!bin.setExecutable(true, false)) {
-            throw new IOException("无法设置可执行权限: " + bin);
-        }
-        try (OutputStream out = new FileOutputStream(verFile)) {
-            out.write(assetVersion.getBytes(StandardCharsets.UTF_8));
-        }
-        Log.i(TAG, "binary extracted, version=" + assetVersion + ", size=" + bin.length());
-        return bin;
-    }
-
     private void startProcess(File bin) throws IOException {
         File root = new File(ctx.getFilesDir(), "opencode");
         File home = new File(root, "home");
@@ -232,14 +207,5 @@ public class ServerManager {
         }, "opencode-log");
         logThread.setDaemon(true);
         logThread.start();
-    }
-
-    private static String readText(InputStream in) throws IOException {
-        try (InputStream is = in; ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            byte[] buf = new byte[1024];
-            int n;
-            while ((n = is.read(buf)) > 0) out.write(buf, 0, n);
-            return new String(out.toByteArray(), StandardCharsets.UTF_8);
-        }
     }
 }

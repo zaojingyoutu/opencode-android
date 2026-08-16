@@ -159,7 +159,7 @@ public class MainActivity extends Activity {
                         "日志:\n" + embedded.getLogTail(1500) + "\n\n点击重试");
             }
         }, stage -> runOnUiThread(() -> {
-            statusView.setText(stage + "\n\n首次启动需要 1~2 分钟, 请耐心等待");
+            statusView.setText(stage + "\n\n首次启动约需 30 秒~1 分钟, 请稍候");
         }));
     }
 

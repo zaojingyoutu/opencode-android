@@ -6,11 +6,11 @@ plugins {
     id("com.android.application") version "8.5.2"
 }
 
-val opencodeAssetDir = layout.projectDirectory.dir("src/main/assets/opencode")
+val opencodeJniDir = layout.projectDirectory.dir("src/main/jniLibs/arm64-v8a")
 
 // 版本可由 CI 通过 -PversionName / -PversionCode 注入, 本地构建用默认值
-val releaseVersionName = (project.findProperty("versionName") as String?) ?: "0.4.1"
-val releaseVersionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 5
+val releaseVersionName = (project.findProperty("versionName") as String?) ?: "0.5.0"
+val releaseVersionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 6
 
 fun httpGet(url: String): String {
     val conn = URL(url).openConnection() as HttpURLConnection
@@ -22,14 +22,14 @@ fun httpGet(url: String): String {
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
 
-/** 从 GitHub latest release 下载 linux-arm64-musl 二进制并解压到 assets/opencode/ */
+/** 从 GitHub latest release 下载 linux-arm64-musl 二进制, 作为 native lib 放到 jniLibs.
+ *  系统安装 APK 时会把它解压到 /data/app/<pkg>/lib/arm64/ 下,
+ *  该位置 SELinux 允许 app 执行 (解决 files/ 目录 exec 被 ROM 拒绝的 error=13 问题)。 */
 tasks.register("downloadOpencode") {
-    description = "Download opencode linux-arm64-musl binary into assets/opencode"
-    val outputDir = opencodeAssetDir
+    description = "Download opencode binary into src/main/jniLibs/arm64-v8a"
+    val outputDir = opencodeJniDir
     outputs.dir(outputDir)
-    onlyIf {
-        !file("$outputDir/opencode").exists() || !file("$outputDir/version.txt").exists()
-    }
+    onlyIf { !file("$outputDir/libopencode.so").exists() }
     doLast {
         val api = "https://api.github.com/repos/anomalyco/opencode/releases/latest"
         val json = httpGet(api)
@@ -40,14 +40,18 @@ tasks.register("downloadOpencode") {
             ?: error("cannot find linux-arm64-musl.tar.gz asset in latest release")
 
         val tarball = layout.buildDirectory.file("opencode-$tag.tar.gz").get().asFile
-        logger.lifecycle("Downloading opencode $tag ...")
         tarball.parentFile.mkdirs()
-        val conn = URL(dl).openConnection() as HttpURLConnection
-        conn.setRequestProperty("User-Agent", "opencode-android-build")
-        conn.connectTimeout = 60000
-        conn.readTimeout = 300000
-        conn.inputStream.use { input ->
-            FileOutputStream(tarball).use { output -> input.copyTo(output) }
+        if (tarball.exists()) {
+            logger.lifecycle("Using cached tarball ${tarball.name}")
+        } else {
+            logger.lifecycle("Downloading opencode $tag ...")
+            val conn = URL(dl).openConnection() as HttpURLConnection
+            conn.setRequestProperty("User-Agent", "opencode-android-build")
+            conn.connectTimeout = 60000
+            conn.readTimeout = 300000
+            conn.inputStream.use { input ->
+                FileOutputStream(tarball).use { output -> input.copyTo(output) }
+            }
         }
 
         val extracted = layout.buildDirectory.dir("opencode-extracted").get().asFile
@@ -61,10 +65,9 @@ tasks.register("downloadOpencode") {
         copy {
             from(bin)
             into(outputDir)
-            rename { "opencode" }
+            rename { "libopencode.so" }
         }
-        file("$outputDir/version.txt").writeText(tag)
-        logger.lifecycle("opencode $tag ready at $outputDir/opencode")
+        logger.lifecycle("opencode $tag ready at $outputDir/libopencode.so")
     }
 }
 
@@ -84,6 +87,14 @@ android {
     }
     buildTypes {
         getByName("release") { isMinifyEnabled = false }
+    }
+    packagingOptions {
+        jniLibs {
+            // libopencode.so 是 Bun 打包的可执行文件: 压缩进 APK (安装时解压到 nativeLibraryDir),
+            // 并排除 strip (它不是标准 .so 符号库)
+            keepDebugSymbols += "**/libopencode.so"
+            useLegacyPackaging = true
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
