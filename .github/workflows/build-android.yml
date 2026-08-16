@@ -23,79 +23,73 @@ jobs:
       - name: Download opencode binary + musl libs
         run: |
           set -e
-          mkdir -p /tmp/build-assets/{bin,lib}
-          cd /tmp/build-assets
 
-          # 1. Download opencode ARM64 musl binary
+          # ============ 1. opencode 二进制 ============
           echo "=== Downloading opencode binary ==="
-          curl -sL --max-time 60 \
-            -o opencode.tar.gz \
-            "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-arm64-musl.tar.gz"
-          tar -xzf opencode.tar.gz -C .
-          # The tarball extracts a single "opencode" binary at root
-          cp opencode bin/opencode
-          chmod +x bin/opencode
-          echo "Binary: $(ls -lh bin/opencode | awk '{print $5}')"
-
-          # 2. Download musl libc (ARM64) from Alpine edge
-          echo "=== Downloading musl libc ==="
-          curl -sL --max-time 30 \
-            "https://dl-cdn.alpinelinux.org/alpine/edge/releases/aarch64/apks/musl-dev.apk" \
-            -o musl-dev.apk
-          tar -xzf musl-dev.apk -C /tmp/musl-1 2>/dev/null || true
-          if [ -f /tmp/musl-1/usr/lib/libc.musl-aarch64.so.1 ]; then
-            cp /tmp/musl-1/usr/lib/libc.musl-aarch64.so.1 lib/
-          elif find /tmp/musl-1 -name "libc.musl-aarch64.so*" | head -1 | xargs cp -t lib/ 2>/dev/null; then
-            :
+          curl -sL --max-time 120 \
+            "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-arm64-musl.tar.gz" \
+            -o /tmp/opencode.tar.gz
+          mkdir -p /tmp/assets/bin
+          tar -xzf /tmp/opencode.tar.gz -C /tmp/assets/bin
+          # 确认解压后文件存在
+          find /tmp/assets/bin -name "opencode" -type f | head -1 | xargs -I{} cp {} /tmp/assets/bin/opencode.bin 2>/dev/null || true
+          if [ ! -f /tmp/assets/bin/opencode.bin ]; then
+            echo "ERROR: opencode binary not found after extraction"
+            exit 1
           fi
-          # fallback: musl.apk
-          if [ ! -f lib/libc.musl-aarch64.so.1 ]; then
-            curl -sL --max-time 30 "https://dl-cdn.alpinelinux.org/alpine/edge/releases/aarch64/apks/musl.apk" -o musl.apk
-            tar -xzf musl.apk -C /tmp/musl-2 2>/dev/null || true
-            find /tmp/musl-2 -name "libc.musl-aarch64.so*" | head -1 | xargs cp -t lib/ 2>/dev/null || true
-          fi
+          mv /tmp/assets/bin/opencode.bin /tmp/assets/bin/opencode
+          chmod +x /tmp/assets/bin/opencode
+          echo "Binary: $(ls -lh /tmp/assets/bin/opencode | awk '{print $5}')"
 
-          # 3. Download libstdc++ and libgcc_s (ARM64) from Alpine GCC
-          echo "=== Downloading libstdc++ ==="
-          curl -sL --max-time 30 \
-            "https://dl-cdn.alpinelinux.org/alpine/edge/releases/aarch64/apks/libstdc++.apk" \
-            -o libstdc++.apk
-          tar -xzf libstdc++.apk -C /tmp/stdc 2>/dev/null || true
-          find /tmp/stdc -name "libstdc++.so*" | head -1 | xargs cp -t lib/ 2>/dev/null || true
+          # ============ 2. 用 apt 装 ARM64 musl 交叉工具链 ============
+          echo "=== Installing ARM64 musl cross toolchain ==="
+          sudo apt-get update -qq
 
-          echo "=== Downloading libgcc_s ==="
-          curl -sL --max-time 30 \
-            "https://dl-cdn.alpinelinux.org/alpine/edge/releases/aarch64/apks/libgcc.apk" \
-            -o libgcc.apk
-          tar -xzf libgcc.apk -C /tmp/libgcc 2>/dev/null || true
-          find /tmp/libgcc -name "libgcc_s.so*" | head -1 | xargs cp -t lib/ 2>/dev/null || true
+          # 装 musl 的 aarch64 工具链（提供 libc.musl + libgcc_s）
+          echo "=== Installing musl-tools (for libc.musl) ==="
+          sudo apt-get install -y -qq musl-tools 2>&1 | tail -3
 
-          # Fallback: download ARM64 cross toolchain from musl.cc
-          if [ ! -f lib/libstdc++.so.6 ] || [ ! -f lib/libgcc_s.so.1 ]; then
-            echo "=== Downloading musl.cc ARM64 toolchain (fallback) ==="
-            curl -sL --max-time 120 \
-              "https://musl.cc/aarch64-linux-musl-cross.tgz" \
-              -o /tmp/toolchain.tgz
-            mkdir -p /tmp/toolchain
-            tar -xzf /tmp/toolchain.tgz -C /tmp/toolchain
-            find /tmp/toolchain -name "libstdc++.so*" | head -1 | xargs cp -t lib/ 2>/dev/null || true
-            find /tmp/toolchain -name "libgcc_s.so*" | head -1 | xargs cp -t lib/ 2>/dev/null || true
-          fi
+          # 从 musl.cc 下载 aarch64-musl 工具链（包含 libc + libgcc_s + libstdc++）
+          echo "=== Downloading musl.cc aarch64 cross toolchain ==="
+          curl -sL --max-time 300 \
+            "https://musl.cc/aarch64-linux-musl-cross.tgz" \
+            -o /tmp/musl-cross.tgz
+          mkdir -p /tmp/musl-cross
+          tar -xzf /tmp/musl-cross.tgz -C /tmp/musl-cross
 
-          # Final check
-          echo "=== Final lib contents ==="
-          ls -lh lib/
-          echo "=== Final binary ==="
-          ls -lh bin/
+          echo "=== Extracting musl libs ==="
+          mkdir -p /tmp/assets/lib
 
-          # 3. Copy assets into APK project
-          cd /home/runner/work/opencode-android/opencode-android
+          # libc.musl-aarch64.so.1
+          find /tmp/musl-cross -name "libc.musl-aarch64.so*" | head -1 | \
+            xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
+          find /tmp/musl-cross -name "libc.so" | head -1 | \
+            xargs -I{} cp -P {} /tmp/assets/lib/ 2>/dev/null || true
+
+          # libstdc++.so.6 (或 libstdc++.so.0)
+          find /tmp/musl-cross -name "libstdc++.so*" | head -1 | \
+            xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
+
+          # libgcc_s.so.1
+          find /tmp/musl-cross -name "libgcc_s.so*" | head -1 | \
+            xargs -I{} cp {} /tmp/assets/lib/ 2>/dev/null || true
+
+          # libm 可能也需要
+          find /tmp/musl-cross -name "libm.so*" | head -1 | \
+            xargs -I{} cp -P {} /tmp/assets/lib/ 2>/dev/null || true
+
+          echo "=== Libs extracted ==="
+          ls -lh /tmp/assets/lib/ || echo "WARNING: no libs extracted!"
+
+          # ============ 3. 拷贝到 APK assets ============
+          echo "=== Copying to APK assets ==="
           mkdir -p android-app/app/src/main/assets/{bin,lib}
-          cp /tmp/build-assets/bin/opencode android-app/app/src/main/assets/bin/
-          cp /tmp/build-assets/lib/* android-app/app/src/main/assets/lib/ 2>/dev/null || true
-          echo "=== Assets copied ==="
-          ls -lh android-app/app/src/main/assets/bin/
-          ls -lh android-app/app/src/main/assets/lib/
+          cp /tmp/assets/bin/opencode android-app/app/src/main/assets/bin/
+          cp /tmp/assets/lib/* android-app/app/src/main/assets/lib/ 2>/dev/null || true
+
+          echo "=== Final assets ==="
+          echo "bin:"; ls -lh android-app/app/src/main/assets/bin/
+          echo "lib:"; ls -lh android-app/app/src/main/assets/lib/ 2>/dev/null || echo "(empty)"
 
       - name: Download Gradle wrapper
         run: |
