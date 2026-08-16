@@ -14,11 +14,15 @@ elif [ -f "$DEPS_DIR/opencode-linux-arm64-musl/bin/opencode" ]; then
     ARCHIVE="$DEPS_DIR/opencode-linux-arm64-musl"
 fi
 
-if [ -z "$ARCHIVE" ] || [ ! -x "$ARCHIVE/bin/opencode" ]; then
+if [ -z "$ARCHIVE" ]; then
     echo "ERROR: opencode binary not found."
+    echo "  looked at: $DEPS_DIR/opencode-linux-arm64-musl/bin/opencode"
+    echo "  contents of deps/:"
+    ls -la "$DEPS_DIR/" 2>/dev/null || echo "  deps/ does not exist"
     echo "Run ./scripts/download-deps.sh first."
     exit 1
 fi
+chmod +x "$ARCHIVE/bin/opencode"
 
 mkdir -p "$PKG_DIR/data/data/com.termux/files/usr/bin"
 cp "$ARCHIVE/bin/opencode" "$PKG_DIR/data/data/com.termux/files/usr/bin/opencode"
