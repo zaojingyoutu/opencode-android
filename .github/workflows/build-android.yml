@@ -23,12 +23,21 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # 读取最新 release 的 tag, patch 版本 +1; 无 release 时从 0.1.0 开始
+      # 从所有 releases 中选语义版本最大的 tag, patch +1; 无 release 时从 0.1.0 开始
+      # tag 若已存在 (如上次发布失败) 则继续递增直到可用
       - name: Compute next version
         id: ver
         run: |
           set -euo pipefail
-          LATEST=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          LATEST=$(curl -sL --max-time 30 \
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
+            | python3 -c "
+import sys, json
+rels = json.load(sys.stdin)
+tags = [r['tag_name'] for r in rels if r['tag_name'].startswith('v')]
+tags.sort(key=lambda t: [int(x) for x in t[1:].split('.')])
+print(tags[-1] if tags else '')
+" 2>/dev/null || true)
           if [ -z "$LATEST" ]; then
             NEXT="0.1.0"
           else
@@ -36,6 +45,10 @@ jobs:
             IFS=. read -r MAJ MIN PAT <<< "$TAG"
             NEXT="$MAJ.$MIN.$((PAT+1))"
           fi
+          while git rev-parse -q --verify "refs/tags/v$NEXT" >/dev/null 2>&1; do
+            IFS=. read -r MAJ MIN PAT <<< "$NEXT"
+            NEXT="$MAJ.$MIN.$((PAT+1))"
+          done
           IFS=. read -r M m p <<< "$NEXT"
           echo "next=$NEXT" >> "$GITHUB_OUTPUT"
           echo "code=$((M*10000 + m*100 + p))" >> "$GITHUB_OUTPUT"
