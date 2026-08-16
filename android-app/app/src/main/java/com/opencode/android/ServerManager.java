@@ -12,6 +12,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -19,20 +20,29 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * 内嵌 opencode server 管理器。
  *
- * opencode (linux-arm64-musl) 二进制以 libopencode.so 名义打包在
- * jniLibs/arm64-v8a/ 里, APK 安装时由系统解压到
- *   /data/app/<pkg>/lib/arm64/libopencode.so  (nativeLibraryDir)
- * 该位置 SELinux 允许 app 执行, 避免 files/ 目录 exec 被 ROM 拦截 (error=13)。
+ * opencode (linux-arm64-musl) 是动态链接 musl 的二进制, 需要:
+ *   - ld-musl-aarch64.so.1   (musl loader, interp 已 patchelf 指向固定路径)
+ *   - libgcc_s.so.1 / libstdc++.so.6  (C/C++ 运行时)
+ * 这些文件打包在 APK assets/opencode/ 里, 首次启动提取到
+ *   /data/user/0/<pkg>/files/opencode/{bin,lib}
+ * (interp 写死该路径, 因此不能换位置)。
  *
  * 启动: opencode serve --port 18888 --hostname 127.0.0.1
- * HOME / XDG_* / TMPDIR 指向 app 私有目录, 配置与登录态随 APP 持久化。
+ * 环境: HOME/XDG_CONFIG_HOME/XDG_DATA_HOME/XDG_CACHE_HOME/TMPDIR -> app 私有目录,
+ *       LD_LIBRARY_PATH -> lib 目录。
  * APP 退出时 (onDestroy) 调用 stop() 杀掉子进程。
  */
 public class ServerManager {
 
     private static final String TAG = "OpenCodeServer";
     private static final int PORT = 18888;
-    private static final String LIB_NAME = "libopencode.so";
+    private static final String ASSET_VERSION = "opencode/version.txt";
+    private static final String[] ASSET_LIBS = {
+            "opencode/lib/ld-musl-aarch64.so.1",
+            "opencode/lib/libgcc_s.so.1",
+            "opencode/lib/libstdc++.so.6",
+            "opencode/lib/ca-certificates.crt",
+    };
 
     private static volatile ServerManager instance;
 
@@ -62,14 +72,9 @@ public class ServerManager {
         return abi.equals("arm64-v8a") || abi.equals("aarch64");
     }
 
-    /** 内置二进制 (nativeLibraryDir/libopencode.so) 是否存在 */
+    /** APK 内是否包含内置运行环境 (nativeLibraryDir 有二进制) */
     public boolean hasEmbeddedBinary() {
-        return binaryFile().exists();
-    }
-
-    /** 系统安装 APK 时解压出来的可执行文件 */
-    private File binaryFile() {
-        return new File(ctx.getApplicationInfo().nativeLibraryDir, LIB_NAME);
+        return binFile().exists();
     }
 
     public boolean isRunning() {
@@ -113,10 +118,10 @@ public class ServerManager {
         new Thread(() -> {
             String err = null;
             try {
-                File bin = binaryFile();
-                if (!bin.exists()) {
-                    throw new IOException("内置二进制缺失: " + bin.getAbsolutePath());
+                if (progress != null) {
+                    progress.onProgress("正在准备运行环境...");
                 }
+                File bin = ensureRuntime();
                 if (progress != null) {
                     progress.onProgress("正在启动 OpenCode 服务...");
                 }
@@ -164,13 +169,131 @@ public class ServerManager {
         }
     }
 
+    /**
+     * 数据根目录 (files/opencode, 存放配置/库/日志)。
+     * loader 的 interp 路径写死在此, 不能换位置。
+     */
+    private File dataRoot() {
+        return new File(ctx.getFilesDir(), "opencode");
+    }
+
+    /**
+     * 二进制位置: nativeLibraryDir/libopencode.so。
+     * 系统安装 APK 时解压 (app_lib_file 类型, SELinux 允许执行)。
+     * 部分 ROM 禁止 app 执行 files/ (app_data_file) 下的文件 (error=13), 因此二进制不能放 files。
+     */
+    private File binFile() {
+        return new File(ctx.getApplicationInfo().nativeLibraryDir, "libopencode.so");
+    }
+
+    /** 确保二进制 + 全部动态库就位 (版本变化时重新提取), 返回二进制路径 */
+    private File ensureRuntime() throws IOException {
+        File root = dataRoot();
+        File bin = binFile();
+        File libDir = new File(root, "lib");
+        String assetVersion = readText(ctx.getAssets().open(ASSET_VERSION));
+        File verFile = new File(root, ".version");
+        String localVersion = verFile.exists() ? readText(new FileInputStream(verFile)) : "";
+
+        boolean missing = !bin.exists() || !new File(libDir, "ld-musl-aarch64.so.1").exists()
+                || !new File(libDir, "libgcc_s.so.1").exists()
+                || !new File(libDir, "libstdc++.so.6").exists()
+                || !new File(libDir, "ca-certificates.crt").exists();
+        if (bin.exists() && !missing && localVersion.equals(assetVersion)) {
+            return bin;
+        }
+        if (root.exists()) deleteRecursive(root);
+        root.mkdirs();
+        libDir.mkdirs();
+
+        for (String asset : ASSET_LIBS) {
+            extractAsset(asset, new File(libDir, asset.substring(asset.lastIndexOf('/') + 1)));
+        }
+        for (String asset : ASSET_LIBS) {
+            setReadable(new File(libDir, asset.substring(asset.lastIndexOf('/') + 1)));
+        }
+        try (OutputStream out = new FileOutputStream(verFile)) {
+            out.write(assetVersion.getBytes(StandardCharsets.UTF_8));
+        }
+        Log.i(TAG, "runtime extracted, version=" + assetVersion + ", bin=" + bin.length() + " bytes");
+        return bin;
+    }
+
+    private void extractAsset(String asset, File dest) throws IOException {
+        if (dest.getParentFile() != null) dest.getParentFile().mkdirs();
+        try (InputStream in = ctx.getAssets().open(asset);
+             OutputStream out = new FileOutputStream(dest)) {
+            byte[] buf = new byte[128 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        }
+    }
+
+    private static void setReadable(File f) throws IOException {
+        f.setReadable(true, false);
+        f.setWritable(true, false);
+    }
+
+    private static boolean deleteRecursive(File f) {
+        if (f.isDirectory()) {
+            File[] children = f.listFiles();
+            if (children != null) {
+                for (File c : children) deleteRecursive(c);
+            }
+        }
+        return f.delete();
+    }
+
+    /** 清理上次残留的 server 进程 (通过 pid 文件; 同 uid 可直接 kill) */
+    private static void killStaleServer(File root) {
+        File pidFile = new File(root, "server.pid");
+        if (!pidFile.exists()) return;
+        String s = "";
+        try (FileInputStream in = new FileInputStream(pidFile)) {
+            byte[] buf = new byte[32];
+            int n = in.read(buf);
+            if (n > 0) s = new String(buf, 0, n, StandardCharsets.UTF_8).trim();
+        } catch (IOException ignored) {
+        }
+        if (s.isEmpty()) return;
+        try {
+            int pid = Integer.parseInt(s);
+            if (pid > 1) {
+                android.os.Process.killProcess(pid);
+                Log.i(TAG, "killed stale server pid=" + pid);
+            }
+        } catch (Exception ignored) {
+        }
+        pidFile.delete();
+    }
+
+    private static void writePidFile(File root, int pid) {
+        try (OutputStream out = new FileOutputStream(new File(root, "server.pid"))) {
+            out.write(String.valueOf(pid).getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            Log.w(TAG, "cannot write pid file", e);
+        }
+    }
+
+    /** Process.pid() 是 API 26+, 这里用反射兼容 API 24/25 */
+    private static int pidOf(Process p) {
+        try {
+            java.lang.reflect.Field f = p.getClass().getDeclaredField("pid");
+            f.setAccessible(true);
+            return f.getInt(p);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
     private void startProcess(File bin) throws IOException {
-        File root = new File(ctx.getFilesDir(), "opencode");
+        File root = dataRoot();
         File home = new File(root, "home");
         File cfg = new File(root, "config");
         File data = new File(root, "data");
         File cache = new File(root, "cache");
         File tmp = new File(root, "tmp");
+        File libDir = new File(root, "lib");
         home.mkdirs();
         cfg.mkdirs();
         data.mkdirs();
@@ -178,22 +301,29 @@ public class ServerManager {
         tmp.mkdirs();
         logFile = new File(root, "server.log");
 
+        // 清理上次残留的 server 进程 (APP 被系统杀时子进程会成孤儿继续占端口)
+        killStaleServer(root);
+
         ProcessBuilder pb = new ProcessBuilder(
                 bin.getAbsolutePath(),
                 "serve",
                 "--port", String.valueOf(PORT),
                 "--hostname", "127.0.0.1");
         pb.redirectErrorStream(true);
-        pb.directory(bin.getParentFile());
+        // cwd 用 home 目录, opencode Web UI 里的文件浏览从用户根目录开始
+        pb.directory(home);
         pb.environment().put("HOME", home.getAbsolutePath());
         pb.environment().put("XDG_CONFIG_HOME", cfg.getAbsolutePath());
         pb.environment().put("XDG_DATA_HOME", data.getAbsolutePath());
         pb.environment().put("XDG_CACHE_HOME", cache.getAbsolutePath());
         pb.environment().put("TMPDIR", tmp.getAbsolutePath());
+        pb.environment().put("LD_LIBRARY_PATH", libDir.getAbsolutePath());
+        pb.environment().put("SSL_CERT_FILE", new File(libDir, "ca-certificates.crt").getAbsolutePath());
         pb.environment().put("TERM", "xterm-256color");
 
         process = pb.start();
         final Process proc = process;
+        writePidFile(root, pidOf(proc));
         Log.i(TAG, "server process started");
 
         Thread logThread = new Thread(() -> {
@@ -207,5 +337,14 @@ public class ServerManager {
         }, "opencode-log");
         logThread.setDaemon(true);
         logThread.start();
+    }
+
+    private static String readText(InputStream in) throws IOException {
+        try (InputStream is = in; ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[1024];
+            int n;
+            while ((n = is.read(buf)) > 0) out.write(buf, 0, n);
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        }
     }
 }

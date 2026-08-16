@@ -64,6 +64,7 @@ public class MainActivity extends Activity {
         ws.setDomStorageEnabled(true);
         ws.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         ws.setBuiltInZoomControls(true);
+        ws.setDisplayZoomControls(false);
         ws.setLoadWithOverviewMode(true);
         ws.setUseWideViewPort(true);
         ws.setCacheMode(WebSettings.LOAD_DEFAULT);
@@ -80,6 +81,11 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 progressBar.setVisibility(View.GONE);
+                // opencode 网页的错误信息在窄屏不换行, 注入 CSS 强制长文本折行
+                view.evaluateJavascript(
+                        "var s=document.createElement('style');" +
+                        "s.innerHTML='*{overflow-wrap:break-word!important;word-break:break-word!important;max-width:100%!important}';" +
+                        "document.head.appendChild(s);", null);
             }
             @Override
             public void onReceivedError(WebView view, int errorCode,

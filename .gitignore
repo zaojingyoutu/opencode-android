@@ -1,10 +1,13 @@
-apk-output/
+﻿apk-output/
 *.apk
 android-app/.gradle/
 android-app/build/
 android-app/app/build/
 
-# opencode 二进制由 gradle downloadOpencode 自动下载, 不入库
-android-app/app/src/main/jniLibs/
-deps/
+# 本地构建环境 (JDK/SDK/Gradle), 不入库
+.local/
 
+# opencode 运行环境 (二进制+musl库) 由 gradle downloadOpencode 自动下载, 不入库
+android-app/app/src/main/jniLibs/
+android-app/app/src/main/assets/opencode/
+deps/
