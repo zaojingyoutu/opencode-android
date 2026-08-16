@@ -25,6 +25,6 @@
 
         <meta-data
             android:name="com.opencode.android.VERSION"
-            android:value="0.2.0" />
+            android:value="0.3.0" />
     </application>
 </manifest>

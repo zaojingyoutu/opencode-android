@@ -8,8 +8,8 @@ android {
         applicationId = "com.opencode.android"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
     }
     buildTypes {
         getByName("release") { isMinifyEnabled = false }
@@ -17,17 +17,5 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
-    }
-    splits {
-        abi {
-            isEnable = true
-            reset()
-            include("arm64-v8a")
-            isUniversalApk = false
-        }
-    }
-    aaptOptions {
-        // 跳过压缩以 .bin 结尾的资产（192MB ELF 二进制无需压缩）
-        ignoreAssetsPattern = "!*.bin:*"
     }
 }

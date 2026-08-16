@@ -1,74 +1,101 @@
 # opencode-android
 
-**单个 APK，完全自包含**，内置 opencode 引擎 + musl libc，无需 Termux。
+**OpenCode AI 编程助手的 Android 客户端（AidLux 方案）**
 
-- 首次启动 → 填 API Key（一次性）
-- 自动解压引擎 → 自动启动 `opencode serve` → WebView 直连
-
----
-
-## 快速构建
-
-```bash
-./scripts/build-all.sh
-```
-
-产物：`android-app/app/build/outputs/apk/debug/app-debug.apk`
+- 单个轻量 APK（~400KB）——纯 WebView 前端
+- opencode server 跑在 **AidLux Linux 侧**（本机 localhost），不用打包 200MB 二进制
+- 首次使用只需在 AidLux 终端跑一次 `bash scripts/aidlux-start.sh`
 
 ---
 
 ## 架构
 
 ```
-┌──────────────────────────────────┐
-│  OpenCode APP (单个 APK)         │
-│                                  │
-│  assets/bin/opencode  (192MB)    │
-│  assets/lib/*.so  (musl 三件套)   │
-│                                  │
-│  首次启动 → 拷贝到 filesDir      │
-│  → LD_LIBRARY_PATH=... opencode  │
-│    serve --port 18888            │
-│  → WebView 连 localhost:18888   │
-└──────────────────────────────────┘
+┌────────────── Android 侧 ──────────────┐
+│  OpenCode APP (WebView 前端, ~400KB)    │
+│  http://127.0.0.1:18888                 │
+└──────────────┬──────────────────────────┘
+               │ localhost 直连
+┌──────────────▼──────────────────────────┐
+│  AidLux Linux 侧                        │
+│  opencode serve --port 18888            │
+│  (DeepSeek free / OpenCode Zen)         │
+└─────────────────────────────────────────┘
 ```
 
-## 核心代码
+## 快速开始（AidLux 用户）
 
-```
-android-app/app/src/main/java/com/opencode/android/
-└── MainActivity.java              ← 自包含入口
-    - API Key 设置界面（首次启动）
-    - assets → filesDir 解压
-    - Runtime.exec 启动 opencode serve
-    - WebView 连接健康检查 → 显示 UI
+### 第 1 步：在 AidLux 终端启动 server
+
+```bash
+cd ~/opencode-android
+bash scripts/aidlux-start.sh
 ```
 
-## 依赖
+脚本会自动：检查 opencode →（没有就 npm 安装）→ 启动 serve。
 
-| 文件 | 来源 |
-|------|------|
-| `assets/bin/opencode` | GitHub Release `opencode-linux-arm64-musl.tar.gz` |
-| `assets/lib/libc.musl-aarch64.so.1` | Alpine musl-dev |
-| `assets/lib/libstdc++.so.6` | Alpine GCC / musl.cc toolchain |
-| `assets/lib/libgcc_s.so.1` | Alpine GCC |
+如果要在后台常驻：
 
-## GitHub Actions
+```bash
+nohup bash scripts/aidlux-start.sh > ~/opencode-server.log 2>&1 &
+echo "已启动, 日志: ~/opencode-server.log"
+```
 
-Push 到 main 自动：
-1. 下载 opencode ARM64 musl 二进制
-2. 下载 musl libc + libstdc++ + libgcc_s 三个 .so
-3. 打包进 APK assets
-4. 编译 + 上传 APK
+### 第 2 步：装 APP
 
-## 使用
+下载 APK 安装即可。打开后自动连 `127.0.0.1:18888`。
+如果连不上，屏幕会显示提示，点一下重试。
 
-1. 手机装 APK
-2. 打开 → 填 API Key
-3. 自动启动，WebView 显示 AI 界面
+### 局域网使用（可选）
 
-## 注意事项
+手机/平板连同一 Wi-Fi，在 APP 内把地址改成 `http://AidLux设备IP:18888`。
+（server 已默认监听 0.0.0.0）
 
-- API Key 仅存于本设备，`allowBackup=false` 防止备份泄露
-- APK 大小约 200MB（含 opencode 二进制 + 库）
-- 仅支持 ARM64 设备（Android 7.0+）
+## 手动启动 server（不用脚本）
+
+```bash
+opencode serve --port 18888 --hostname 0.0.0.0
+```
+
+只本机用：`--hostname 127.0.0.1`
+
+## 模型配置
+
+默认模型可以直接在 opencode 网页界面里选（OpenCode Zen / DeepSeek free 都在列表里）。
+也可以在启动前设置环境变量指定模型：
+
+```bash
+OPENCODE_MODEL=opencode/deepseek-v4-flash-free opencode serve --port 18888 --hostname 0.0.0.0
+```
+
+## 构建 APP
+
+```bash
+cd android-app
+./gradlew assembleDebug
+# 输出: app/build/outputs/apk/debug/app-debug.apk
+```
+
+或推到 GitHub 自动构建（Actions artifact）。
+
+## 目录
+
+```
+android-app/          Android APP (WebView 前端)
+scripts/
+  aidlux-start.sh     一键启动 server（AidLux）
+  build-all.sh        本地构建
+  gen-icons.py        图标生成
+.github/workflows/    CI 自动构建 APK
+```
+
+## 常见问题
+
+**Q: 打开 APP 显示连不上**
+确认 AidLux 侧 server 在跑：`curl http://127.0.0.1:18888/api/health` 应返回 `{"healthy":true}`
+
+**Q: 想用别的设备访问**
+APP 内改地址为 `http://<AidLux-IP>:18888`，确认 server 用 `--hostname 0.0.0.0` 启动
+
+**Q: opencode 没装**
+`npm install -g opencode-ai` 或用脚本自动装
