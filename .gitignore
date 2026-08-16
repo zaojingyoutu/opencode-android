@@ -1,2 +1,9 @@
 apk-output/
 *.apk
+android-app/.gradle/
+android-app/app/build/
+
+# opencode 二进制由 gradle downloadOpencode 自动下载, 不入库
+android-app/app/src/main/assets/opencode/
+deps/
+

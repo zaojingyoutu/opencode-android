@@ -29,5 +29,12 @@ fi
 echo "Downloading $DOWNLOAD_URL ..."
 curl -sL --progress-bar -o "$OUT_DIR/opencode-linux-arm64-musl.tar.gz" "$DOWNLOAD_URL"
 tar -xzf "$OUT_DIR/opencode-linux-arm64-musl.tar.gz" -C "$OUT_DIR"
+# tar 结构可能不同 (根目录直接是二进制, 或带 bin/ 目录), 统一规整到 bin/opencode
+BIN=$(find "$OUT_DIR" -maxdepth 3 -name opencode -type f | head -1)
+mkdir -p "$OUT_DIR/opencode-linux-arm64-musl/bin"
+if [ "$BIN" != "$OUT_DIR/opencode-linux-arm64-musl/bin/opencode" ]; then
+    cp "$BIN" "$OUT_DIR/opencode-linux-arm64-musl/bin/opencode"
+fi
+chmod +x "$OUT_DIR/opencode-linux-arm64-musl/bin/opencode"
 echo "Downloaded and extracted."
 echo "Binary at: $OUT_DIR/opencode-linux-arm64-musl/bin/opencode"

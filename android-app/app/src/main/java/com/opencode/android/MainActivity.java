@@ -13,22 +13,19 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.*;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * OpenCode Android APP (AidLux 方案)
+ * OpenCode Android APP
  *
- * AidLux = Android + Linux 双系统。
- * opencode server 跑在 AidLux 的 Linux 侧（本机 localhost:18888），
- * 这个 APP 只是一个轻量 WebView 前端。
+ * 两种模式自动切换:
+ * 1. 内置模式 (原生集成): APK 内嵌 opencode 二进制 (arm64-musl),
+ *    本 APP 直接拉起 server 到 127.0.0.1:18888, 任何手机都能用。
+ * 2. 外部模式: 连局域网/AidLux 上已有的 opencode server (server_url 可改)。
  *
- * 启动 server 的方法（AidLux 终端一次）:
- *   opencode serve --port 18888 --hostname 0.0.0.0
- *
- * 也可以填局域网 IP 让局域网内其他设备访问。
+ * 启动流程: 先 ping 外部地址 → 通就加载; 不通且有内置二进制 → 自动启动内置 server。
  */
 public class MainActivity extends Activity {
 
@@ -39,6 +36,10 @@ public class MainActivity extends Activity {
     private TextView statusView;
     private SharedPreferences prefs;
     private String serverUrl;
+    private ServerManager embedded;
+    private boolean embeddedMode = false;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final AtomicBoolean polling = new AtomicBoolean(false);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -46,16 +47,17 @@ public class MainActivity extends Activity {
 
         prefs = getSharedPreferences("opencode_prefs", MODE_PRIVATE);
         serverUrl = prefs.getString("server_url", "http://127.0.0.1:" + DEFAULT_PORT);
+        embedded = ServerManager.get(this);
 
         buildUI();
-        checkServer();
+        setupRetry();
+        tryConnect();
     }
 
     private void buildUI() {
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(0xFF0E1116);
 
-        // WebView
         webView = new WebView(this);
         WebSettings ws = webView.getSettings();
         ws.setJavaScriptEnabled(true);
@@ -84,8 +86,13 @@ public class MainActivity extends Activity {
                     String description, String failingUrl) {
                 super.onReceivedError(view, errorCode, description, failingUrl);
                 progressBar.setVisibility(View.GONE);
-                statusView.setText("无法连接到服务器\n" + serverUrl + "\n\n" +
-                        "请在 AidLux 终端运行:\nopencode serve --port 18888 --hostname 0.0.0.0");
+                if (embeddedMode) {
+                    statusView.setText("内置服务器连接失败\n" + failingUrl +
+                            "\n\n点击重试 (可先查看上方 server 日志)");
+                } else {
+                    statusView.setText("无法连接到服务器\n" + serverUrl + "\n\n" +
+                            "请在 AidLux 终端运行:\nopencode serve --port 18888 --hostname 0.0.0.0");
+                }
                 statusView.setVisibility(View.VISIBLE);
             }
         });
@@ -108,49 +115,102 @@ public class MainActivity extends Activity {
         statusView.setGravity(android.view.Gravity.CENTER);
         statusView.setPadding(48, 0, 48, 0);
         statusView.setTextSize(14);
+        statusView.setHint("点击重试");
         root.addView(statusView);
 
         setContentView(root);
     }
 
-    /** 启动时先检查 server, 通就直接加载, 不通显示提示 (不自动重载避免循环) */
-    private void checkServer() {
+    /** 第一步: 先试外部地址; 不通则走内置模式 */
+    private void tryConnect() {
+        statusView.setText("连接中... " + serverUrl);
+        statusView.setVisibility(View.VISIBLE);
         new Thread(() -> {
             boolean ok = ping(serverUrl);
             runOnUiThread(() -> {
                 if (ok) {
-                    statusView.setVisibility(View.GONE);
-                    webView.loadUrl(serverUrl);
+                    embeddedMode = false;
+                    load();
                 } else {
-                    statusView.setText("无法连接到服务器\n" + serverUrl + "\n\n" +
-                        "在 AidLux 终端运行:\nopencode serve --port 18888 --hostname 0.0.0.0\n\n" +
-                        "然后回到本 APP 重试\n(服务器地址可在设置里修改)");
-                    statusView.setVisibility(View.VISIBLE);
-                    setupLongPressRetry();
+                    embeddedConnect();
                 }
             });
         }).start();
     }
 
-    private void setupLongPressRetry() {
-        statusView.setOnClickListener(v -> {
-            // 点状态文字重试
-            statusView.setText("连接中...");
-            new Thread(() -> {
-                boolean ok = ping(serverUrl);
-                runOnUiThread(() -> {
-                    if (ok) {
-                        statusView.setVisibility(View.GONE);
-                        webView.loadUrl(serverUrl);
-                    } else {
-                        statusView.setText("仍然连不上 " + serverUrl +
-                            "\n确认 AidLux 侧 opencode 已启动");
-                        statusView.setVisibility(View.VISIBLE);
-                    }
-                });
-            }).start();
+    /** 内置模式: 启动内嵌 server 并轮询健康检查 */
+    private void embeddedConnect() {
+        if (!embedded.isSupported()) {
+            statusView.setText("当前设备不是 arm64, 无法使用内置服务器。\n\n" +
+                    "请改用 AidLux 方案:\n" + serverUrl + "\n\n点击重试");
+            return;
+        }
+        if (!embedded.hasEmbeddedBinary()) {
+            statusView.setText("APK 未包含内置 opencode 二进制。\n\n" +
+                    "请改用 AidLux 方案:\n" + serverUrl + "\n\n点击重试");
+            return;
+        }
+        embeddedMode = true;
+        statusView.setText("正在启动内置 OpenCode 服务器...\n(首次启动需解压二进制, 请稍候)");
+        embedded.start((ok, msg) -> {
+            if (ok) {
+                pollHealth(30);
+            } else {
+                statusView.setText("内置服务器启动失败\n" + msg + "\n\n" +
+                        "日志:\n" + embedded.getLogTail(1500) + "\n\n点击重试");
+            }
         });
-        statusView.setHint("点击重试");
+    }
+
+    /** 每 1s ping 一次内置 server, 最多 seconds 秒 */
+    private void pollHealth(final int seconds) {
+        if (!polling.compareAndSet(false, true)) return;
+        statusView.setText("内置服务器启动中... " + embedded.serverUrl());
+        final int[] waited = {0};
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (!polling.get()) return;
+                new Thread(() -> {
+                    boolean ok = ping(embedded.serverUrl());
+                    runOnUiThread(() -> {
+                        if (ok) {
+                            polling.set(false);
+                            load();
+                        } else if (waited[0] >= seconds) {
+                            polling.set(false);
+                            statusView.setText("内置服务器启动超时\n\n日志:\n" +
+                                    embedded.getLogTail(2000) + "\n\n点击重试");
+                        } else {
+                            waited[0]++;
+                            handler.postDelayed(this, 1000);
+                        }
+                    });
+                }).start();
+            }
+        });
+    }
+
+    private void load() {
+        statusView.setVisibility(View.GONE);
+        webView.loadUrl(embeddedMode ? embedded.serverUrl() : serverUrl);
+    }
+
+    /** 点击状态文字重试 */
+    private void setupRetry() {
+        statusView.setOnClickListener(v -> {
+            if (embeddedMode) {
+                if (embedded.isStarting()) {
+                    // 正在启动中, 不要打断, 重新等一轮
+                    pollHealth(30);
+                } else {
+                    embedded.stop();
+                    embeddedConnect();
+                }
+            } else {
+                tryConnect();
+            }
+        });
     }
 
     private boolean ping(String url) {
@@ -187,5 +247,13 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (webView != null) webView.onResume();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        polling.set(false);
+        handler.removeCallbacksAndMessages(null);
+        embedded.stop();
     }
 }

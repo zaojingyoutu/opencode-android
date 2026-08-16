@@ -16,7 +16,8 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop">
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -25,6 +26,6 @@
 
         <meta-data
             android:name="com.opencode.android.VERSION"
-            android:value="0.3.0" />
+            android:value="0.4.0" />
     </application>
 </manifest>
