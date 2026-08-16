@@ -9,8 +9,8 @@ plugins {
 val opencodeAssetDir = layout.projectDirectory.dir("src/main/assets/opencode")
 
 // 版本可由 CI 通过 -PversionName / -PversionCode 注入, 本地构建用默认值
-val releaseVersionName = (project.findProperty("versionName") as String?) ?: "0.4.0"
-val releaseVersionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 4
+val releaseVersionName = (project.findProperty("versionName") as String?) ?: "0.4.1"
+val releaseVersionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 5
 
 fun httpGet(url: String): String {
     val conn = URL(url).openConnection() as HttpURLConnection

@@ -88,8 +88,18 @@ public class ServerManager {
         void onResult(boolean ok, String message);
     }
 
+    /** 启动阶段进度回调 (运行在后台线程, 需要自行切主线程) */
+    public interface Progress {
+        void onProgress(String stage);
+    }
+
     /** 异步启动 server, 结果回到主线程 */
     public void start(final Callback cb) {
+        start(cb, null);
+    }
+
+    /** 异步启动 server, 结果回到主线程; progress 可选, 报告启动阶段 */
+    public void start(final Callback cb, final Progress progress) {
         if (isRunning()) {
             cb.onResult(true, "server 已在运行");
             return;
@@ -102,7 +112,13 @@ public class ServerManager {
         new Thread(() -> {
             String err = null;
             try {
+                if (progress != null) {
+                    progress.onProgress("正在解压二进制 (192MB, 首次约需 1 分钟)...");
+                }
                 File bin = ensureBinary();
+                if (progress != null) {
+                    progress.onProgress("正在启动 OpenCode 服务...");
+                }
                 startProcess(bin);
                 if (stopRequested) {
                     Process pp = process;

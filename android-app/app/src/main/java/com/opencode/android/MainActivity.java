@@ -121,9 +121,9 @@ public class MainActivity extends Activity {
         setContentView(root);
     }
 
-    /** 第一步: 先试外部地址; 不通则走内置模式 */
+    /** 打开即进入: 先快速探测外部 server, 不通则异步启动内置后端; UI 一直显示过渡状态 */
     private void tryConnect() {
-        statusView.setText("连接中... " + serverUrl);
+        statusView.setText("正在启动 OpenCode...\n\n正在检测服务器连接");
         statusView.setVisibility(View.VISIBLE);
         new Thread(() -> {
             boolean ok = ping(serverUrl);
@@ -138,7 +138,7 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    /** 内置模式: 启动内嵌 server 并轮询健康检查 */
+    /** 内置模式: 异步启动内嵌 server, 阶段进度实时显示, 就绪后自动载入 UI */
     private void embeddedConnect() {
         if (!embedded.isSupported()) {
             statusView.setText("当前设备不是 arm64, 无法使用内置服务器。\n\n" +
@@ -151,7 +151,6 @@ public class MainActivity extends Activity {
             return;
         }
         embeddedMode = true;
-        statusView.setText("正在启动内置 OpenCode 服务器...\n(首次启动需解压 192MB 二进制, 请耐心等待 1~2 分钟)");
         embedded.start((ok, msg) -> {
             if (ok) {
                 pollHealth(120);
@@ -159,14 +158,15 @@ public class MainActivity extends Activity {
                 statusView.setText("内置服务器启动失败\n" + msg + "\n\n" +
                         "日志:\n" + embedded.getLogTail(1500) + "\n\n点击重试");
             }
-        });
+        }, stage -> runOnUiThread(() -> {
+            statusView.setText(stage + "\n\n首次启动需要 1~2 分钟, 请耐心等待");
+        }));
     }
 
     /** 每 1s ping 一次内置 server, 最多 seconds 秒 (首次启动含解压+加载 192MB 二进制, 放宽到 2 分钟) */
     private void pollHealth(final int seconds) {
         if (!polling.compareAndSet(false, true)) return;
-        statusView.setText("内置服务器启动中... " + embedded.serverUrl() +
-                "\n(首次启动请耐心等待, 正在解压并加载 192MB 二进制)");
+        statusView.setText("OpenCode 服务启动中...\n\n正在等待就绪, 请稍候");
         final int[] waited = {0};
         handler.post(new Runnable() {
             @Override
