@@ -90,8 +90,8 @@ public class MainActivity extends Activity {
                     statusView.setText("内置服务器连接失败\n" + failingUrl +
                             "\n\n点击重试 (可先查看上方 server 日志)");
                 } else {
-                    statusView.setText("无法连接到服务器\n" + serverUrl + "\n\n" +
-                            "请在 AidLux 终端运行:\nopencode serve --port 18888 --hostname 0.0.0.0");
+                    statusView.setText("外部服务器连接失败\n" + serverUrl +
+                            "\n\n点击重试, 将自动启动内置服务器");
                 }
                 statusView.setVisibility(View.VISIBLE);
             }
@@ -208,7 +208,8 @@ public class MainActivity extends Activity {
                     embeddedConnect();
                 }
             } else {
-                tryConnect();
+                // 外部 server 失败 → 直接启动内置, 避免反复 ping 卡死
+                embeddedConnect();
             }
         });
     }
