@@ -70,7 +70,10 @@ cd android-app
 ./gradlew assembleDebug   # 自动下载 opencode 二进制 (无则下载, 有则跳过)
 ```
 
-或推到 GitHub 自动构建 (Actions artifact / tag 发布 Release)。
+或推到 GitHub 自动构建:
+
+- 每次 push 到 `main` → CI 自动构建 APK → 自动递增版本 (vX.Y.Z → vX.Y.(Z+1)) → 自动发布 GitHub Release
+- 手动发布: 打 tag 如 `v1.0.0` 不会触发自动发布 (自动发布只走 main push)
 
 ## 目录
 

@@ -3,7 +3,6 @@ name: Build Android
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +23,24 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      # 读取最新 release 的 tag, patch 版本 +1; 无 release 时从 0.1.0 开始
+      - name: Compute next version
+        id: ver
+        run: |
+          set -euo pipefail
+          LATEST=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          if [ -z "$LATEST" ]; then
+            NEXT="0.1.0"
+          else
+            TAG="${LATEST#v}"
+            IFS=. read -r MAJ MIN PAT <<< "$TAG"
+            NEXT="$MAJ.$MIN.$((PAT+1))"
+          fi
+          IFS=. read -r M m p <<< "$NEXT"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "code=$((M*10000 + m*100 + p))" >> "$GITHUB_OUTPUT"
+          echo "Next version: $NEXT (versionCode: $((M*10000 + m*100 + p)))"
+
       - name: Download Gradle wrapper
         run: |
           mkdir -p android-app/gradle/wrapper
@@ -35,7 +52,9 @@ jobs:
       - name: Build APK
         run: |
           cd android-app
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleDebug --no-daemon \
+            -PversionName=${{ steps.ver.outputs.next }} \
+            -PversionCode=${{ steps.ver.outputs.code }}
 
       - name: Upload APK (Actions Artifact)
         uses: actions/upload-artifact@v4
@@ -44,11 +63,22 @@ jobs:
           path: android-app/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
+      # 自动打 tag (不会再次触发本 workflow, 因为只监听 main 分支 push)
+      - name: Create and push tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag v${{ steps.ver.outputs.next }}
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" \
+            v${{ steps.ver.outputs.next }}
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: android-app/app/build/outputs/apk/debug/*.apk
-          name: OpenCode Android ${{ github.ref_name }}
+          tag_name: v${{ steps.ver.outputs.next }}
+          name: OpenCode Android v${{ steps.ver.outputs.next }}
           generate_release_notes: true
+          files: android-app/app/build/outputs/apk/debug/*.apk
           fail_on_unmatched_files: true

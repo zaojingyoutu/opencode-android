@@ -8,6 +8,10 @@ plugins {
 
 val opencodeAssetDir = layout.projectDirectory.dir("src/main/assets/opencode")
 
+// 版本可由 CI 通过 -PversionName / -PversionCode 注入, 本地构建用默认值
+val releaseVersionName = (project.findProperty("versionName") as String?) ?: "0.4.0"
+val releaseVersionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 4
+
 fun httpGet(url: String): String {
     val conn = URL(url).openConnection() as HttpURLConnection
     conn.requestMethod = "GET"
@@ -75,8 +79,8 @@ android {
         applicationId = "com.opencode.android"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.4.0"
+        versionCode = releaseVersionCode
+        versionName = releaseVersionName
     }
     buildTypes {
         getByName("release") { isMinifyEnabled = false }
