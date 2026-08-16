@@ -31,13 +31,7 @@ jobs:
           set -euo pipefail
           LATEST=$(curl -sL --max-time 30 \
             "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
-            | python3 -c "
-import sys, json
-rels = json.load(sys.stdin)
-tags = [r['tag_name'] for r in rels if r['tag_name'].startswith('v')]
-tags.sort(key=lambda t: [int(x) for x in t[1:].split('.')])
-print(tags[-1] if tags else '')
-" 2>/dev/null || true)
+            | python3 -c "import sys,json; rels=json.load(sys.stdin); tags=[r['tag_name'] for r in rels if r['tag_name'].startswith('v')]; tags.sort(key=lambda t:[int(x) for x in t[1:].split('.')]); print(tags[-1] if tags else '')" 2>/dev/null || true)
           if [ -z "$LATEST" ]; then
             NEXT="0.1.0"
           else
