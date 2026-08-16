@@ -20,6 +20,83 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Download opencode binary + musl libs
+        run: |
+          set -e
+          mkdir -p /tmp/build-assets/{bin,lib}
+          cd /tmp/build-assets
+
+          # 1. Download opencode ARM64 musl binary
+          echo "=== Downloading opencode binary ==="
+          curl -sL --max-time 60 \
+            -o opencode.tar.gz \
+            "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-arm64-musl.tar.gz"
+          tar -xzf opencode.tar.gz -C .
+          # The tarball extracts a single "opencode" binary at root
+          cp opencode bin/opencode
+          chmod +x bin/opencode
+          echo "Binary: $(ls -lh bin/opencode | awk '{print $5}')"
+
+          # 2. Download musl libc (ARM64) from Alpine edge
+          echo "=== Downloading musl libc ==="
+          curl -sL --max-time 30 \
+            "https://dl-cdn.alpinelinux.org/alpine/edge/releases/aarch64/apks/musl-dev.apk" \
+            -o musl-dev.apk
+          tar -xzf musl-dev.apk -C /tmp/musl-1 2>/dev/null || true
+          if [ -f /tmp/musl-1/usr/lib/libc.musl-aarch64.so.1 ]; then
+            cp /tmp/musl-1/usr/lib/libc.musl-aarch64.so.1 lib/
+          elif find /tmp/musl-1 -name "libc.musl-aarch64.so*" | head -1 | xargs cp -t lib/ 2>/dev/null; then
+            :
+          fi
+          # fallback: musl.apk
+          if [ ! -f lib/libc.musl-aarch64.so.1 ]; then
+            curl -sL --max-time 30 "https://dl-cdn.alpinelinux.org/alpine/edge/releases/aarch64/apks/musl.apk" -o musl.apk
+            tar -xzf musl.apk -C /tmp/musl-2 2>/dev/null || true
+            find /tmp/musl-2 -name "libc.musl-aarch64.so*" | head -1 | xargs cp -t lib/ 2>/dev/null || true
+          fi
+
+          # 3. Download libstdc++ and libgcc_s (ARM64) from Alpine GCC
+          echo "=== Downloading libstdc++ ==="
+          curl -sL --max-time 30 \
+            "https://dl-cdn.alpinelinux.org/alpine/edge/releases/aarch64/apks/libstdc++.apk" \
+            -o libstdc++.apk
+          tar -xzf libstdc++.apk -C /tmp/stdc 2>/dev/null || true
+          find /tmp/stdc -name "libstdc++.so*" | head -1 | xargs cp -t lib/ 2>/dev/null || true
+
+          echo "=== Downloading libgcc_s ==="
+          curl -sL --max-time 30 \
+            "https://dl-cdn.alpinelinux.org/alpine/edge/releases/aarch64/apks/libgcc.apk" \
+            -o libgcc.apk
+          tar -xzf libgcc.apk -C /tmp/libgcc 2>/dev/null || true
+          find /tmp/libgcc -name "libgcc_s.so*" | head -1 | xargs cp -t lib/ 2>/dev/null || true
+
+          # Fallback: download ARM64 cross toolchain from musl.cc
+          if [ ! -f lib/libstdc++.so.6 ] || [ ! -f lib/libgcc_s.so.1 ]; then
+            echo "=== Downloading musl.cc ARM64 toolchain (fallback) ==="
+            curl -sL --max-time 120 \
+              "https://musl.cc/aarch64-linux-musl-cross.tgz" \
+              -o /tmp/toolchain.tgz
+            mkdir -p /tmp/toolchain
+            tar -xzf /tmp/toolchain.tgz -C /tmp/toolchain
+            find /tmp/toolchain -name "libstdc++.so*" | head -1 | xargs cp -t lib/ 2>/dev/null || true
+            find /tmp/toolchain -name "libgcc_s.so*" | head -1 | xargs cp -t lib/ 2>/dev/null || true
+          fi
+
+          # Final check
+          echo "=== Final lib contents ==="
+          ls -lh lib/
+          echo "=== Final binary ==="
+          ls -lh bin/
+
+          # 3. Copy assets into APK project
+          cd /home/runner/work/opencode-android/opencode-android
+          mkdir -p android-app/app/src/main/assets/{bin,lib}
+          cp /tmp/build-assets/bin/opencode android-app/app/src/main/assets/bin/
+          cp /tmp/build-assets/lib/* android-app/app/src/main/assets/lib/ 2>/dev/null || true
+          echo "=== Assets copied ==="
+          ls -lh android-app/app/src/main/assets/bin/
+          ls -lh android-app/app/src/main/assets/lib/
+
       - name: Download Gradle wrapper
         run: |
           mkdir -p android-app/gradle/wrapper
@@ -27,7 +104,6 @@ jobs:
             -o android-app/gradle/wrapper/gradle-wrapper.jar \
             "https://raw.githubusercontent.com/gradle/gradle/v8.7.0/gradle/wrapper/gradle-wrapper.jar"
           chmod +x android-app/gradlew
-          cd android-app && ./gradlew --version
 
       - name: Build APK
         run: |
@@ -39,22 +115,3 @@ jobs:
         with:
           name: opencode-android.apk
           path: android-app/app/build/outputs/apk/debug/app-debug.apk
-
-  build-termux-deb:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download opencode binary
-        run: |
-          sudo apt-get update && sudo apt-get install -y dpkg curl
-          ./scripts/download-deps.sh
-
-      - name: Build Termux .deb
-        run: ./termux-deb/build.sh
-
-      - name: Upload .deb
-        uses: actions/upload-artifact@v4
-        with:
-          name: opencode-termux.deb
-          path: termux-deb/output/*.deb
