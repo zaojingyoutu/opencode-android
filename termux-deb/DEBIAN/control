@@ -3,10 +3,9 @@ Version: 0.1.0
 Section: terminal
 Architecture: aarch64
 Maintainer: opencode-android <maintainer@example.com>
-Depends: proot-distro, nodejs, python
+Depends: nodejs, python
 Description: OpenCode - AI Coding Agent for Termux
-OpenCode Android packaging runs the opencode terminal agent inside Termux.
-Provides a CLI coding agent with AI model access.
-Requires: nodejs, python, git (optional)
-.
-Run: opencode [command]
+ OpenCode runs as a terminal-based coding agent inside Termux.
+ Provides AI-powered coding assistance with multiple model support.
+ Requires nodejs and python from Termux packages.
+ Run: opencode [command]
