@@ -27,7 +27,7 @@ import java.net.URL;
 public class MainActivity extends Activity {
 
     private static final int PORT = 18888;
-    private static final String APP_NAME = "opencode";
+    private static final String APP_NAME = "opencode.bin";
 
     private WebView webView;
     private ProgressBar progressBar;

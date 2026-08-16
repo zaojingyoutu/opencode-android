@@ -26,4 +26,8 @@ android {
             isUniversalApk = false
         }
     }
+    aaptOptions {
+        // 跳过压缩以 .bin 结尾的资产（192MB ELF 二进制无需压缩）
+        ignoreAssetsPattern = "!*.bin:*"
+    }
 }
