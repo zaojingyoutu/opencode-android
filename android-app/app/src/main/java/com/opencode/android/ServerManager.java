@@ -53,6 +53,7 @@ public class ServerManager {
     private volatile Process process;
     private volatile boolean stopRequested = false;
     private File logFile;
+    private final DnsProxy dnsProxy = new DnsProxy();
 
     public static synchronized ServerManager get(Context ctx) {
         if (instance == null) {
@@ -144,6 +145,7 @@ public class ServerManager {
     /** 停止子进程 (不阻塞等待) */
     public void stop() {
         stopRequested = true;
+        dnsProxy.stop();
         Process p = process;
         process = null;
         if (p != null) {
@@ -244,6 +246,39 @@ public class ServerManager {
         return f.delete();
     }
 
+    /** 写 resolv.conf 到 patch 后的路径 (musl 从那里读 nameserver) */
+    private void writeResolvConf() {
+        File f = new File(dataRoot(), "resolv.conf");
+        StringBuilder sb = new StringBuilder();
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                android.net.Network[] nets = cm.getAllNetworks();
+                for (android.net.Network n : nets) {
+                    android.net.LinkProperties lp = cm.getLinkProperties(n);
+                    if (lp != null) {
+                        for (java.net.InetAddress dns : lp.getDnsServers()) {
+                            String h = dns.getHostAddress();
+                            if (h != null && !dns.isLoopbackAddress() && h.indexOf('%') < 0) {
+                                sb.append("nameserver ").append(h).append('\n');
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        sb.append("nameserver 223.5.5.5\n");
+        sb.append("nameserver 8.8.8.8\n");
+        try (OutputStream out = new FileOutputStream(f)) {
+            out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
+            Log.i(TAG, "resolv.conf written:\n" + sb);
+        } catch (IOException e) {
+            Log.w(TAG, "cannot write resolv.conf", e);
+        }
+    }
+
     /** 清理上次残留的 server 进程 (通过 pid 文件; 同 uid 可直接 kill) */
     private static void killStaleServer(File root) {
         File pidFile = new File(root, "server.pid");
@@ -303,6 +338,13 @@ public class ServerManager {
 
         // 清理上次残留的 server 进程 (APP 被系统杀时子进程会成孤儿继续占端口)
         killStaleServer(root);
+
+        // musl 的 getaddrinfo 读不到 Android 的 /etc/resolv.conf (不存在),
+        // 二进制已 patch 指向 files/opencode/resolv.conf, 这里写入真实 DNS 配置
+        writeResolvConf();
+
+        // musl/Bun 读不到 /etc/resolv.conf, 在 127.0.0.1:53 架 DNS 代理让 Bun 能解析域名
+        dnsProxy.start();
 
         ProcessBuilder pb = new ProcessBuilder(
                 bin.getAbsolutePath(),

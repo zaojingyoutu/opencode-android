@@ -89,6 +89,10 @@ tasks.register("downloadOpencode") {
         val interp = "/data/user/0/com.opencode.android/files/opencode/lib/ld-musl-aarch64.so.1"
         val patchScript = rootProject.projectDir.parentFile.resolve("scripts/patch_interp.py").absolutePath
         runPython(patchScript, bin.absolutePath, interp)
+        // Android 无 /etc/resolv.conf, musl 的 DNS 会完全失效:
+        // 把 resolv.conf 路径重定向到 app 私有目录, APP 启动时写入真实配置
+        runPython(rootProject.projectDir.parentFile.resolve("scripts/patch_resolv.py").absolutePath,
+                bin.absolutePath)
 
         // ---- 2. alpine minirootfs (musl loader) ----
         val rtBase = "https://dl-cdn.alpinelinux.org/alpine/latest-stable"
