@@ -1,6 +1,7 @@
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 
 plugins {
     id("com.android.application") version "8.5.2"
@@ -89,10 +90,6 @@ tasks.register("downloadOpencode") {
         val interp = "/data/user/0/com.opencode.android/files/opencode/lib/ld-musl-aarch64.so.1"
         val patchScript = rootProject.projectDir.parentFile.resolve("scripts/patch_interp.py").absolutePath
         runPython(patchScript, bin.absolutePath, interp)
-        // Android 无 /etc/resolv.conf, musl 的 DNS 会完全失效:
-        // 把 resolv.conf 路径重定向到 app 私有目录, APP 启动时写入真实配置
-        runPython(rootProject.projectDir.parentFile.resolve("scripts/patch_resolv.py").absolutePath,
-                bin.absolutePath)
 
         // ---- 2. alpine minirootfs (musl loader) ----
         val rtBase = "https://dl-cdn.alpinelinux.org/alpine/latest-stable"
@@ -104,6 +101,12 @@ tasks.register("downloadOpencode") {
             into(extracted)
         }
         val loader = extracted.walkTopDown().first { it.name == "ld-musl-aarch64.so.1" }
+        // Android 无 /etc/resolv.conf, musl (opencode 的 libc) 的 DNS 会完全失效,
+        // 报告 "Unable to connect" / "typo in url or port" 等误导性错误。
+        // musl 的 resolv.conf/hosts 路径字符串在 libc (loader 同一文件) 里,
+        // 重定向到 app 私有目录, APP 启动时写入真实 resolv.conf。
+        runPython(rootProject.projectDir.parentFile.resolve("scripts/patch_musl.py").absolutePath,
+                loader.absolutePath)
 
         // ---- 3. libgcc / libstdc++ / ca-certificates (alpine main repo, 只取主包) ----
         val mainIdx = "$rtBase/main/aarch64/"
@@ -159,8 +162,13 @@ tasks.register("downloadOpencode") {
             into(File(outputDir.asFile, "lib"))
             rename { "ca-certificates.crt" }
         }
-        file("$outputDir/version.txt").writeText(tag)
-        logger.lifecycle("opencode runtime $tag ready in $outputDir")
+        // version.txt 同时包含运行时资产指纹: ServerManager 据此判断是否需要重新提取。
+        // opencode 版本号 + loader (musl libc, 含 resolv.conf 重定向 patch) 的 SHA-256,
+        // 这样任何二进制/patch 变化都会触发重新提取, 避免旧 APK 残留未 patch 的 libc。
+        val loaderHash = MessageDigest.getInstance("SHA-256")
+            .digest(loader.readBytes()).take(8).joinToString("") { "%02x".format(it) }
+        file("$outputDir/version.txt").writeText("$tag-$loaderHash")
+        logger.lifecycle("opencode runtime $tag ($loaderHash) ready in $outputDir")
     }
 }
 

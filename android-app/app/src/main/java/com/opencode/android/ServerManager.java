@@ -53,7 +53,6 @@ public class ServerManager {
     private volatile Process process;
     private volatile boolean stopRequested = false;
     private File logFile;
-    private final DnsProxy dnsProxy = new DnsProxy();
 
     public static synchronized ServerManager get(Context ctx) {
         if (instance == null) {
@@ -145,7 +144,6 @@ public class ServerManager {
     /** 停止子进程 (不阻塞等待) */
     public void stop() {
         stopRequested = true;
-        dnsProxy.stop();
         Process p = process;
         process = null;
         if (p != null) {
@@ -212,7 +210,11 @@ public class ServerManager {
             extractAsset(asset, new File(libDir, asset.substring(asset.lastIndexOf('/') + 1)));
         }
         for (String asset : ASSET_LIBS) {
-            setReadable(new File(libDir, asset.substring(asset.lastIndexOf('/') + 1)));
+            File lib = new File(libDir, asset.substring(asset.lastIndexOf('/') + 1));
+            // 必须给执行位: ld-musl 是 libopencode.so 的 PT_INTERP,
+            // 内核 execve 要求解释器可执行, 否则 error=13 Permission denied。
+            lib.setExecutable(true, false);
+            setReadable(lib);
         }
         try (OutputStream out = new FileOutputStream(verFile)) {
             out.write(assetVersion.getBytes(StandardCharsets.UTF_8));
@@ -254,10 +256,10 @@ public class ServerManager {
             Log.i(TAG, "config already exists, skipping default config");
             return;
         }
-        // 默认使用 opencode Zen 免费模型 (api.z.ai, 国内可直连, 无需 API Key)
+        // 默认使用 opencode 内置免费模型 (models.dev 提供, 无需 API Key)
         // 用户可在 Web UI 设置中添加其他 provider
         String config = "{\n" +
-            "  \"model\": \"opencode-zen/deepseek-v4-flash-free\"\n" +
+            "  \"model\": \"opencode/deepseek-v4-flash-free\"\n" +
             "}\n";
         try (OutputStream out = new FileOutputStream(configFile)) {
             out.write(config.getBytes(StandardCharsets.UTF_8));
@@ -268,7 +270,10 @@ public class ServerManager {
     /** 写 resolv.conf 到 patch 后的路径 (musl 从那里读 nameserver) */
     private void writeResolvConf() {
         File f = new File(dataRoot(), "resolv.conf");
-        StringBuilder sb = new StringBuilder();
+        // musl 的 getaddrinfo 只读 resolv.conf 里的前 3 个 nameserver (MAXNS=3)。
+        // 系统 DNS 常常把不可用的 IPv6 地址排在最前, 导致解析完全失败;
+        // 因此优先放可靠公共 DNS, 再补系统 IPv4 DNS, 最多 3 个。
+        java.util.List<String> servers = new java.util.ArrayList<>();
         try {
             android.net.ConnectivityManager cm =
                     (android.net.ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -279,8 +284,10 @@ public class ServerManager {
                     if (lp != null) {
                         for (java.net.InetAddress dns : lp.getDnsServers()) {
                             String h = dns.getHostAddress();
-                            if (h != null && !dns.isLoopbackAddress() && h.indexOf('%') < 0) {
-                                sb.append("nameserver ").append(h).append('\n');
+                            // 只要 IPv4 (musl 前 3 个里混入不可达 IPv6 会直接解析失败)
+                            if (h != null && !dns.isLoopbackAddress() && h.indexOf('%') < 0
+                                    && h.indexOf(':') < 0) {
+                                servers.add(h);
                             }
                         }
                     }
@@ -288,8 +295,18 @@ public class ServerManager {
             }
         } catch (Exception ignored) {
         }
-        sb.append("nameserver 223.5.5.5\n");
-        sb.append("nameserver 8.8.8.8\n");
+        StringBuilder sb = new StringBuilder();
+        for (String s : new String[]{"223.5.5.5", "114.114.114.114", "8.8.8.8"}) {
+            if (sb.toString().split("\n").length >= 3) break;
+            sb.append("nameserver ").append(s).append('\n');
+        }
+        for (String s : servers) {
+            if (sb.toString().split("\n").length >= 3) break;
+            String line = "nameserver " + s + "\n";
+            if (!sb.toString().contains(line)) {
+                sb.append(line);
+            }
+        }
         try (OutputStream out = new FileOutputStream(f)) {
             out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
             Log.i(TAG, "resolv.conf written:\n" + sb);
@@ -364,9 +381,6 @@ public class ServerManager {
         // musl 的 getaddrinfo 读不到 Android 的 /etc/resolv.conf (不存在),
         // 二进制已 patch 指向 files/opencode/resolv.conf, 这里写入真实 DNS 配置
         writeResolvConf();
-
-        // musl/Bun 读不到 /etc/resolv.conf, 在 127.0.0.1:53 架 DNS 代理让 Bun 能解析域名
-        dnsProxy.start();
 
         ProcessBuilder pb = new ProcessBuilder(
                 bin.getAbsolutePath(),
