@@ -12,3 +12,7 @@ android-app/app/src/main/jniLibs/
 android-app/app/src/main/assets/opencode/
 deps/
 android-app/.omo/
+
+# 临时 openssl 中间产物 (最终 keystore 已提交)
+android-app/debug-key.pem
+android-app/debug-cert.pem

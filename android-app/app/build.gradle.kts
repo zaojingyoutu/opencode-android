@@ -10,8 +10,8 @@ plugins {
 val opencodeAssetDir = layout.projectDirectory.dir("src/main/assets/opencode")
 
 // 版本可由 CI 通过 -PversionName / -PversionCode 注入, 本地构建用默认值
-val releaseVersionName = (project.findProperty("versionName") as String?) ?: "0.5.1"
-val releaseVersionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 7
+val releaseVersionName = (project.findProperty("versionName") as String?) ?: "0.7.0"
+val releaseVersionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 1000007
 
 fun httpGet(url: String): String {
     val conn = URL(url).openConnection() as HttpURLConnection
@@ -179,6 +179,15 @@ tasks.matching { it.name == "preBuild" }.configureEach {
 android {
     namespace = "com.opencode.android"
     compileSdk = 34
+    signingConfigs {
+        create("release") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+            storeType = "PKCS12"
+        }
+    }
     defaultConfig {
         applicationId = "com.opencode.android"
         minSdk = 24
@@ -187,7 +196,13 @@ android {
         versionName = releaseVersionName
     }
     buildTypes {
-        getByName("release") { isMinifyEnabled = false }
+        getByName("release") {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
+        }
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("release")
+        }
     }
     packagingOptions {
         jniLibs {
