@@ -365,6 +365,13 @@ public class ServerManager {
         File cache = new File(root, "cache");
         File tmp = new File(root, "tmp");
         File libDir = new File(root, "lib");
+        // 方案 B：把 opencode 的文件浏览根目录指向 APP 在外部共享存储的专属目录。
+        // getExternalFilesDir(null) 返回形如 /storage/emulated/0/Android/data/com.opencode.android/files，
+        // 该目录 APP 自身无需申请任何存储权限即可读写；用户通过 opencode Web UI 在此目录下创建/编辑/保存文件。
+        File appExternal = ctx.getExternalFilesDir(null);
+        if (appExternal != null) appExternal.mkdirs();
+        File projects = new File(appExternal != null ? appExternal : root, "Projects");
+        projects.mkdirs();
         home.mkdirs();
         cfg.mkdirs();
         data.mkdirs();
@@ -388,9 +395,9 @@ public class ServerManager {
                 "--port", String.valueOf(PORT),
                 "--hostname", "127.0.0.1");
         pb.redirectErrorStream(true);
-        // cwd 用 home 目录, opencode Web UI 里的文件浏览从用户根目录开始
-        pb.directory(home);
-        pb.environment().put("HOME", home.getAbsolutePath());
+        // cwd 用 projects 目录, opencode Web UI 里的文件浏览从用户根目录开始
+        pb.directory(projects);
+        pb.environment().put("HOME", projects.getAbsolutePath());
         pb.environment().put("XDG_CONFIG_HOME", cfg.getAbsolutePath());
         pb.environment().put("XDG_DATA_HOME", data.getAbsolutePath());
         pb.environment().put("XDG_CACHE_HOME", cache.getAbsolutePath());
