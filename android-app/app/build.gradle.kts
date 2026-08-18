@@ -178,8 +178,8 @@ tasks.matching { it.name == "preBuild" }.configureEach {
 }
 
 /**
- * 下载 alpine aarch64-musl 的 git + pcore2 库到 assets/opencode/
- * git 动态依赖 libpcore2-8.so.0，pcore2 apk 一起提取。
+ * 下载 alpine aarch64-musl 的 git + pcre2 库到 assets/opencode/
+ * git 动态依赖 libpcre2-8.so.0，pcre2 apk 一起提取。
  * opencode 的 AI 子进程通过 PATH 里的 git 执行 git 命令。
  */
 tasks.register("downloadGit") {
@@ -189,9 +189,9 @@ tasks.register("downloadGit") {
     doLast {
         val build = layout.buildDirectory
         val gitApk = build.file("git-2.47.3-r0.apk").get().asFile
-        val pcore2Apk = build.file("pcore2-10.43-r0.apk").get().asFile
+        val pcre2Apk = build.file("pcre2-10.43-r0.apk").get().asFile
         download("https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/git-2.47.3-r0.apk", gitApk)
-        download("https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/pcore2-10.43-r0.apk", pcore2Apk)
+        download("https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/pcre2-10.43-r0.apk", pcre2Apk)
 
         val gitBinDir = File(outputDir.asFile, "bin"); gitBinDir.mkdirs()
         copy {
@@ -205,21 +205,28 @@ tasks.register("downloadGit") {
             eachFile { path = name }
             into(gitBinDir)
         }
+        // git 也是动态链接 musl 的, 需要把 PT_INTERP 指向 app 私有目录的 loader,
+        // 否则 exec 时报 "No such file or directory" (interp=/lib/ld-musl-aarch64.so.1 不存在)。
+        val gitInterp = "/data/user/0/com.opencode.android/files/opencode/lib/ld-musl-aarch64.so.1"
+        val patchScript = rootProject.projectDir.parentFile.resolve("scripts/patch_interp.py").absolutePath
+        for (g in listOf("git", "git-remote-http", "git-http-fetch", "git-http-push", "git-sh-i18n--envsubst")) {
+            runPython(patchScript, File(gitBinDir, g).absolutePath, gitInterp)
+        }
 
         val libDir = File(outputDir.asFile, "lib"); libDir.mkdirs()
         copy {
-            from(tarTree(project.resources.gzip(pcore2Apk))) {
-                include("usr/lib/libpcore2-8.so.0.*")
+            from(tarTree(project.resources.gzip(pcre2Apk))) {
+                include("usr/lib/libpcre2-8.so.0.*")
             }
             eachFile { path = name }
             into(libDir)
         }
-        // apk 里的 libpcore2-8.so.0 是软链接, gradle copy 后变文本文件, musl 无法解析。
+        // apk 里的 libpcre2-8.so.0 是软链接, gradle copy 后变文本文件, musl 无法解析。
         // 复制 .so.0.12.0 重命名为 .so.0（真实二进制），功能等价于软链接。
         copy {
-            from(File(libDir, "libpcore2-8.so.0.12.0"))
+            from(File(libDir, "libpcre2-8.so.0.12.0"))
             into(libDir)
-            rename("libpcore2-8.so.0.12.0", "libpcore2-8.so.0")
+            rename("libpcre2-8.so.0.12.0", "libpcre2-8.so.0")
         }
     }
 }
@@ -229,7 +236,7 @@ android {
     compileSdk = 34
     signingConfigs {
         create("release") {
-            storeFile = file("debug.keystore")
+            storeFile = file("../debug.keystore")
             storePassword = "android"
             keyAlias = "androiddebugkey"
             keyPassword = "android"

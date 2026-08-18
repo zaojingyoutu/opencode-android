@@ -41,6 +41,7 @@ public class ServerManager {
             "opencode/lib/ld-musl-aarch64.so.1",
             "opencode/lib/libgcc_s.so.1",
             "opencode/lib/libstdc++.so.6",
+            "opencode/lib/libpcre2-8.so.0",
             "opencode/lib/ca-certificates.crt",
     };
     private static final String[] ASSET_GIT = {
