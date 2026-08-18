@@ -43,10 +43,18 @@ public class ServerManager {
             "opencode/lib/libstdc++.so.6",
             "opencode/lib/ca-certificates.crt",
     };
+    private static final String[] ASSET_GIT = {
+            "opencode/bin/git",
+            "opencode/bin/git-remote-http",
+            "opencode/bin/git-http-fetch",
+            "opencode/bin/git-http-push",
+            "opencode/bin/git-sh-i18n--envsubst",
+    };
 
     private static volatile ServerManager instance;
 
     private final Context ctx;
+    private File gitDir;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AtomicBoolean starting = new AtomicBoolean(false);
 
@@ -216,6 +224,18 @@ public class ServerManager {
             lib.setExecutable(true, false);
             setReadable(lib);
         }
+        // 提取 git 二进制 + 子命令（让 opencode 的 AI 子进程能调用 git 命令）
+        gitDir = new File(root, "git");
+        gitDir.mkdirs();
+        for (String asset : ASSET_GIT) {
+            File f = new File(gitDir, asset.substring(asset.lastIndexOf('/') + 1));
+            try {
+                extractAsset(asset, f);
+                f.setExecutable(true, false);
+                setReadable(f);
+            } catch (Exception ignored) {
+            }
+        }
         try (OutputStream out = new FileOutputStream(verFile)) {
             out.write(assetVersion.getBytes(StandardCharsets.UTF_8));
         }
@@ -359,12 +379,13 @@ public class ServerManager {
 
     private void startProcess(File bin) throws IOException {
         File root = dataRoot();
-        File home = new File(root, "home");
-        File cfg = new File(root, "config");
-        File data = new File(root, "data");
-        File cache = new File(root, "cache");
-        File tmp = new File(root, "tmp");
-        File libDir = new File(root, "lib");
+        // HOME 指向私有目录：安全存放 opencode 的登录态、API Key、模型配置
+        File home = new File(ctx.getFilesDir(), "home");
+        File cfg = new File(ctx.getFilesDir(), "config");
+        File data = new File(ctx.getFilesDir(), "data");
+        File cache = new File(ctx.getFilesDir(), "cache");
+        File tmp = new File(ctx.getFilesDir(), "tmp");
+        // 项目/代码目录指向外部：卸载不丢，可被其他文件管理器访问
         // 方案 B：把 opencode 的文件浏览根目录指向 APP 在外部共享存储的专属目录。
         // getExternalFilesDir(null) 返回形如 /storage/emulated/0/Android/data/com.opencode.android/files，
         // 该目录 APP 自身无需申请任何存储权限即可读写；用户通过 opencode Web UI 在此目录下创建/编辑/保存文件。
@@ -372,11 +393,9 @@ public class ServerManager {
         if (appExternal != null) appExternal.mkdirs();
         File projects = new File(appExternal != null ? appExternal : root, "Projects");
         projects.mkdirs();
-        home.mkdirs();
-        cfg.mkdirs();
-        data.mkdirs();
-        cache.mkdirs();
-        tmp.mkdirs();
+        // 保留 lib 目录在 root 下（用于 musl loader / ca-certificates，不需要用户访问）
+        File libDir = new File(root, "lib");
+        home.mkdirs(); cfg.mkdirs(); data.mkdirs(); cache.mkdirs(); tmp.mkdirs(); libDir.mkdirs();
         logFile = new File(root, "server.log");
 
         // 写入默认 opencode 配置 (指定免费模型, 用户可在 Web UI 中改)
@@ -397,7 +416,7 @@ public class ServerManager {
         pb.redirectErrorStream(true);
         // cwd 用 projects 目录, opencode Web UI 里的文件浏览从用户根目录开始
         pb.directory(projects);
-        pb.environment().put("HOME", projects.getAbsolutePath());
+        pb.environment().put("HOME", home.getAbsolutePath());
         pb.environment().put("XDG_CONFIG_HOME", cfg.getAbsolutePath());
         pb.environment().put("XDG_DATA_HOME", data.getAbsolutePath());
         pb.environment().put("XDG_CACHE_HOME", cache.getAbsolutePath());
@@ -405,6 +424,13 @@ public class ServerManager {
         pb.environment().put("LD_LIBRARY_PATH", libDir.getAbsolutePath());
         pb.environment().put("SSL_CERT_FILE", new File(libDir, "ca-certificates.crt").getAbsolutePath());
         pb.environment().put("TERM", "xterm-256color");
+        // git 目录加入 PATH, 让 opencode 的 AI 子进程能调用 git 命令 (git add/commit/push 等)
+        if (gitDir != null && gitDir.exists()) {
+            String path = pb.environment().get("PATH");
+            if (path != null) {
+                pb.environment().put("PATH", gitDir.getAbsolutePath() + File.separator + path);
+            }
+        }
 
         process = pb.start();
         final Process proc = process;

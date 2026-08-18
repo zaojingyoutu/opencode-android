@@ -174,6 +174,54 @@ tasks.register("downloadOpencode") {
 
 tasks.matching { it.name == "preBuild" }.configureEach {
     dependsOn("downloadOpencode")
+    dependsOn("downloadGit")
+}
+
+/**
+ * 下载 alpine aarch64-musl 的 git + pcore2 库到 assets/opencode/
+ * git 动态依赖 libpcore2-8.so.0，pcore2 apk 一起提取。
+ * opencode 的 AI 子进程通过 PATH 里的 git 执行 git 命令。
+ */
+tasks.register("downloadGit") {
+    val outputDir = opencodeAssetDir
+    outputs.dir(outputDir)
+    onlyIf { !file("$outputDir/bin/git").exists() }
+    doLast {
+        val build = layout.buildDirectory
+        val gitApk = build.file("git-2.47.3-r0.apk").get().asFile
+        val pcore2Apk = build.file("pcore2-10.43-r0.apk").get().asFile
+        download("https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/git-2.47.3-r0.apk", gitApk)
+        download("https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/pcore2-10.43-r0.apk", pcore2Apk)
+
+        val gitBinDir = File(outputDir.asFile, "bin"); gitBinDir.mkdirs()
+        copy {
+            from(tarTree(project.resources.gzip(gitApk))) {
+                include("usr/bin/git")
+                include("usr/libexec/git-core/git-remote-http")
+                include("usr/libexec/git-core/git-http-fetch")
+                include("usr/libexec/git-core/git-http-push")
+                include("usr/libexec/git-core/git-sh-i18n--envsubst")
+            }
+            eachFile { path = name }
+            into(gitBinDir)
+        }
+
+        val libDir = File(outputDir.asFile, "lib"); libDir.mkdirs()
+        copy {
+            from(tarTree(project.resources.gzip(pcore2Apk))) {
+                include("usr/lib/libpcore2-8.so.0.*")
+            }
+            eachFile { path = name }
+            into(libDir)
+        }
+        // apk 里的 libpcore2-8.so.0 是软链接, gradle copy 后变文本文件, musl 无法解析。
+        // 复制 .so.0.12.0 重命名为 .so.0（真实二进制），功能等价于软链接。
+        copy {
+            from(File(libDir, "libpcore2-8.so.0.12.0"))
+            into(libDir)
+            rename("libpcore2-8.so.0.12.0", "libpcore2-8.so.0")
+        }
+    }
 }
 
 android {
