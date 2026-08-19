@@ -109,8 +109,6 @@ scripts/
   build_rootfs.py      组装 Alpine rootfs (minirootfs + opencode + git/libs + CA)
   prepare_proot.py     从 termux deb 解出 proot/loader/依赖库
   build-all.sh         本地构建
-  gen-icons.py         图标生成
-termux-deb/           Termux .deb 打包 (可选)
 .github/workflows/    CI 自动构建 APK + tag 发布 Release
 ```
 

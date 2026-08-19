@@ -367,30 +367,17 @@ public class ServerManager {
         }
     }
 
-    private String projectsPath = "";
-
-    /** 当前项目目录 (容器内 /workspace 对应的宿主路径) */
-    public String projectDir() {
-        if (projectsPath.isEmpty()) projectsDir();
-        return projectsPath;
-    }
-
     /** 项目目录: 固定 /sdcard/opencode (卸载不丢, 文件管理器可见);
      *  未授予"所有文件访问"权限或创建失败时回退 app 专属外部目录 (卸载会删) */
     private File projectsDir() {
         File pub = new File(Environment.getExternalStorageDirectory(), "opencode");
-        if (pub.exists() || pub.mkdirs()) {
-            if (pub.isDirectory()) {
-                projectsPath = pub.getAbsolutePath();
-                seedReadme(pub);
-                return pub;
-            }
+        if ((pub.exists() || pub.mkdirs()) && pub.isDirectory()) {
+            seedReadme(pub);
+            return pub;
         }
         File appExternal = ctx.getExternalFilesDir(null);
         if (appExternal != null) appExternal.mkdirs();
-        File def = new File(appExternal != null ? appExternal : dataRoot(), "Projects");
-        projectsPath = def.getAbsolutePath();
-        return def;
+        return new File(appExternal != null ? appExternal : dataRoot(), "Projects");
     }
 
     /** 首次使用在公开目录放一个说明文件, 提示用户项目都放这里 */

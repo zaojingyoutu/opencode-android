@@ -16,8 +16,9 @@ android-app/local.properties
 # opencode 运行环境 (二进制+musl库) 由 gradle downloadOpencode 自动下载, 不入库
 android-app/app/src/main/jniLibs/
 android-app/app/src/main/assets/opencode/
-deps/
-android-app/.omo/
+
+# opencode 本地会话产物, 不入库
+**/.omo/
 
 # 临时 openssl 中间产物 (最终 keystore 已提交)
 android-app/debug-key.pem
