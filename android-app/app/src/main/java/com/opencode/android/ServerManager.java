@@ -2,10 +2,12 @@ package com.opencode.android;
 
 import android.content.Context;
 import android.os.Build;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -15,47 +17,43 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.zip.GZIPInputStream;
 
 /**
- * 内嵌 opencode server 管理器。
+ * 内嵌 opencode server 管理器 (proot 容器模式)。
  *
- * opencode (linux-arm64-musl) 是动态链接 musl 的二进制, 需要:
- *   - ld-musl-aarch64.so.1   (musl loader, interp 已 patchelf 指向固定路径)
- *   - libgcc_s.so.1 / libstdc++.so.6  (C/C++ 运行时)
- * 这些文件打包在 APK assets/opencode/ 里, 首次启动提取到
- *   /data/user/0/<pkg>/files/opencode/{bin,lib}
- * (interp 写死该路径, 因此不能换位置)。
- *
- * 启动: opencode serve --port 18888 --hostname 127.0.0.1
- * 环境: HOME/XDG_CONFIG_HOME/XDG_DATA_HOME/XDG_CACHE_HOME/TMPDIR -> app 私有目录,
- *       LD_LIBRARY_PATH -> lib 目录。
- * APP 退出时 (onDestroy) 调用 stop() 杀掉子进程。
+ * 原理: 在 Android 上跑一个完整的 Alpine Linux (arm64) 容器:
+ *   - proot (termux 编译, bionic 链接) 以系统调用拦截方式伪 chroot,
+ *     放在 nativeLibraryDir (libproot.so), 极端 ROM 也允许执行;
+ *   - Alpine rootfs 打包在 APK assets/opencode/rootfs.tar (纯 tar, 首次启动解压到
+ *     files/opencode/rootfs (容器内二进制由 proot 的 loader 直接 mmap 加载, 只需读权限);
+ *   - 启动命令:
+ *       libproot.so -0 -r <rootfs> -b <projects>:/workspace -b <home>:/root \
+ *                   -b <resolv.conf>:/etc/resolv.conf -b /dev -b /proc -b /sys \
+ *                   -w /workspace --kill-on-exit /bin/sh -c \
+ *                   "opencode serve --port 18888 --hostname 127.0.0.1"
+ *   - 用户在 Web UI 终端里可 apk add nodejs python3 git gcc 等任意工具。
+ * APP 退出时进程继续由前台服务 (ServerService) 保持运行; 用户从通知栏点"停止"
+ * 或调用 stop() 才会杀掉 proot 进程 (--kill-on-exit 会带走全部子进程)。
  */
 public class ServerManager {
 
     private static final String TAG = "OpenCodeServer";
     private static final int PORT = 18888;
     private static final String ASSET_VERSION = "opencode/version.txt";
-    private static final String[] ASSET_LIBS = {
-            "opencode/lib/ld-musl-aarch64.so.1",
-            "opencode/lib/libgcc_s.so.1",
-            "opencode/lib/libstdc++.so.6",
-            "opencode/lib/libpcre2-8.so.0",
-            "opencode/lib/ca-certificates.crt",
-    };
-    private static final String[] ASSET_GIT = {
-            "opencode/bin/git",
-            "opencode/bin/git-remote-http",
-            "opencode/bin/git-http-fetch",
-            "opencode/bin/git-http-push",
-            "opencode/bin/git-sh-i18n--envsubst",
+    private static final String ASSET_ROOTFS = "opencode/rootfs.tar";
+    private static final String[] ASSET_PROOT_LIBS = {
+            "opencode/proot/libtalloc.so.2",
+            "opencode/proot/libandroid-shmem.so",
     };
 
     private static volatile ServerManager instance;
 
     private final Context ctx;
-    private File gitDir;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AtomicBoolean starting = new AtomicBoolean(false);
 
@@ -74,16 +72,16 @@ public class ServerManager {
         this.ctx = ctx;
     }
 
-    /** 只支持 arm64 (几乎覆盖所有现代手机/平板) */
+    /** 只支持 arm64 (覆盖绝大多数现代手机/平板) */
     public boolean isSupported() {
         if (Build.SUPPORTED_ABIS == null || Build.SUPPORTED_ABIS.length == 0) return false;
         String abi = Build.SUPPORTED_ABIS[0];
         return abi.equals("arm64-v8a") || abi.equals("aarch64");
     }
 
-    /** APK 内是否包含内置运行环境 (nativeLibraryDir 有二进制) */
+    /** APK 内是否包含内置运行环境 (nativeLibraryDir 有 proot) */
     public boolean hasEmbeddedBinary() {
-        return binFile().exists();
+        return prootFile().exists();
     }
 
     public boolean isRunning() {
@@ -130,7 +128,7 @@ public class ServerManager {
                 if (progress != null) {
                     progress.onProgress("正在准备运行环境...");
                 }
-                File bin = ensureRuntime();
+                File bin = ensureRuntime(progress);
                 if (progress != null) {
                     progress.onProgress("正在启动 OpenCode 服务...");
                 }
@@ -178,70 +176,53 @@ public class ServerManager {
         }
     }
 
-    /**
-     * 数据根目录 (files/opencode, 存放配置/库/日志)。
-     * loader 的 interp 路径写死在此, 不能换位置。
-     */
+    /** 数据根目录 (files/opencode, 存放 rootfs/库/日志) */
     private File dataRoot() {
         return new File(ctx.getFilesDir(), "opencode");
     }
 
-    /**
-     * 二进制位置: nativeLibraryDir/libopencode.so。
-     * 系统安装 APK 时解压 (app_lib_file 类型, SELinux 允许执行)。
-     * 部分 ROM 禁止 app 执行 files/ (app_data_file) 下的文件 (error=13), 因此二进制不能放 files。
-     */
-    private File binFile() {
-        return new File(ctx.getApplicationInfo().nativeLibraryDir, "libopencode.so");
+    /** proot 位置: nativeLibraryDir/libproot.so (app_lib_file, SELinux 允许执行) */
+    private File prootFile() {
+        return new File(ctx.getApplicationInfo().nativeLibraryDir, "libproot.so");
     }
 
-    /** 确保二进制 + 全部动态库就位 (版本变化时重新提取), 返回二进制路径 */
-    private File ensureRuntime() throws IOException {
+    /**
+     * 确保 proot 依赖库 + rootfs 就位 (版本变化时重新解压), 返回 proot 二进制路径。
+     */
+    private File ensureRuntime(Progress progress) throws IOException {
         File root = dataRoot();
-        File bin = binFile();
-        File libDir = new File(root, "lib");
-        String assetVersion = readText(ctx.getAssets().open(ASSET_VERSION));
-        File verFile = new File(root, ".version");
-        String localVersion = verFile.exists() ? readText(new FileInputStream(verFile)) : "";
+        File prootDir = new File(root, "proot");
+        File rootfs = new File(root, "rootfs");
 
-        boolean missing = !bin.exists() || !new File(libDir, "ld-musl-aarch64.so.1").exists()
-                || !new File(libDir, "libgcc_s.so.1").exists()
-                || !new File(libDir, "libstdc++.so.6").exists()
-                || !new File(libDir, "ca-certificates.crt").exists();
-        if (bin.exists() && !missing && localVersion.equals(assetVersion)) {
-            return bin;
-        }
-        if (root.exists()) deleteRecursive(root);
-        root.mkdirs();
-        libDir.mkdirs();
-
-        for (String asset : ASSET_LIBS) {
-            extractAsset(asset, new File(libDir, asset.substring(asset.lastIndexOf('/') + 1)));
-        }
-        for (String asset : ASSET_LIBS) {
-            File lib = new File(libDir, asset.substring(asset.lastIndexOf('/') + 1));
-            // 必须给执行位: ld-musl 是 libopencode.so 的 PT_INTERP,
-            // 内核 execve 要求解释器可执行, 否则 error=13 Permission denied。
-            lib.setExecutable(true, false);
-            setReadable(lib);
-        }
-        // 提取 git 二进制 + 子命令（让 opencode 的 AI 子进程能调用 git 命令）
-        gitDir = new File(root, "git");
-        gitDir.mkdirs();
-        for (String asset : ASSET_GIT) {
-            File f = new File(gitDir, asset.substring(asset.lastIndexOf('/') + 1));
-            try {
+        // proot 依赖的 termux 共享库 (libtalloc/libandroid-shmem) → files/opencode/proot
+        // proot 是 bionic 链接的, 启动时通过 LD_LIBRARY_PATH 找到它们
+        prootDir.mkdirs();
+        for (String asset : ASSET_PROOT_LIBS) {
+            File f = new File(prootDir, asset.substring(asset.lastIndexOf('/') + 1));
+            if (!f.exists()) {
                 extractAsset(asset, f);
-                f.setExecutable(true, false);
                 setReadable(f);
-            } catch (Exception ignored) {
             }
         }
-        try (OutputStream out = new FileOutputStream(verFile)) {
-            out.write(assetVersion.getBytes(StandardCharsets.UTF_8));
+
+        String assetVersion = readText(ctx.getAssets().open(ASSET_VERSION));
+        File verFile = new File(rootfs, ".opencode-version");
+        String localVersion = verFile.exists() ? readText(new FileInputStream(verFile)) : "";
+        boolean upToDate = new File(rootfs, "usr/local/bin/opencode").exists()
+                && localVersion.equals(assetVersion);
+        if (!upToDate) {
+            if (progress != null) {
+                progress.onProgress("正在解压内置运行环境 (首次约需 30 秒)...");
+            }
+            if (rootfs.exists()) deleteRecursive(rootfs);
+            rootfs.mkdirs();
+            extractTarGz(ctx.getAssets().open(ASSET_ROOTFS), rootfs);
+            try (OutputStream out = new FileOutputStream(verFile)) {
+                out.write(assetVersion.getBytes(StandardCharsets.UTF_8));
+            }
+            Log.i(TAG, "rootfs extracted, version=" + assetVersion);
         }
-        Log.i(TAG, "runtime extracted, version=" + assetVersion + ", bin=" + bin.length() + " bytes");
-        return bin;
+        return prootFile();
     }
 
     private void extractAsset(String asset, File dest) throws IOException {
@@ -288,7 +269,7 @@ public class ServerManager {
         Log.i(TAG, "default config written: " + configFile.getAbsolutePath());
     }
 
-    /** 写 resolv.conf 到 patch 后的路径 (musl 从那里读 nameserver) */
+    /** 写 resolv.conf, 通过 proot -b 绑定到容器 /etc/resolv.conf (musl 的 getaddrinfo 从这里读) */
     private void writeResolvConf() {
         File f = new File(dataRoot(), "resolv.conf");
         // musl 的 getaddrinfo 只读 resolv.conf 里的前 3 个 nameserver (MAXNS=3)。
@@ -318,13 +299,13 @@ public class ServerManager {
         }
         StringBuilder sb = new StringBuilder();
         for (String s : new String[]{"223.5.5.5", "114.114.114.114", "8.8.8.8"}) {
-            if (sb.toString().split("\n").length >= 3) break;
+            if (countNameservers(sb) >= 3) break;
             sb.append("nameserver ").append(s).append('\n');
         }
         for (String s : servers) {
-            if (sb.toString().split("\n").length >= 3) break;
+            if (countNameservers(sb) >= 3) break;
             String line = "nameserver " + s + "\n";
-            if (!sb.toString().contains(line)) {
+            if (sb.indexOf(line) < 0) {
                 sb.append(line);
             }
         }
@@ -336,7 +317,15 @@ public class ServerManager {
         }
     }
 
-    /** 清理上次残留的 server 进程 (通过 pid 文件; 同 uid 可直接 kill) */
+    private static int countNameservers(StringBuilder sb) {
+        int n = 0;
+        for (int i = 0; i < sb.length(); i++) {
+            if (sb.charAt(i) == '\n') n++;
+        }
+        return n;
+    }
+
+    /** 清理上次残留的 proot 进程 (通过 pid 文件; 同 uid 可直接 kill) */
     private static void killStaleServer(File root) {
         File pidFile = new File(root, "server.pid");
         if (!pidFile.exists()) return;
@@ -352,7 +341,7 @@ public class ServerManager {
             int pid = Integer.parseInt(s);
             if (pid > 1) {
                 android.os.Process.killProcess(pid);
-                Log.i(TAG, "killed stale server pid=" + pid);
+                Log.i(TAG, "killed stale proot pid=" + pid);
             }
         } catch (Exception ignored) {
         }
@@ -378,65 +367,114 @@ public class ServerManager {
         }
     }
 
-    private void startProcess(File bin) throws IOException {
-        File root = dataRoot();
-        // HOME 指向私有目录：安全存放 opencode 的登录态、API Key、模型配置
-        File home = new File(ctx.getFilesDir(), "home");
-        File cfg = new File(ctx.getFilesDir(), "config");
-        File data = new File(ctx.getFilesDir(), "data");
-        File cache = new File(ctx.getFilesDir(), "cache");
-        File tmp = new File(ctx.getFilesDir(), "tmp");
-        // 项目/代码目录指向外部：卸载不丢，可被其他文件管理器访问
-        // 方案 B：把 opencode 的文件浏览根目录指向 APP 在外部共享存储的专属目录。
-        // getExternalFilesDir(null) 返回形如 /storage/emulated/0/Android/data/com.opencode.android/files，
-        // 该目录 APP 自身无需申请任何存储权限即可读写；用户通过 opencode Web UI 在此目录下创建/编辑/保存文件。
-        File appExternal = ctx.getExternalFilesDir(null);
-        if (appExternal != null) appExternal.mkdirs();
-        File projects = new File(appExternal != null ? appExternal : root, "Projects");
-        projects.mkdirs();
-        // 保留 lib 目录在 root 下（用于 musl loader / ca-certificates，不需要用户访问）
-        File libDir = new File(root, "lib");
-        home.mkdirs(); cfg.mkdirs(); data.mkdirs(); cache.mkdirs(); tmp.mkdirs(); libDir.mkdirs();
-        logFile = new File(root, "server.log");
+    private String projectsPath = "";
 
-        // 写入默认 opencode 配置 (指定免费模型, 用户可在 Web UI 中改)
-        writeDefaultConfig(cfg);
+    /** 当前项目目录 (容器内 /workspace 对应的宿主路径) */
+    public String projectDir() {
+        if (projectsPath.isEmpty()) projectsDir();
+        return projectsPath;
+    }
 
-        // 清理上次残留的 server 进程 (APP 被系统杀时子进程会成孤儿继续占端口)
-        killStaleServer(root);
-
-        // musl 的 getaddrinfo 读不到 Android 的 /etc/resolv.conf (不存在),
-        // 二进制已 patch 指向 files/opencode/resolv.conf, 这里写入真实 DNS 配置
-        writeResolvConf();
-
-        ProcessBuilder pb = new ProcessBuilder(
-                bin.getAbsolutePath(),
-                "serve",
-                "--port", String.valueOf(PORT),
-                "--hostname", "127.0.0.1");
-        pb.redirectErrorStream(true);
-        // cwd 用 projects 目录, opencode Web UI 里的文件浏览从用户根目录开始
-        pb.directory(projects);
-        pb.environment().put("HOME", home.getAbsolutePath());
-        pb.environment().put("XDG_CONFIG_HOME", cfg.getAbsolutePath());
-        pb.environment().put("XDG_DATA_HOME", data.getAbsolutePath());
-        pb.environment().put("XDG_CACHE_HOME", cache.getAbsolutePath());
-        pb.environment().put("TMPDIR", tmp.getAbsolutePath());
-        pb.environment().put("LD_LIBRARY_PATH", libDir.getAbsolutePath());
-        pb.environment().put("SSL_CERT_FILE", new File(libDir, "ca-certificates.crt").getAbsolutePath());
-        pb.environment().put("TERM", "xterm-256color");
-        // git 目录加入 PATH, 让 opencode 的 AI 子进程能调用 git 命令 (git add/commit/push 等)
-        if (gitDir != null && gitDir.exists()) {
-            String path = pb.environment().get("PATH");
-            if (path != null) {
-                pb.environment().put("PATH", gitDir.getAbsolutePath() + File.separator + path);
+    /** 项目目录: 固定 /sdcard/opencode (卸载不丢, 文件管理器可见);
+     *  未授予"所有文件访问"权限或创建失败时回退 app 专属外部目录 (卸载会删) */
+    private File projectsDir() {
+        File pub = new File(Environment.getExternalStorageDirectory(), "opencode");
+        if (pub.exists() || pub.mkdirs()) {
+            if (pub.isDirectory()) {
+                projectsPath = pub.getAbsolutePath();
+                seedReadme(pub);
+                return pub;
             }
         }
+        File appExternal = ctx.getExternalFilesDir(null);
+        if (appExternal != null) appExternal.mkdirs();
+        File def = new File(appExternal != null ? appExternal : dataRoot(), "Projects");
+        projectsPath = def.getAbsolutePath();
+        return def;
+    }
+
+    /** 首次使用在公开目录放一个说明文件, 提示用户项目都放这里 */
+    private static void seedReadme(File dir) {
+        File readme = new File(dir, "README.md");
+        if (readme.exists()) return;
+        try (OutputStream out = new FileOutputStream(readme)) {
+            out.write(("# OpenCode Projects\n\n"
+                    + "该目录是 OpenCode 内置 Linux 环境的工作目录 (/workspace)。\n"
+                    + "在此新建/克隆的代码项目、配置都会保存在这里, 卸载 App 也不会丢失。\n")
+                    .getBytes(StandardCharsets.UTF_8));
+        } catch (IOException ignored) {
+        }
+    }
+
+    private void startProcess(File bin) throws IOException {
+        File root = dataRoot();
+        File rootfs = new File(root, "rootfs");
+        File prootDir = new File(root, "proot");
+        // HOME 指向私有目录: 安全存放 opencode 的登录态、API Key、模型配置
+        // (容器内可见为 /root)
+        File home = new File(ctx.getFilesDir(), "home");
+        // 项目/代码目录 → 容器内 /workspace。
+        // 固定为公开目录 /sdcard/opencode (文件管理器可见, 卸载不丢);
+        // 未授予"所有文件访问"权限或创建失败时回退 app 专属外部目录 (卸载会删)。
+        File projects = projectsDir();
+        projects.mkdirs();
+        home.mkdirs();
+        logFile = new File(root, "server.log");
+
+        // 写入默认 opencode 配置 (容器内 XDG_CONFIG_HOME=/root/.config)
+        writeDefaultConfig(new File(home, ".config"));
+
+        // 清理上次残留的 proot 进程 (APP 被系统杀时子进程会成孤儿继续占端口)
+        killStaleServer(root);
+
+        // 写入真实 DNS 配置, 绑定到容器 /etc/resolv.conf
+        writeResolvConf();
+
+        File nativeLibDir = bin.getParentFile();
+        ProcessBuilder pb = new ProcessBuilder(
+                bin.getAbsolutePath(),
+                "-0",                                   // 容器内所有文件看起来属主为 root
+                "-r", rootfs.getAbsolutePath(),
+                "-b", projects.getAbsolutePath() + ":/workspace",
+                "-b", home.getAbsolutePath() + ":/root",
+                "-b", new File(root, "resolv.conf").getAbsolutePath() + ":/etc/resolv.conf",
+                "-b", "/dev",
+                "-b", "/proc",
+                "-b", "/sys",
+                "-w", "/workspace",
+                "--kill-on-exit",
+                "/bin/sh", "-c",
+                "opencode serve --port " + PORT + " --hostname 127.0.0.1");
+        pb.redirectErrorStream(true);
+        // proot 的 -w 会覆盖 cwd, 这里不设也无妨
+        pb.directory(projects);
+
+        Map<String, String> env = pb.environment();
+        env.put("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+        env.put("HOME", "/root");
+        env.put("XDG_CONFIG_HOME", "/root/.config");
+        env.put("XDG_DATA_HOME", "/root/.local/share");
+        env.put("XDG_CACHE_HOME", "/root/.cache");
+        env.put("TMPDIR", "/tmp");
+        env.put("TERM", "xterm-256color");
+        // proot 需要可写临时目录 (f2fs 探测/glue rootfs)。PROOT_TMP_DIR 是宿主路径,
+        // 默认编译进 termux 的路径不存在, 覆盖为 app 私有可写目录
+        File prootTmp = new File(prootDir, "tmp");
+        prootTmp.mkdirs();
+        env.put("PROOT_TMP_DIR", prootTmp.getAbsolutePath());
+        env.put("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
+        // proot 是 bionic 链接的: 从私有目录加载 libtalloc/libandroid-shmem
+        env.put("LD_LIBRARY_PATH", prootDir.getAbsolutePath());
+        // termux 编译的 proot 写死了 loader 路径 (/data/data/com.termux/...),
+        // 用 PROOT_LOADER / PROOT_LOADER_32 覆盖为 nativeLibraryDir 里的 loader
+        // (opencode/容器内二进制都经由 loader 加载, 只需读权限)
+        env.put("PROOT_LOADER", new File(nativeLibDir, "libproot-loader.so").getAbsolutePath());
+        env.put("PROOT_LOADER_32", new File(nativeLibDir, "libproot-loader32.so").getAbsolutePath());
 
         process = pb.start();
         final Process proc = process;
         writePidFile(root, pidOf(proc));
-        Log.i(TAG, "server process started");
+        Log.i(TAG, "proot started: " + bin.getAbsolutePath());
 
         Thread logThread = new Thread(() -> {
             try (InputStream in = proc.getInputStream();
@@ -458,5 +496,235 @@ public class ServerManager {
             while ((n = is.read(buf)) > 0) out.write(buf, 0, n);
             return new String(out.toByteArray(), StandardCharsets.UTF_8);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 极简 tar 解压 (支持 ustar/GNU longname/pax, 符号链接/硬链接)
+    // ------------------------------------------------------------------
+
+    private static void extractTarGz(InputStream gzIn, File destDir) throws IOException {
+        // 兼容纯 tar 与 gzip tar: 探测 gzip magic (0x1f 0x8b)
+        BufferedInputStream buffered = new BufferedInputStream(gzIn, 64 * 1024);
+        buffered.mark(2);
+        int b0 = buffered.read();
+        int b1 = buffered.read();
+        buffered.reset();
+        InputStream in = (b0 == 0x1f && b1 == 0x8b)
+                ? new GZIPInputStream(buffered, 64 * 1024)
+                : buffered;
+        try (InputStream stream = in) {
+            String pendingName = null;
+            String pendingLink = null;
+            List<TarEntry> deferredHardlinks = new ArrayList<>();
+            TarEntry e;
+            while ((e = readEntry(in)) != null) {
+                switch (e.type) {
+                    case 'L': // GNU longname
+                        pendingName = e.data;
+                        break;
+                    case 'K': // GNU longlink
+                        pendingLink = e.data;
+                        break;
+                    case 'x': // pax header
+                        for (String rec : parsePax(e.data)) {
+                            int eq = rec.indexOf('=');
+                            if (eq < 0) continue;
+                            String k = rec.substring(0, eq);
+                            String v = rec.substring(eq + 1);
+                            if ("path".equals(k)) pendingName = v;
+                            else if ("linkpath".equals(k)) pendingLink = v;
+                        }
+                        break;
+                    default: {
+                        String name = pendingName != null ? pendingName : e.name;
+                        String link = pendingLink != null ? pendingLink : e.linkname;
+                        pendingName = null;
+                        pendingLink = null;
+                        name = stripDotSlash(name);
+                        if (name.isEmpty() || name.startsWith("..")) break;
+                        File target = new File(destDir, name);
+                        if (e.type == '5' || e.type == 'D') { // dir
+                            target.mkdirs();
+                        } else if (e.type == '2') { // symlink
+                            target.getParentFile().mkdirs();
+                            target.delete();
+                            try {
+                                // android.system.Os 从 API 21 就有 (java.nio.file 要 API 26+)
+                                android.system.Os.symlink(link, target.getAbsolutePath());
+                            } catch (Exception ex) {
+                                Log.w(TAG, "symlink failed: " + name, ex);
+                            }
+                        } else if (e.type == '1') { // hardlink
+                            target.getParentFile().mkdirs();
+                            File src = new File(destDir, stripDotSlash(link));
+                            if (src.exists()) {
+                                linkOrCopy(src, target);
+                            } else {
+                                e.name = name;
+                                e.linkname = link;
+                                deferredHardlinks.add(e);
+                            }
+                        } else { // regular file (0 / '\0')
+                            target.getParentFile().mkdirs();
+                            try (OutputStream out = new FileOutputStream(target)) {
+                                copyN(in, out, e.size);
+                            }
+                            if ((e.mode & 0100) != 0) target.setExecutable(true, false);
+                            setReadable(target);
+                        }
+                        skipPad(in, e.size);
+                        break;
+                    }
+                }
+            }
+            // 处理目标位置在归档中靠后的硬链接
+            for (TarEntry h : deferredHardlinks) {
+                File target = new File(destDir, h.name);
+                File src = new File(destDir, stripDotSlash(h.linkname));
+                if (src.exists()) {
+                    linkOrCopy(src, target);
+                } else {
+                    Log.w(TAG, "hardlink target missing: " + h.linkname);
+                }
+            }
+        }
+    }
+
+    private static void linkOrCopy(File src, File target) throws IOException {
+        target.delete();
+        try {
+            android.system.Os.link(src.getAbsolutePath(), target.getAbsolutePath());
+        } catch (Exception e) {
+            try (InputStream in = new FileInputStream(src);
+                 OutputStream out = new FileOutputStream(target)) {
+                copyN(in, out, Long.MAX_VALUE);
+            }
+        }
+    }
+
+    private static String stripDotSlash(String s) {
+        while (s.startsWith("./")) s = s.substring(2);
+        return s;
+    }
+
+    private static List<String> parsePax(String data) {
+        List<String> out = new ArrayList<>();
+        int i = 0;
+        while (i < data.length()) {
+            int sp = data.indexOf(' ', i);
+            if (sp < 0) break;
+            try {
+                int len = Integer.parseInt(data.substring(i, sp));
+                if (len <= 0 || sp + len > data.length()) break;
+                String rec = data.substring(sp + 1, sp + len - 1); // drop trailing \n
+                out.add(rec);
+                i = sp + len;
+            } catch (NumberFormatException e) {
+                break;
+            }
+        }
+        return out;
+    }
+
+    /** 读一个 512B tar 头 + 数据; 文件块类型时 e.data 为内容 (仅 'L'/'K'/'x'), 其余为空 */
+    private static TarEntry readEntry(InputStream in) throws IOException {
+        byte[] hdr = readExact(in, TarEntry.BLOCK);
+        if (hdr == null || isAllZero(hdr)) return null;
+        TarEntry e = new TarEntry();
+        e.name = cstr(hdr, 0, 100);
+        e.mode = (int) parseOctal(hdr, 100, 8);
+        long size = parseOctal(hdr, 124, 12);
+        e.type = (char) hdr[156];
+        e.linkname = cstr(hdr, 157, 100);
+        String magic = cstr(hdr, 257, 6);
+        String prefix = cstr(hdr, 345, 155);
+        if (!prefix.isEmpty()) e.name = prefix + "/" + e.name;
+        e.size = size;
+        e.data = null;
+        if (e.type == 'L' || e.type == 'K' || e.type == 'x') {
+            byte[] data = readExact(in, (int) size);
+            e.data = data != null ? new String(data, StandardCharsets.UTF_8) : "";
+            skipPad(in, size);
+        }
+        return e;
+    }
+
+    private static byte[] readExact(InputStream in, int n) throws IOException {
+        byte[] buf = new byte[n];
+        int off = 0;
+        while (off < n) {
+            int r = in.read(buf, off, n - off);
+            if (r < 0) return off == 0 ? null : buf;
+            off += r;
+        }
+        return buf;
+    }
+
+    private static void skipPad(InputStream in, long size) throws IOException {
+        long pad = (TarEntry.BLOCK - (size % TarEntry.BLOCK)) % TarEntry.BLOCK;
+        while (pad > 0) {
+            long r = in.skip(pad);
+            if (r <= 0) {
+                if (in.read() < 0) return;
+                pad--;
+            } else {
+                pad -= r;
+            }
+        }
+    }
+
+    private static void copyN(InputStream in, OutputStream out, long n) throws IOException {
+        byte[] buf = new byte[64 * 1024];
+        long left = n;
+        while (left > 0) {
+            int r = in.read(buf, 0, (int) Math.min(buf.length, left));
+            if (r < 0) return;
+            out.write(buf, 0, r);
+            left -= r;
+        }
+    }
+
+    private static boolean isAllZero(byte[] b) {
+        for (byte x : b) if (x != 0) return false;
+        return true;
+    }
+
+    private static String cstr(byte[] b, int off, int len) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = off; i < off + len && i < b.length; i++) {
+            if (b[i] == 0) break;
+            sb.append((char) (b[i] & 0xff));
+        }
+        return sb.toString();
+    }
+
+    /** 解析 tar 八进制数字 (兼容 base-256 大尺寸) */
+    private static long parseOctal(byte[] b, int off, int len) {
+        int end = off + len;
+        if (end > b.length) end = b.length;
+        // base-256 (GNU 大文件)
+        if (off < end && (b[off] & 0x80) != 0) {
+            long v = b[off] & 0x7f;
+            for (int i = off + 1; i < end; i++) v = (v << 8) | (b[i] & 0xff);
+            return v;
+        }
+        long v = 0;
+        for (int i = off; i < end; i++) {
+            byte c = b[i];
+            if (c == ' ' || c == 0) break;
+            if (c < '0' || c > '7') continue;
+            v = (v << 3) | (c - '0');
+        }
+        return v;
+    }
+
+    private static final class TarEntry {
+        static final int BLOCK = 512;
+        String name;
+        String linkname;
+        long size;
+        char type;
+        int mode;
+        String data;
     }
 }

@@ -1,10 +1,18 @@
 package com.opencode.android;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.view.KeyEvent;
 import android.view.View;
 import android.webkit.WebChromeClient;
@@ -20,24 +28,20 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * OpenCode Android APP
  *
- * 两种模式自动切换:
- * 1. 内置模式 (原生集成): APK 内嵌 opencode 二进制 (arm64-musl),
- *    本 APP 直接拉起 server 到 127.0.0.1:18888, 任何手机都能用。
- * 2. 外部模式: 连局域网/AidLux 上已有的 opencode server (server_url 可改)。
- *
- * 启动流程: 先 ping 外部地址 → 通就加载; 不通且有内置二进制 → 自动启动内置 server。
+ * 内置模式: APK 内嵌完整 Alpine Linux (arm64) 容器 (PRoot), 本 APP 直接拉起
+ * opencode server 到 127.0.0.1:18888, 任何手机都能用。
+ * 打开即显示加载界面, server 就绪后自动载入 Web UI。
  */
 public class MainActivity extends Activity {
-
-    private static final int DEFAULT_PORT = 18888;
 
     private WebView webView;
     private ProgressBar progressBar;
     private TextView statusView;
+    private ProgressBar spinner;
+    private FrameLayout startupOverlay;
     private SharedPreferences prefs;
-    private String serverUrl;
     private ServerManager embedded;
-    private boolean embeddedMode = false;
+    private boolean hadAllFilesAccess;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean polling = new AtomicBoolean(false);
 
@@ -46,12 +50,13 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
 
         prefs = getSharedPreferences("opencode_prefs", MODE_PRIVATE);
-        serverUrl = prefs.getString("server_url", "http://127.0.0.1:" + DEFAULT_PORT);
         embedded = ServerManager.get(this);
+        hadAllFilesAccess = Environment.isExternalStorageManager();
 
         buildUI();
         setupRetry();
-        tryConnect();
+        startServer();
+        maybePromptAllFilesAccess();
     }
 
     private void buildUI() {
@@ -74,8 +79,8 @@ public class MainActivity extends Activity {
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
+                progressBar.setProgress(5);
                 progressBar.setVisibility(View.VISIBLE);
-                statusView.setVisibility(View.GONE);
             }
             @Override
             public void onPageFinished(WebView view, String url) {
@@ -92,87 +97,172 @@ public class MainActivity extends Activity {
                     String description, String failingUrl) {
                 super.onReceivedError(view, errorCode, description, failingUrl);
                 progressBar.setVisibility(View.GONE);
-                if (embeddedMode) {
-                    statusView.setText("内置服务器连接失败\n" + failingUrl +
-                            "\n\n点击重试 (可先查看上方 server 日志)");
-                } else {
-                    statusView.setText("外部服务器连接失败\n" + serverUrl +
-                            "\n\n点击重试, 将自动启动内置服务器");
-                }
-                statusView.setVisibility(View.VISIBLE);
+                error("内置服务器连接失败\n" + failingUrl +
+                        "\n\n点击重试 (可先查看上方 server 日志)");
             }
         });
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
                 super.onProgressChanged(view, newProgress);
-                if (newProgress >= 100) progressBar.setVisibility(View.GONE);
+                if (newProgress >= 100) {
+                    progressBar.setVisibility(View.GONE);
+                } else {
+                    progressBar.setProgress(newProgress);
+                    progressBar.setVisibility(View.VISIBLE);
+                }
             }
         });
 
         root.addView(webView);
 
-        progressBar = new ProgressBar(this);
+        // 顶部细进度条 (Web UI 页面加载)
+        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progressBar.setMax(100);
+        progressBar.setProgressTintList(android.content.res.ColorStateList.valueOf(0xFF3FB950));
+        progressBar.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(0x333FB950));
+        FrameLayout.LayoutParams pbp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, dp(3));
+        pbp.gravity = android.view.Gravity.TOP;
+        progressBar.setLayoutParams(pbp);
+        progressBar.setVisibility(View.GONE);
         root.addView(progressBar);
 
+        // 启动覆盖层: 渐变底 + Logo + 状态
+        GradientDrawable bg = new GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                new int[]{0xFF161B22, 0xFF0D1117});
+        startupOverlay = new FrameLayout(this);
+        startupOverlay.setBackground(bg);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
+        box.setPadding(dp(40), 0, dp(40), 0);
+        FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+        blp.gravity = android.view.Gravity.CENTER;
+        box.setLayoutParams(blp);
+
+        ImageView logo = new ImageView(this);
+        logo.setImageDrawable(getPackageManager().getApplicationIcon(getApplicationInfo()));
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(dp(84), dp(84));
+        logo.setLayoutParams(llp);
+        box.addView(logo);
+
+        TextView title = new TextView(this);
+        title.setText("OpenCode");
+        title.setTextSize(26);
+        title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        title.setTextColor(0xFFE6EDF3);
+        title.setGravity(android.view.Gravity.CENTER);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        tlp.topMargin = dp(24);
+        title.setLayoutParams(tlp);
+        box.addView(title);
+
+        TextView subtitle = new TextView(this);
+        subtitle.setText("AI 编程助手 · 内置 Linux 环境");
+        subtitle.setTextSize(13);
+        subtitle.setTextColor(0xFF8B949E);
+        subtitle.setGravity(android.view.Gravity.CENTER);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        slp.topMargin = dp(6);
+        subtitle.setLayoutParams(slp);
+        box.addView(subtitle);
+
+        spinner = new ProgressBar(this);
+        spinner.setIndeterminateTintList(android.content.res.ColorStateList.valueOf(0xFF3FB950));
+        LinearLayout.LayoutParams spinLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        spinLp.topMargin = dp(32);
+        spinLp.gravity = android.view.Gravity.CENTER_HORIZONTAL;
+        spinner.setLayoutParams(spinLp);
+        box.addView(spinner);
+
         statusView = new TextView(this);
-        statusView.setVisibility(View.GONE);
+        statusView.setTextSize(13);
         statusView.setTextColor(0xFF8B949E);
         statusView.setGravity(android.view.Gravity.CENTER);
-        statusView.setPadding(48, 0, 48, 0);
-        statusView.setTextSize(14);
-        statusView.setHint("点击重试");
-        root.addView(statusView);
+        statusView.setLineSpacing(0, 1.15f);
+        LinearLayout.LayoutParams sllp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        sllp.topMargin = dp(20);
+        statusView.setLayoutParams(sllp);
+        box.addView(statusView);
+
+        startupOverlay.addView(box);
+        root.addView(startupOverlay);
 
         setContentView(root);
     }
 
-    /** 打开即进入: 先快速探测外部 server, 不通则异步启动内置后端; UI 一直显示过渡状态 */
-    private void tryConnect() {
-        statusView.setText("正在启动 OpenCode...\n\n正在检测服务器连接");
-        statusView.setVisibility(View.VISIBLE);
-        new Thread(() -> {
-            boolean ok = ping(serverUrl);
-            runOnUiThread(() -> {
-                if (ok) {
-                    embeddedMode = false;
-                    load();
-                } else {
-                    embeddedConnect();
-                }
-            });
-        }).start();
+    /** 显示启动覆盖层 */
+    private void showOverlay() {
+        startupOverlay.setVisibility(View.VISIBLE);
+    }
+
+    /** 加载中状态: 转圈 + 文案 */
+    private void busy(String text) {
+        showOverlay();
+        spinner.setVisibility(View.VISIBLE);
+        statusView.setText(text);
+    }
+
+    /** 错误状态: 停转圈, 显示错误文案 (点击覆盖层重试) */
+    private void error(String text) {
+        showOverlay();
+        spinner.setVisibility(View.GONE);
+        statusView.setText(text);
+    }
+
+    private int dp(float v) {
+        return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    /** 打开即进入: 后台服务仍在跑则直接连上, 否则异步启动内置 server; UI 一直显示过渡状态 */
+    private void startServer() {
+        if (embedded.isRunning()) {
+            // 上次的后台服务还在跑, 直接连上, 不再等待
+            ensureServerService();
+            load();
+            return;
+        }
+        embeddedConnect();
     }
 
     /** 内置模式: 异步启动内嵌 server, 阶段进度实时显示, 就绪后自动载入 UI */
     private void embeddedConnect() {
         if (!embedded.isSupported()) {
-            statusView.setText("当前设备不是 arm64, 无法使用内置服务器。\n\n" +
-                    "请改用 AidLux 方案:\n" + serverUrl + "\n\n点击重试");
+            error("当前设备不是 arm64, 无法使用内置服务器。\n\n点击重试");
             return;
         }
         if (!embedded.hasEmbeddedBinary()) {
-            statusView.setText("APK 未包含内置 opencode 二进制。\n\n" +
-                    "请改用 AidLux 方案:\n" + serverUrl + "\n\n点击重试");
+            error("APK 未包含内置 opencode 运行环境。\n\n点击重试");
             return;
         }
-        embeddedMode = true;
+        ensureServerService();
+        ensureNotificationPermission();
         embedded.start((ok, msg) -> {
-            if (ok) {
+            // "已在运行"/"正在启动中" 是并发启动时的正常返回值, 不视为失败
+            if (ok || (msg != null && (msg.contains("已在运行") || msg.contains("正在启动中")))) {
+                maybePromptBatteryOptimization();
                 pollHealth(120);
             } else {
-                statusView.setText("内置服务器启动失败\n" + msg + "\n\n" +
+                error("内置服务器启动失败\n" + msg + "\n\n" +
                         "日志:\n" + embedded.getLogTail(1500) + "\n\n点击重试");
             }
         }, stage -> runOnUiThread(() -> {
-            statusView.setText(stage + "\n\n首次启动约需 30 秒~1 分钟, 请稍候");
+            busy(stage + "\n\n首次启动约需 30 秒~1 分钟, 请稍候");
         }));
     }
 
     /** 每 1s ping 一次内置 server, 最多 seconds 秒 (首次启动含解压+加载 192MB 二进制, 放宽到 2 分钟) */
     private void pollHealth(final int seconds) {
         if (!polling.compareAndSet(false, true)) return;
-        statusView.setText("OpenCode 服务启动中...\n\n正在等待就绪, 请稍候");
+        busy("OpenCode 服务启动中...\n\n正在等待就绪, 请稍候");
         final int[] waited = {0};
         handler.post(new Runnable() {
             @Override
@@ -186,7 +276,7 @@ public class MainActivity extends Activity {
                             load();
                         } else if (waited[0] >= seconds) {
                             polling.set(false);
-                            statusView.setText("内置服务器启动超时\n\n日志:\n" +
+                            error("内置服务器启动超时\n\n日志:\n" +
                                     embedded.getLogTail(2000) + "\n\n点击重试");
                         } else {
                             waited[0]++;
@@ -199,26 +289,98 @@ public class MainActivity extends Activity {
     }
 
     private void load() {
-        statusView.setVisibility(View.GONE);
-        webView.loadUrl(embeddedMode ? embedded.serverUrl() : serverUrl);
+        startupOverlay.setVisibility(View.GONE);
+        webView.loadUrl(embedded.serverUrl());
     }
 
-    /** 点击状态文字重试 */
+    /** 点击覆盖层/状态文字重试 */
     private void setupRetry() {
-        statusView.setOnClickListener(v -> {
-            if (embeddedMode) {
-                if (embedded.isStarting()) {
-                    // 正在启动中, 不要打断, 重新等一轮
-                    pollHealth(120);
-                } else {
-                    embedded.stop();
-                    embeddedConnect();
-                }
+        View.OnClickListener retry = v -> {
+            if (embedded.isStarting()) {
+                // 正在启动中, 不要打断, 重新等一轮
+                pollHealth(120);
             } else {
-                // 外部 server 失败 → 直接启动内置, 避免反复 ping 卡死
+                embedded.stop();
                 embeddedConnect();
             }
-        });
+        };
+        startupOverlay.setOnClickListener(retry);
+        statusView.setOnClickListener(retry);
+    }
+
+    // ------------------------------------------------------------------
+    // 所有文件访问 (写固定项目目录 /sdcard/opencode 需要) — 启动时弹窗授权
+    // ------------------------------------------------------------------
+
+    /** 未授予"所有文件访问"权限时, 首次启动弹窗引导授权; 拒绝则回退 app 专属目录 */
+    private void maybePromptAllFilesAccess() {
+        if (Environment.isExternalStorageManager()) return;
+        new AlertDialog.Builder(this)
+                .setTitle("使用公开项目目录")
+                .setMessage("项目目录固定为 /sdcard/opencode (卸载 App 不丢失)。\n\n" +
+                        "写该目录需要「所有文件访问」权限, 请前往系统设置授予。\n\n" +
+                        "若暂不授权, 将使用 App 专属目录 (卸载会删除)。")
+                .setCancelable(true)
+                .setPositiveButton("去授权", (d, w) -> requestAllFilesAccess())
+                .setNegativeButton("暂不", (d, w) -> d.dismiss())
+                .show();
+    }
+
+    private void requestAllFilesAccess() {
+        try {
+            startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getPackageName())));
+        } catch (Exception e) {
+            startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 息屏后台运行: 前台服务保活 + 唤醒锁 + 电池优化豁免
+    // ------------------------------------------------------------------
+
+    /** 启动前台保活服务 (通知栏常驻 + PARTIAL_WAKE_LOCK 息屏不休眠) */
+    private void ensureServerService() {
+        Intent i = new Intent(this, ServerService.class);
+        i.setAction(ServerService.ACTION_START);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+            else startService(i);
+        } catch (Exception e) {
+            // 通知权限被拒等, 忽略 (服务仍能跑, 只是看不到通知)
+        }
+    }
+
+    /** Android 13+ 通知需要运行时权限, 否则前台服务通知不显示 */
+    private void ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1002);
+        }
+    }
+
+    /** 关闭系统对应用的电池优化, 防止息屏后 Doze 中断长任务 (只引导一次) */
+    private void maybePromptBatteryOptimization() {
+        if (Build.VERSION.SDK_INT < 23) return;
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        if (pm.isIgnoringBatteryOptimizations(getPackageName())) return;
+        if (prefs.getBoolean("battery_opt_prompted", false)) return;
+        prefs.edit().putBoolean("battery_opt_prompted", true).apply();
+        new AlertDialog.Builder(this)
+                .setTitle("允许后台运行")
+                .setMessage("为保证息屏后长任务不被系统中断, 请对本应用关闭电池优化。\n\n" +
+                        "小米/OPPO 等手机还可在「设置 → 应用 → 电池/自启动」允许后台运行, 效果更好。")
+                .setPositiveButton("去设置", (d, w) -> {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:" + getPackageName())));
+                    } catch (Exception e) {
+                        startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+                    }
+                })
+                .setNegativeButton("暂不", (d, w) -> d.dismiss())
+                .show();
     }
 
     private boolean ping(String url) {
@@ -255,6 +417,13 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (webView != null) webView.onResume();
+        // 从"所有文件访问"设置页返回: 授权后重启服务以生效公开项目目录
+        boolean granted = Environment.isExternalStorageManager();
+        if (!hadAllFilesAccess && granted && embedded.isRunning()) {
+            embedded.stop();
+            embeddedConnect();
+        }
+        hadAllFilesAccess = granted;
     }
 
     @Override
@@ -262,6 +431,7 @@ public class MainActivity extends Activity {
         super.onDestroy();
         polling.set(false);
         handler.removeCallbacksAndMessages(null);
-        embedded.stop();
+        // 不在这里停 server: 息屏/退出 App 后由 ServerService 保活, 长任务不中断;
+        // 用户可通过通知栏"停止"或重新打开 App 管理
     }
 }
