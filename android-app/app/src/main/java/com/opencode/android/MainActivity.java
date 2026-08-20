@@ -48,6 +48,7 @@ public class MainActivity extends Activity {
     private final AtomicBoolean polling = new AtomicBoolean(false);
     private boolean wasBackgrounded = false;
     private boolean pendingFileChooser = false;
+    private boolean pageFailed = false;
     private long lastPauseElapsed;
     // 后台超过该时长才在回前台时刷新页面 (快速切回/文件选择返回不打断使用)
     private static final long BG_REFRESH_THRESHOLD_MS = 30_000;
@@ -88,6 +89,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
+                pageFailed = false;
                 progressBar.setProgress(5);
                 progressBar.setVisibility(View.VISIBLE);
             }
@@ -96,6 +98,9 @@ public class MainActivity extends Activity {
                 super.onPageFinished(view, url);
                 progressBar.setVisibility(View.GONE);
                 embedded.noteClientActivity();
+                if (pageFailed) return;
+                // 页面加载完成: 隐藏加载覆盖层 (避免空白闪烁, 首次打开/后台恢复统一走这里)
+                startupOverlay.setVisibility(View.GONE);
                 // opencode 网页的错误信息在窄屏不换行, 注入 CSS 强制长文本折行
                 view.evaluateJavascript(
                         "var s=document.createElement('style');" +
@@ -106,6 +111,7 @@ public class MainActivity extends Activity {
             public void onReceivedError(WebView view, int errorCode,
                     String description, String failingUrl) {
                 super.onReceivedError(view, errorCode, description, failingUrl);
+                pageFailed = true;
                 progressBar.setVisibility(View.GONE);
                 error("内置服务器连接失败\n" + failingUrl +
                         "\n\n点击重试 (可先查看上方 server 日志)");
@@ -318,7 +324,7 @@ public class MainActivity extends Activity {
     }
 
     private void load() {
-        startupOverlay.setVisibility(View.GONE);
+        busy("正在加载界面...");
         webView.loadUrl(embedded.serverUrl());
     }
 
@@ -465,10 +471,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        // 省电: 后台时冻结 WebView 渲染/JS 定时器/SSE 通道
-        // 容器内的 server 不受影响仍继续跑, 长任务不中断; 回来时 onResume 恢复并刷新页面
-        webView.onPause();
-        webView.pauseTimers();
+        // 不暂停 WebView: 保留页面 DOM/滚动位置, 后台回来不闪白、不整页重载。
+        // 后台耗电由 ServerService 看护兜底 (空闲释放唤醒锁 / 长时间空闲自动停止 server)。
         wasBackgrounded = true;
         lastPauseElapsed = SystemClock.elapsedRealtime();
     }
@@ -477,8 +481,6 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         embedded.noteClientActivity();
-        webView.onResume();
-        webView.resumeTimers();
         // 从"所有文件访问"设置页返回: 授权后重启服务以生效公开项目目录
         boolean granted = Environment.isExternalStorageManager();
         if (!hadAllFilesAccess && granted && embedded.isRunning()) {
@@ -491,16 +493,21 @@ public class MainActivity extends Activity {
         hadAllFilesAccess = granted;
         if (wasBackgrounded) {
             wasBackgrounded = false;
-            // 文件选择器返回 / 快速切回: SSE 通道未断, 不刷新, 避免打断上传等操作
+            // 文件选择器返回 / 快速切回: 无需任何处理
             if (pendingFileChooser ||
                     SystemClock.elapsedRealtime() - lastPauseElapsed < BG_REFRESH_THRESHOLD_MS) {
                 return;
             }
             if (embedded.isRunning()) {
-                // 后台暂停过 WebView, SSE 通道已断, 刷新页面恢复实时通道
-                webView.reload();
+                // 页面 DOM 未销毁, 无需整页 reload; 通知页面触发 UI 自身重连/刷新
+                // (部分 SPA 监听 visibilitychange/focus 时主动重连 SSE), 避免整页重载闪白
+                webView.evaluateJavascript(
+                        "try{" +
+                        "document.dispatchEvent(new Event('visibilitychange'));" +
+                        "window.dispatchEvent(new Event('focus'));" +
+                        "}catch(e){}", null);
             } else {
-                // server 已被空闲看护停止, 重新拉起
+                // server 已被空闲看护停止, 重新拉起 (覆盖层会显示启动/加载进度)
                 embeddedConnect();
             }
         }
