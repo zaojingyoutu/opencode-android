@@ -499,13 +499,17 @@ public class MainActivity extends Activity {
                 return;
             }
             if (embedded.isRunning()) {
-                // 页面 DOM 未销毁, 无需整页 reload; 通知页面触发 UI 自身重连/刷新
-                // (部分 SPA 监听 visibilitychange/focus 时主动重连 SSE), 避免整页重载闪白
-                webView.evaluateJavascript(
-                        "try{" +
-                        "document.dispatchEvent(new Event('visibilitychange'));" +
-                        "window.dispatchEvent(new Event('focus'));" +
-                        "}catch(e){}", null);
+                // 回复完成 → 页面可能停在旧"回复中"状态, 刷新拉取最新结果;
+                // 回复进行中 → 不刷新, 注入事件让 UI 重连 SSE (避免打断/闪白)
+                if (embedded.isReplying()) {
+                    webView.evaluateJavascript(
+                            "try{" +
+                            "document.dispatchEvent(new Event('visibilitychange'));" +
+                            "window.dispatchEvent(new Event('focus'));" +
+                            "}catch(e){}", null);
+                } else {
+                    webView.reload();
+                }
             } else {
                 // server 已被空闲看护停止, 重新拉起 (覆盖层会显示启动/加载进度)
                 embeddedConnect();

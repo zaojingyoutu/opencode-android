@@ -136,15 +136,7 @@ public class ServerManager {
      */
     public long sessionUpdatedTs() {
         try {
-            URL u = new URL(serverUrl() + "/session");
-            HttpURLConnection conn = (HttpURLConnection) u.openConnection();
-            conn.setRequestMethod("GET");
-            conn.setConnectTimeout(3000);
-            conn.setReadTimeout(3000);
-            int code = conn.getResponseCode();
-            String body = readText(conn.getInputStream());
-            conn.disconnect();
-            if (code != 200) return -1;
+            String body = httpGet(serverUrl() + "/session");
             org.json.JSONArray arr = new org.json.JSONArray(body);
             long latest = -1;
             for (int i = 0; i < arr.length(); i++) {
@@ -160,6 +152,47 @@ public class ServerManager {
         } catch (Exception e) {
             return -1;
         }
+    }
+
+    /**
+     * 判断 AI 是否正在回复: 最新一条 assistant 消息缺失 time.completed 即视为回复中。
+     * 回复中绝不能停止/整页刷新 (否则丢回复)。server 不可用返回 false。
+     */
+    public boolean isReplying() {
+        try {
+            String list = httpGet(serverUrl() + "/session");
+            org.json.JSONArray arr = new org.json.JSONArray(list);
+            if (arr.length() == 0) return false;
+            String sid = arr.optJSONObject(0).optString("id", "");
+            if (sid.isEmpty()) return false;
+            String msgs = httpGet(serverUrl() + "/session/" + sid + "/message");
+            org.json.JSONArray ma = new org.json.JSONArray(msgs);
+            for (int i = ma.length() - 1; i >= 0; i--) {
+                org.json.JSONObject m = ma.optJSONObject(i);
+                if (m == null) continue;
+                org.json.JSONObject info = m.optJSONObject("info");
+                if (info == null) continue;
+                if (!"assistant".equals(info.optString("role", ""))) continue;
+                org.json.JSONObject t = info.optJSONObject("time");
+                return t == null || !t.has("completed");
+            }
+            return false;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** GET 指定 URL 返回响应体字符串, 失败抛异常 */
+    private static String httpGet(String url) throws IOException {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(3000);
+        conn.setReadTimeout(3000);
+        int code = conn.getResponseCode();
+        String body = readText(conn.getInputStream());
+        conn.disconnect();
+        if (code != 200) throw new IOException("http " + code);
+        return body;
     }
 
     /**

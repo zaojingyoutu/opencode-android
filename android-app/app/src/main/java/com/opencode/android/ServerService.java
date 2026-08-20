@@ -54,7 +54,6 @@ public class ServerService extends Service {
     private volatile boolean watchdogRunning;
     private int lastPid = -1;
     private long lastTicks = -1;
-    private long lastServerTs = -1;
     private int idleMinutes = 0;
     private int busyMinutes = 0;
 
@@ -109,7 +108,6 @@ public class ServerService extends Service {
         watchdogRunning = true;
         lastPid = -1;
         lastTicks = -1;
-        lastServerTs = -1;
         idleMinutes = 0;
         busyMinutes = 0;
         watchdog = new Thread(this::watchdogLoop, "opencode-watchdog");
@@ -153,29 +151,33 @@ public class ServerService extends Service {
         boolean interactive = pm.isInteractive();
         boolean clientActive = server.clientActiveWithinMs(CLIENT_ACTIVE_MS);
         boolean busy = delta >= BUSY_TICKS;
-        // 服务端会话时间戳变化 = AI 正在回复/有活动 (SSE 转发回复本地 CPU 很低, CPU 采样测不到)
-        long serverTs = server.sessionUpdatedTs();
-        boolean serverActive = serverTs >= 0 && serverTs != lastServerTs;
-        lastServerTs = serverTs;
 
-        if (interactive) {
-            // 亮屏: 屏幕本身保证 CPU 活跃, 无需唤醒锁, 也不累计空闲
-            idleMinutes = 0;
-            busyMinutes = 0;
-            releaseWakeLock();
-        } else if (busy || clientActive || serverActive) {
-            // 息屏但有任务在跑 / 用户近期在用 / AI 回复中: 保持唤醒锁
-            idleMinutes = 0;
-            busyMinutes = busy ? busyMinutes + 1 : 0;
-            acquireWakeLock();
+        if (interactive || busy || clientActive) {
+            // 亮屏 / 有任务在跑 / 用户近期在用
+            if (interactive) {
+                idleMinutes = 0;
+                busyMinutes = 0;
+                releaseWakeLock();
+            } else {
+                idleMinutes = 0;
+                busyMinutes = busy ? busyMinutes + 1 : 0;
+                acquireWakeLock();
+            }
         } else {
-            // 真正空闲: 先放唤醒锁让 CPU 可休眠, 长时间空闲则整体停止
-            idleMinutes++;
-            busyMinutes = 0;
-            if (idleMinutes >= RELEASE_MINUTES) releaseWakeLock();
+            // 疑似空闲: 再确认 AI 没有正在回复 (SSE 转发回复本地 CPU 很低, CPU 采样测不到)
+            boolean replying = server.isReplying();
+            if (replying) {
+                idleMinutes = 0;
+                busyMinutes = 0;
+                acquireWakeLock();
+            } else {
+                idleMinutes++;
+                busyMinutes = 0;
+                if (idleMinutes >= RELEASE_MINUTES) releaseWakeLock();
+            }
         }
 
-        if (busyMinutes >= FORCE_STOP_MINUTES && !clientActive && !serverActive) {
+        if (busyMinutes >= FORCE_STOP_MINUTES && !clientActive) {
             // 息屏 + 无客户端活动 + 持续高 CPU → 失控进程, 强制停止防烧电
             Log.i(TAG, "runaway busy, forcing stop (busyMinutes=" + busyMinutes +
                     ", cpuDelta=" + delta + ")");
