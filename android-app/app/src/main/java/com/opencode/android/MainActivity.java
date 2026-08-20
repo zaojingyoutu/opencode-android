@@ -502,11 +502,23 @@ public class MainActivity extends Activity {
                 // 回复完成 → 页面可能停在旧"回复中"状态, 刷新拉取最新结果;
                 // 回复进行中 → 不刷新, 注入事件让 UI 重连 SSE (避免打断/闪白)
                 if (embedded.isReplying()) {
+                    // 回复进行中: 注入事件让 UI 重连 SSE; 若后台时 SSE 已断(页面冻结在
+                    // "思考中"不动), 5s 后页面文本仍无任何进展则强制 reload 重新订阅,
+                    // 避免永远卡住 (reload 不打断 server 端回复, 只是重新拉页面)
                     webView.evaluateJavascript(
                             "try{" +
+                            "window.__ocBodyLen=document.body?document.body.innerText.length:-1;" +
                             "document.dispatchEvent(new Event('visibilitychange'));" +
                             "window.dispatchEvent(new Event('focus'));" +
                             "}catch(e){}", null);
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        webView.evaluateJavascript(
+                                "try{window.__ocBodyLen===document.body.innerText.length}catch(e){true}",
+                                v -> {
+                                    if ("true".equals(v)) webView.reload();
+                                });
+                    }, 5000);
                 } else {
                     webView.reload();
                 }
