@@ -14,7 +14,6 @@ import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
-import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.webkit.ValueCallback;
@@ -47,14 +46,13 @@ public class MainActivity extends Activity {
     private boolean hadAllFilesAccess;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean polling = new AtomicBoolean(false);
-    // 后台超过该时长才在回前台时刷新页面 (快速切回不打断使用)
-    private static final long BG_REFRESH_THRESHOLD_MS = 3000;
-    // 两次自动刷新之间最小间隔, 防抖
-    private static final long RELOAD_MIN_INTERVAL_MS = 3000;
+    private boolean wasBackgrounded = false;
+    private boolean pendingFileChooser = false;
+    private long lastPauseElapsed;
+    // 后台超过该时长才在回前台时刷新页面 (快速切回/文件选择返回不打断使用)
+    private static final long BG_REFRESH_THRESHOLD_MS = 30_000;
     private static final int FILECHOOSER_RESULT_CODE = 1001;
     private ValueCallback<Uri[]> filePathCallback;
-    private long lastPauseMs;
-    private long lastReloadMs;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -97,6 +95,7 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 progressBar.setVisibility(View.GONE);
+                embedded.noteClientActivity();
                 // opencode 网页的错误信息在窄屏不换行, 注入 CSS 强制长文本折行
                 view.evaluateJavascript(
                         "var s=document.createElement('style');" +
@@ -132,6 +131,7 @@ public class MainActivity extends Activity {
                     filePathCallback = null;
                 }
                 filePathCallback = cb;
+                pendingFileChooser = true;
                 try {
                     startActivityForResult(params.createIntent(), FILECHOOSER_RESULT_CODE);
                     return true;
@@ -344,6 +344,7 @@ public class MainActivity extends Activity {
             super.onActivityResult(requestCode, resultCode, data);
             return;
         }
+        pendingFileChooser = false;
         if (filePathCallback == null) return;
         Uri[] results = null;
         if (resultCode == RESULT_OK && data != null) {
@@ -455,6 +456,7 @@ public class MainActivity extends Activity {
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_BACK && webView != null && webView.canGoBack()) {
             webView.goBack();
+            embedded.noteClientActivity();
             return true;
         }
         return super.onKeyDown(keyCode, event);
@@ -463,52 +465,45 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        lastPauseMs = SystemClock.elapsedRealtime();
-        if (webView != null) webView.onPause();
+        // 省电: 后台时冻结 WebView 渲染/JS 定时器/SSE 通道
+        // 容器内的 server 不受影响仍继续跑, 长任务不中断; 回来时 onResume 恢复并刷新页面
+        webView.onPause();
+        webView.pauseTimers();
+        wasBackgrounded = true;
+        lastPauseElapsed = SystemClock.elapsedRealtime();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (webView != null) webView.onResume();
+        embedded.noteClientActivity();
+        webView.onResume();
+        webView.resumeTimers();
         // 从"所有文件访问"设置页返回: 授权后重启服务以生效公开项目目录
         boolean granted = Environment.isExternalStorageManager();
         if (!hadAllFilesAccess && granted && embedded.isRunning()) {
             embedded.stop();
             embeddedConnect();
             hadAllFilesAccess = granted;
+            wasBackgrounded = false;
             return;
         }
         hadAllFilesAccess = granted;
-        maybeRefreshStale();
-    }
-
-    /**
-     * 后台一段时间后回来: opencode Web UI 的实时通道 (SSE/WebSocket) 在 WebView
-     * 暂停期间会断, 且页面不会自己重新同步, 导致界面停留在旧回复。
-     * 这里先确认服务端仍可达, 再重载页面强制与服务端重新同步;
-     * 服务端不可达 / 正在启动 / 后台时间过短 / 高频触发时都不重载。
-     */
-    private void maybeRefreshStale() {
-        long away = SystemClock.elapsedRealtime() - lastPauseMs;
-        lastPauseMs = 0;
-        if (away < BG_REFRESH_THRESHOLD_MS) return;
-        if (startupOverlay.getVisibility() == View.VISIBLE) return;
-        if (embedded.isStarting() || !embedded.isRunning()) return;
-        long now = SystemClock.elapsedRealtime();
-        if (now - lastReloadMs < RELOAD_MIN_INTERVAL_MS) return;
-        new Thread(() -> {
-            boolean ok = ping(embedded.serverUrl());
-            runOnUiThread(() -> {
-                // 后台期间 Activity 可能已被系统销毁, 此时不要再碰 WebView
-                if (isDestroyed() || isFinishing()) return;
-                if (ok && startupOverlay.getVisibility() != View.VISIBLE) {
-                    lastReloadMs = SystemClock.elapsedRealtime();
-                    Log.i("MainActivity", "background resume: reloading page to resync");
-                    webView.reload();
-                }
-            });
-        }).start();
+        if (wasBackgrounded) {
+            wasBackgrounded = false;
+            // 文件选择器返回 / 快速切回: SSE 通道未断, 不刷新, 避免打断上传等操作
+            if (pendingFileChooser ||
+                    SystemClock.elapsedRealtime() - lastPauseElapsed < BG_REFRESH_THRESHOLD_MS) {
+                return;
+            }
+            if (embedded.isRunning()) {
+                // 后台暂停过 WebView, SSE 通道已断, 刷新页面恢复实时通道
+                webView.reload();
+            } else {
+                // server 已被空闲看护停止, 重新拉起
+                embeddedConnect();
+            }
+        }
     }
 
     @Override

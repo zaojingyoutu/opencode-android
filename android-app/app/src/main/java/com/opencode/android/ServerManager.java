@@ -5,6 +5,7 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.BufferedInputStream;
@@ -61,6 +62,10 @@ public class ServerManager {
     private volatile boolean stopRequested = false;
     private File logFile;
 
+    // 客户端(Web UI)最近活动时间戳: 供 ServerService 空闲看护判断"用户是否在用"
+    private volatile long lastActivityElapsed = 0;
+    private volatile long lastWriteWall = 0;
+
     public static synchronized ServerManager get(Context ctx) {
         if (instance == null) {
             instance = new ServerManager(ctx.getApplicationContext());
@@ -91,6 +96,91 @@ public class ServerManager {
 
     public boolean isStarting() {
         return starting.get();
+    }
+
+    /** 记录一次客户端活动 (打开/操作/页面加载), 供空闲看护用; 写入 prefs 做了节流 */
+    public void noteClientActivity() {
+        lastActivityElapsed = SystemClock.elapsedRealtime();
+        long wall = System.currentTimeMillis();
+        if (wall - lastWriteWall < 60_000) return;
+        lastWriteWall = wall;
+        ctx.getSharedPreferences("opencode_prefs", Context.MODE_PRIVATE)
+                .edit().putLong("last_activity_wall", wall).apply();
+    }
+
+    /** 距上次客户端活动是否在窗口 ms 内 (内存时间戳, 进程被杀后失效) */
+    public boolean clientActiveWithinMs(long ms) {
+        return lastActivityElapsed != 0
+                && SystemClock.elapsedRealtime() - lastActivityElapsed < ms;
+    }
+
+    /** 距上次客户端活动是否在窗口 ms 内 (持久化时间戳, 跨进程重启可用) */
+    public boolean recentlyUsed(long windowMs) {
+        long last = ctx.getSharedPreferences("opencode_prefs", Context.MODE_PRIVATE)
+                .getLong("last_activity_wall", 0);
+        return last != 0 && System.currentTimeMillis() - last < windowMs;
+    }
+
+    /** proot 进程 pid, 未运行返回 0 */
+    public int pid() {
+        Process p = process;
+        return p != null ? pidOf(p) : 0;
+    }
+
+    /**
+     * 返回 proot 进程树的累计 CPU 时钟数 (jiffies)。
+     * 通过 /proc/<pid>/children 递归求和 (同 uid 可读), 供空闲看护判断容器是否在干活。
+     */
+    public long totalCpuTicks() {
+        int pid = pid();
+        if (pid <= 0) return 0;
+        long total = 0;
+        java.util.ArrayDeque<Integer> stack = new java.util.ArrayDeque<>();
+        java.util.HashSet<Integer> seen = new java.util.HashSet<>();
+        stack.push(pid);
+        while (!stack.isEmpty()) {
+            int p = stack.pop();
+            if (!seen.add(p)) continue;
+            total += cpuTicks(p);
+            String children = readProc(new File("/proc", p + "/children"));
+            if (children != null) {
+                for (String tok : children.trim().split("\\s+")) {
+                    if (tok.isEmpty()) continue;
+                    try {
+                        stack.push(Integer.parseInt(tok));
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+            }
+        }
+        return total;
+    }
+
+    /** 读 /proc/<pid>/stat 的 utime+stime (字段 14,15; 跳过 comm 因可能含空格/括号) */
+    private static long cpuTicks(int pid) {
+        try {
+            String stat = readProc(new File("/proc", pid + "/stat"));
+            if (stat == null) return 0;
+            int close = stat.lastIndexOf(')');
+            if (close < 0) return 0;
+            String[] f = stat.substring(close + 1).trim().split("\\s+");
+            // f[0]=state(字段3), f[11]=utime(字段14), f[12]=stime(字段15)
+            if (f.length < 13) return 0;
+            return Long.parseLong(f[11]) + Long.parseLong(f[12]);
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static String readProc(File f) {
+        try (FileInputStream in = new FileInputStream(f)) {
+            byte[] buf = new byte[1024];
+            int n = in.read(buf);
+            if (n <= 0) return null;
+            return new String(buf, 0, n, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     public String serverUrl() {
