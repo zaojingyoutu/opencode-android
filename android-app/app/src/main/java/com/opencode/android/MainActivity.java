@@ -12,9 +12,12 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -44,6 +47,14 @@ public class MainActivity extends Activity {
     private boolean hadAllFilesAccess;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean polling = new AtomicBoolean(false);
+    // 后台超过该时长才在回前台时刷新页面 (快速切回不打断使用)
+    private static final long BG_REFRESH_THRESHOLD_MS = 3000;
+    // 两次自动刷新之间最小间隔, 防抖
+    private static final long RELOAD_MIN_INTERVAL_MS = 3000;
+    private static final int FILECHOOSER_RESULT_CODE = 1001;
+    private ValueCallback<Uri[]> filePathCallback;
+    private long lastPauseMs;
+    private long lastReloadMs;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -110,6 +121,24 @@ public class MainActivity extends Activity {
                 } else {
                     progressBar.setProgress(newProgress);
                     progressBar.setVisibility(View.VISIBLE);
+                }
+            }
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> cb,
+                    FileChooserParams params) {
+                // 上一次弹窗还没返回时, 先通知它取消
+                if (filePathCallback != null) {
+                    filePathCallback.onReceiveValue(null);
+                    filePathCallback = null;
+                }
+                filePathCallback = cb;
+                try {
+                    startActivityForResult(params.createIntent(), FILECHOOSER_RESULT_CODE);
+                    return true;
+                } catch (Exception e) {
+                    filePathCallback.onReceiveValue(null);
+                    filePathCallback = null;
+                    return false;
                 }
             }
         });
@@ -308,6 +337,30 @@ public class MainActivity extends Activity {
         statusView.setOnClickListener(retry);
     }
 
+    /** 文件选择器结果回传: 单选/多选均支持, 取消则返回 null */
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode != FILECHOOSER_RESULT_CODE) {
+            super.onActivityResult(requestCode, resultCode, data);
+            return;
+        }
+        if (filePathCallback == null) return;
+        Uri[] results = null;
+        if (resultCode == RESULT_OK && data != null) {
+            if (data.getClipData() != null && data.getClipData().getItemCount() > 0) {
+                int n = data.getClipData().getItemCount();
+                results = new Uri[n];
+                for (int i = 0; i < n; i++) {
+                    results[i] = data.getClipData().getItemAt(i).getUri();
+                }
+            } else if (data.getData() != null) {
+                results = new Uri[]{data.getData()};
+            }
+        }
+        filePathCallback.onReceiveValue(results);
+        filePathCallback = null;
+    }
+
     // ------------------------------------------------------------------
     // 所有文件访问 (写固定项目目录 /sdcard/opencode 需要) — 启动时弹窗授权
     // ------------------------------------------------------------------
@@ -410,6 +463,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        lastPauseMs = SystemClock.elapsedRealtime();
         if (webView != null) webView.onPause();
     }
 
@@ -422,8 +476,39 @@ public class MainActivity extends Activity {
         if (!hadAllFilesAccess && granted && embedded.isRunning()) {
             embedded.stop();
             embeddedConnect();
+            hadAllFilesAccess = granted;
+            return;
         }
         hadAllFilesAccess = granted;
+        maybeRefreshStale();
+    }
+
+    /**
+     * 后台一段时间后回来: opencode Web UI 的实时通道 (SSE/WebSocket) 在 WebView
+     * 暂停期间会断, 且页面不会自己重新同步, 导致界面停留在旧回复。
+     * 这里先确认服务端仍可达, 再重载页面强制与服务端重新同步;
+     * 服务端不可达 / 正在启动 / 后台时间过短 / 高频触发时都不重载。
+     */
+    private void maybeRefreshStale() {
+        long away = SystemClock.elapsedRealtime() - lastPauseMs;
+        lastPauseMs = 0;
+        if (away < BG_REFRESH_THRESHOLD_MS) return;
+        if (startupOverlay.getVisibility() == View.VISIBLE) return;
+        if (embedded.isStarting() || !embedded.isRunning()) return;
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastReloadMs < RELOAD_MIN_INTERVAL_MS) return;
+        new Thread(() -> {
+            boolean ok = ping(embedded.serverUrl());
+            runOnUiThread(() -> {
+                // 后台期间 Activity 可能已被系统销毁, 此时不要再碰 WebView
+                if (isDestroyed() || isFinishing()) return;
+                if (ok && startupOverlay.getVisibility() != View.VISIBLE) {
+                    lastReloadMs = SystemClock.elapsedRealtime();
+                    Log.i("MainActivity", "background resume: reloading page to resync");
+                    webView.reload();
+                }
+            });
+        }).start();
     }
 
     @Override

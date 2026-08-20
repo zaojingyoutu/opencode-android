@@ -112,6 +112,22 @@ case "$( uname )" in                #(
   NONSTOP* )        nonstop=true ;;
 esac
 
+# 官方 AGP 仅分发 x86_64 版 aapt2。在 aarch64/arm64 主机(如 ARM 服务器或
+# Android 设备)上构建时,若本机安装了 aarch64 版 aapt2(如
+# lzhiyong/android-sdk-tools 的 static-aarch64 构建, 默认路径 /usr/local/bin/aapt2,
+# 可用 AAPT2_PATH 环境变量指定), 则通过 Gradle 项目属性
+# android.aapt2FromMavenOverride 注入该路径。x86_64(如 GitHub Actions ubuntu)
+# 不受影响, 继续使用 AGP 自带的官方 aapt2。
+case "$( uname -m )" in                  #(
+  aarch64|arm64)                        #(
+    aapt2_path="${AAPT2_PATH:-/usr/local/bin/aapt2}"   #(
+    if [ -x "$aapt2_path" ]; then
+        # dash 的 export 不允许带点的变量名, 故仅记录赋值串, 由下方 exec 用 env 注入。
+        AAPT2_OVERRIDE_ENV="ORG_GRADLE_PROJECT_android.aapt2FromMavenOverride=$aapt2_path"
+    fi
+    ;;                                  #(
+esac
+
 CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
 
 
@@ -246,4 +262,8 @@ eval "set -- $(
         tr '\n' ' '
     )" '"$@"'
 
-exec "$JAVACMD" "$@"
+if [ -n "$AAPT2_OVERRIDE_ENV" ]; then
+    exec env "$AAPT2_OVERRIDE_ENV" "$JAVACMD" "$@"
+else
+    exec "$JAVACMD" "$@"
+fi
