@@ -165,8 +165,7 @@ public class ServerService extends Service {
             }
         } else {
             // 疑似空闲: 再确认 AI 没有正在回复 (SSE 转发回复本地 CPU 很低, CPU 采样测不到)
-            boolean replying = server.isReplying();
-            if (replying) {
+            if (server.status().replying) {
                 idleMinutes = 0;
                 busyMinutes = 0;
                 acquireWakeLock();

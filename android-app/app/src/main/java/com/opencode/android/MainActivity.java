@@ -50,6 +50,8 @@ public class MainActivity extends Activity {
     private boolean pendingFileChooser = false;
     private boolean pageFailed = false;
     private long lastPauseElapsed;
+    /** 进入后台时的墙上时间, 用于和 server 侧会话更新时间比较, 判断离开期间有无进展 */
+    private long lastPauseWall;
     // 后台超过该时长才在回前台时刷新页面 (快速切回/文件选择返回不打断使用)
     private static final long BG_REFRESH_THRESHOLD_MS = 30_000;
     private static final int FILECHOOSER_RESULT_CODE = 1001;
@@ -475,6 +477,7 @@ public class MainActivity extends Activity {
         // 后台耗电由 ServerService 看护兜底 (空闲释放唤醒锁 / 长时间空闲自动停止 server)。
         wasBackgrounded = true;
         lastPauseElapsed = SystemClock.elapsedRealtime();
+        lastPauseWall = System.currentTimeMillis();
     }
 
     @Override
@@ -499,34 +502,53 @@ public class MainActivity extends Activity {
                 return;
             }
             if (embedded.isRunning()) {
-                // 回复完成 → 页面可能停在旧"回复中"状态, 刷新拉取最新结果;
-                // 回复进行中 → 不刷新, 注入事件让 UI 重连 SSE (避免打断/闪白)
-                if (embedded.isReplying()) {
-                    // 回复进行中: 注入事件让 UI 重连 SSE; 若后台时 SSE 已断(页面冻结在
-                    // "思考中"不动), 5s 后页面文本仍无任何进展则强制 reload 重新订阅,
-                    // 避免永远卡住 (reload 不打断 server 端回复, 只是重新拉页面)
-                    webView.evaluateJavascript(
-                            "try{" +
-                            "window.__ocBodyLen=document.body?document.body.innerText.length:-1;" +
-                            "document.dispatchEvent(new Event('visibilitychange'));" +
-                            "window.dispatchEvent(new Event('focus'));" +
-                            "}catch(e){}", null);
-                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                        if (isFinishing() || isDestroyed()) return;
-                        webView.evaluateJavascript(
-                                "try{window.__ocBodyLen===document.body.innerText.length}catch(e){true}",
-                                v -> {
-                                    if ("true".equals(v)) webView.reload();
-                                });
-                    }, 5000);
-                } else {
-                    webView.reload();
-                }
+                resyncAfterBackground();
             } else {
                 // server 已被空闲看护停止, 重新拉起 (覆盖层会显示启动/加载进度)
                 embeddedConnect();
             }
         }
+    }
+
+    /**
+     * 后台回到前台后与 server 对齐。
+     *
+     * HTTP 探测必须放子线程: 主线程上 HttpURLConnection 会抛 NetworkOnMainThreadException,
+     * 之前直接在 onResume 里调用, 异常被 catch 吞掉后恒等于"没在回复", 于是每次回来都整页
+     * reload (既闪白又让回复中分支成了死代码)。
+     */
+    private void resyncAfterBackground() {
+        final long pausedAtWall = lastPauseWall;
+        new Thread(() -> {
+            ServerManager.Status st = embedded.status();
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed() || webView == null) return;
+                if (st.replying) {
+                    // 回复进行中: 先让 UI 自己重连; 若后台时 SSE 已断(页面冻结在"思考中"不动),
+                    // 5s 后页面仍无任何进展则强制 reload 重新订阅 (reload 不打断 server 端回复)
+                    webView.evaluateJavascript(
+                            "(function(){try{" +
+                            "window.__ocBodyLen=document.body?document.body.innerText.length:-1;" +
+                            "document.dispatchEvent(new Event('visibilitychange'));" +
+                            "window.dispatchEvent(new Event('focus'));" +
+                            "}catch(e){}})()", null);
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        if (isFinishing() || isDestroyed() || webView == null) return;
+                        webView.evaluateJavascript(
+                                "(function(){try{" +
+                                "return window.__ocBodyLen===document.body.innerText.length" +
+                                "}catch(e){return false}})()",
+                                v -> {
+                                    if ("true".equals(v)) webView.reload();
+                                });
+                    }, 5000);
+                } else if (st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall) {
+                    // 离开期间 server 侧有进展(回复已写完), 页面还停在旧状态 → 刷新拉最新结果
+                    webView.reload();
+                }
+                // 否则: 离开期间什么都没发生, 页面本来就是最新的 → 不刷新, 不闪白
+            });
+        }, "opencode-resync").start();
     }
 
     @Override

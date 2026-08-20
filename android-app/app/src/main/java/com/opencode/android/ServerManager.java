@@ -47,6 +47,8 @@ public class ServerManager {
 
     private static final String TAG = "OpenCodeServer";
     private static final int PORT = 18888;
+    /** 未完成回复的"新鲜度"窗口: 超过此时长毫无进展的未完成消息视为中断残留, 不再算回复中 */
+    private static final long REPLY_FRESH_MS = 10 * 60_000L;
     private static final String ASSET_VERSION = "opencode/version.txt";
     private static final String ASSET_ROOTFS = "opencode/rootfs.tar";
     private static final String[] ASSET_PROOT_LIBS = {
@@ -130,56 +132,83 @@ public class ServerManager {
     }
 
     /**
-     * 请求 server 会话列表, 返回最新会话的更新时间戳 (ms)。
-     * AI 回复/页面活动时该值会变化, 看护线程据此判断"服务端是否正在干活"
-     * (CPU 采样测不到纯 SSE 转发的低占用回复)。server 不可用返回 -1。
+     * server 侧状态快照。
      */
-    public long sessionUpdatedTs() {
-        try {
-            String body = httpGet(serverUrl() + "/session");
-            org.json.JSONArray arr = new org.json.JSONArray(body);
-            long latest = -1;
-            for (int i = 0; i < arr.length(); i++) {
-                org.json.JSONObject s = arr.optJSONObject(i);
-                if (s == null) continue;
-                org.json.JSONObject t = s.optJSONObject("time");
-                if (t != null) {
-                    long up = t.optLong("updated", -1);
-                    if (up > latest) latest = up;
-                }
-            }
-            return latest;
-        } catch (Exception e) {
-            return -1;
+    public static final class Status {
+        /** 最新会话的更新时间戳 (ms 墙上时间); server 不可用为 -1 */
+        public final long sessionUpdated;
+        /** 是否有进行中的回复 (思考/生成中) */
+        public final boolean replying;
+
+        Status(long sessionUpdated, boolean replying) {
+            this.sessionUpdated = sessionUpdated;
+            this.replying = replying;
         }
     }
 
     /**
-     * 判断 AI 是否正在回复: 最新一条 assistant 消息缺失 time.completed 即视为回复中。
-     * 回复中绝不能停止/整页刷新 (否则丢回复)。server 不可用返回 false。
+     * 查询 server 侧状态, <b>必须在子线程调用</b> (主线程会抛 NetworkOnMainThreadException)。
+     *
+     * 回复中判定: 最新一条消息没有 time.completed、没有 error, 且最近仍有进展。
+     * 两个坑都是实测踩出来的:
+     * 1) 必须叠加"最近有进展": server 被杀/回复被打断会永久留下没有 completed 的孤儿消息
+     *    (实测 191 条 assistant 里 3 条如此, 最老的 14 小时前), 只看 completed 会让看护线程
+     *    永远认为"在回复", 唤醒锁再也放不掉, 比不优化还耗电。
+     * 2) 进展时间不能用会话的 time.updated: 实测它基本等于上一条消息的 completed 时刻;
+     *    真正的流式进展在 part 上 (text part 的 time.start/end, tool part 的 state.time.start/end)。
      */
-    public boolean isReplying() {
+    public Status status() {
         try {
-            String list = httpGet(serverUrl() + "/session");
-            org.json.JSONArray arr = new org.json.JSONArray(list);
-            if (arr.length() == 0) return false;
-            String sid = arr.optJSONObject(0).optString("id", "");
-            if (sid.isEmpty()) return false;
-            String msgs = httpGet(serverUrl() + "/session/" + sid + "/message");
-            org.json.JSONArray ma = new org.json.JSONArray(msgs);
-            for (int i = ma.length() - 1; i >= 0; i--) {
-                org.json.JSONObject m = ma.optJSONObject(i);
-                if (m == null) continue;
-                org.json.JSONObject info = m.optJSONObject("info");
-                if (info == null) continue;
-                if (!"assistant".equals(info.optString("role", ""))) continue;
-                org.json.JSONObject t = info.optJSONObject("time");
-                return t == null || !t.has("completed");
+            org.json.JSONArray sessions = new org.json.JSONArray(httpGet(serverUrl() + "/session"));
+            org.json.JSONObject latest = null;
+            long updated = -1;
+            for (int i = 0; i < sessions.length(); i++) {
+                org.json.JSONObject s = sessions.optJSONObject(i);
+                if (s == null) continue;
+                org.json.JSONObject t = s.optJSONObject("time");
+                long up = t != null ? t.optLong("updated", -1) : -1;
+                if (up > updated) {
+                    updated = up;
+                    latest = s;
+                }
             }
-            return false;
+            if (latest == null) return new Status(-1, false);
+            String sid = latest.optString("id", "");
+            if (sid.isEmpty()) return new Status(updated, false);
+            // limit=1 只取最新一条: 整表实测 1.1MB, 这里只要 1.3KB (看护线程每分钟都要问)
+            org.json.JSONArray msgs = new org.json.JSONArray(
+                    httpGet(serverUrl() + "/session/" + sid + "/message?limit=1"));
+            org.json.JSONObject msg = msgs.length() > 0 ? msgs.optJSONObject(0) : null;
+            org.json.JSONObject info = msg != null ? msg.optJSONObject("info") : null;
+            if (info == null) return new Status(updated, false);
+            org.json.JSONObject time = info.optJSONObject("time");
+            if (time != null && time.has("completed")) return new Status(updated, false);
+            if (!info.isNull("error")) return new Status(updated, false);
+            long progress = Math.max(time != null ? time.optLong("created", -1) : -1,
+                    latestPartTs(msg.optJSONArray("parts")));
+            boolean fresh = progress > 0 && System.currentTimeMillis() - progress < REPLY_FRESH_MS;
+            return new Status(updated, fresh);
         } catch (Exception e) {
-            return false;
+            return new Status(-1, false);
         }
+    }
+
+    /** parts 里最后一次进展时间: text part 取 time.start/end, tool part 取 state.time.start/end */
+    private static long latestPartTs(org.json.JSONArray parts) {
+        long max = -1;
+        if (parts == null) return max;
+        for (int i = 0; i < parts.length(); i++) {
+            org.json.JSONObject p = parts.optJSONObject(i);
+            if (p == null) continue;
+            max = Math.max(max, tsOf(p.optJSONObject("time")));
+            org.json.JSONObject state = p.optJSONObject("state");
+            if (state != null) max = Math.max(max, tsOf(state.optJSONObject("time")));
+        }
+        return max;
+    }
+
+    private static long tsOf(org.json.JSONObject time) {
+        return time == null ? -1 : Math.max(time.optLong("start", -1), time.optLong("end", -1));
     }
 
     /** GET 指定 URL 返回响应体字符串, 失败抛异常 */
