@@ -17,6 +17,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -125,6 +127,39 @@ public class ServerManager {
     public int pid() {
         Process p = process;
         return p != null ? pidOf(p) : 0;
+    }
+
+    /**
+     * 请求 server 会话列表, 返回最新会话的更新时间戳 (ms)。
+     * AI 回复/页面活动时该值会变化, 看护线程据此判断"服务端是否正在干活"
+     * (CPU 采样测不到纯 SSE 转发的低占用回复)。server 不可用返回 -1。
+     */
+    public long sessionUpdatedTs() {
+        try {
+            URL u = new URL(serverUrl() + "/session");
+            HttpURLConnection conn = (HttpURLConnection) u.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(3000);
+            conn.setReadTimeout(3000);
+            int code = conn.getResponseCode();
+            String body = readText(conn.getInputStream());
+            conn.disconnect();
+            if (code != 200) return -1;
+            org.json.JSONArray arr = new org.json.JSONArray(body);
+            long latest = -1;
+            for (int i = 0; i < arr.length(); i++) {
+                org.json.JSONObject s = arr.optJSONObject(i);
+                if (s == null) continue;
+                org.json.JSONObject t = s.optJSONObject("time");
+                if (t != null) {
+                    long up = t.optLong("updated", -1);
+                    if (up > latest) latest = up;
+                }
+            }
+            return latest;
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     /**
