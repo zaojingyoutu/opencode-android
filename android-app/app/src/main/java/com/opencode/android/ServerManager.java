@@ -129,11 +129,37 @@ public class ServerManager {
 
     /**
      * 返回 proot 进程树的累计 CPU 时钟数 (jiffies)。
-     * 通过 /proc/<pid>/children 递归求和 (同 uid 可读), 供空闲看护判断容器是否在干活。
+     * 遍历 /proc 按 ppid 构建进程树求和 (proot 环境下 /proc/<pid>/children 不可读,
+     * 只有该文件时只能统计到 proot 自身, 会漏掉容器内真正耗 CPU 的子进程)。
      */
     public long totalCpuTicks() {
         int pid = pid();
         if (pid <= 0) return 0;
+        // 第一遍: 收集所有 pid 的 ppid 与 CPU 累计值
+        java.util.HashMap<Integer, java.util.List<Integer>> byParent = new java.util.HashMap<>();
+        java.util.HashMap<Integer, Long> ticks = new java.util.HashMap<>();
+        File proc = new File("/proc");
+        String[] entries = proc.list();
+        if (entries == null) return 0;
+        for (String e : entries) {
+            int p;
+            try {
+                p = Integer.parseInt(e);
+            } catch (NumberFormatException nfe) {
+                continue;
+            }
+            String[] f = statFields(p);
+            if (f == null) continue;
+            int ppid = Integer.parseInt(f[1]);
+            java.util.List<Integer> kids = byParent.get(ppid);
+            if (kids == null) {
+                kids = new java.util.ArrayList<>();
+                byParent.put(ppid, kids);
+            }
+            kids.add(p);
+            ticks.put(p, Long.parseLong(f[11]) + Long.parseLong(f[12]));
+        }
+        // 第二遍: 从 proot pid 出发沿父链收集所有后代并求和
         long total = 0;
         java.util.ArrayDeque<Integer> stack = new java.util.ArrayDeque<>();
         java.util.HashSet<Integer> seen = new java.util.HashSet<>();
@@ -141,35 +167,35 @@ public class ServerManager {
         while (!stack.isEmpty()) {
             int p = stack.pop();
             if (!seen.add(p)) continue;
-            total += cpuTicks(p);
-            String children = readProc(new File("/proc", p + "/children"));
-            if (children != null) {
-                for (String tok : children.trim().split("\\s+")) {
-                    if (tok.isEmpty()) continue;
-                    try {
-                        stack.push(Integer.parseInt(tok));
-                    } catch (NumberFormatException ignored) {
-                    }
-                }
+            Long t = ticks.get(p);
+            if (t != null) total += t;
+            java.util.List<Integer> kids = byParent.get(p);
+            if (kids != null) {
+                for (int k : kids) stack.push(k);
             }
         }
         return total;
     }
 
-    /** 读 /proc/<pid>/stat 的 utime+stime (字段 14,15; 跳过 comm 因可能含空格/括号) */
-    private static long cpuTicks(int pid) {
+    /** 读 /proc/<pid>/stat 切分字段 (跳过 comm 因可能含空格/括号), 失败返回 null */
+    private static String[] statFields(int pid) {
         try {
             String stat = readProc(new File("/proc", pid + "/stat"));
-            if (stat == null) return 0;
+            if (stat == null) return null;
             int close = stat.lastIndexOf(')');
-            if (close < 0) return 0;
+            if (close < 0) return null;
             String[] f = stat.substring(close + 1).trim().split("\\s+");
-            // f[0]=state(字段3), f[11]=utime(字段14), f[12]=stime(字段15)
-            if (f.length < 13) return 0;
-            return Long.parseLong(f[11]) + Long.parseLong(f[12]);
+            // f[0]=state(字段3), f[1]=ppid(字段4), f[11]=utime(字段14), f[12]=stime(字段15)
+            return f.length >= 13 ? f : null;
         } catch (Exception e) {
-            return 0;
+            return null;
         }
+    }
+
+    /** 读 /proc/<pid>/stat 的 utime+stime (字段 14,15) */
+    private static long cpuTicks(int pid) {
+        String[] f = statFields(pid);
+        return f == null ? 0 : Long.parseLong(f[11]) + Long.parseLong(f[12]);
     }
 
     private static String readProc(File f) {
