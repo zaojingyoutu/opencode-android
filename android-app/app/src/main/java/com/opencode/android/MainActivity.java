@@ -14,6 +14,7 @@ import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.webkit.ValueCallback;
@@ -47,6 +48,8 @@ public class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean polling = new AtomicBoolean(false);
     private boolean wasBackgrounded = false;
+    /** App 是否在前台 (供 ServerService 看护线程判断"用户是否在看", 决定要不要发完成通知) */
+    public static volatile boolean foreground;
     private boolean pendingFileChooser = false;
     private boolean pageFailed = false;
     private long lastPauseElapsed;
@@ -473,6 +476,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        foreground = false;
         // 不暂停 WebView: 保留页面 DOM/滚动位置, 后台回来不闪白、不整页重载。
         // 后台耗电由 ServerService 看护兜底 (空闲释放唤醒锁 / 长时间空闲自动停止 server)。
         wasBackgrounded = true;
@@ -483,6 +487,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        foreground = true;
         embedded.noteClientActivity();
         // 从"所有文件访问"设置页返回: 授权后重启服务以生效公开项目目录
         boolean granted = Environment.isExternalStorageManager();
@@ -513,6 +518,21 @@ public class MainActivity extends Activity {
     /**
      * 后台回到前台后与 server 对齐。
      *
+     * 关键: 对齐判断必须基于 st.pending (存在未完成消息), 不能只看 st.replying。
+     * replying = pending 且 20 分钟内有进展; 后台被冻结/中断的回复进展时间戳早已变旧,
+     * replying=false 而会话也没有新完成的消息 → 旧版两个分支都不命中, 什么都不做,
+     * 页面就停在断掉的 SSE 订阅上永远显示"思考中"。
+     *
+     * 对齐动作:
+     *   - 无未完成消息但离开期间有新完成的结果 → 直接 reload 拉取;
+     *   - 有未完成消息 → 先唤醒页面自身重连 (visibilitychange/focus), 5s 后页面仍
+     *     无任何变化视为卡死, 再区分处理:
+     *       · 回复仍活跃 (replying) → reload 重新订阅 SSE (不打断 server 端回复);
+     *       · 疑似孤儿 (未完成但已无进展) → 先做 2s CPU 快检:
+     *           CPU 在烧 = 活着的慢任务, 只 reload;
+     *           CPU 为零 = 冻结的孤儿, 调 abort 把消息落定为已中止再 reload
+     *           (否则重载后页面照样把它渲染成"思考中", 永远卡住)。
+     *
      * HTTP 探测必须放子线程: 主线程上 HttpURLConnection 会抛 NetworkOnMainThreadException,
      * 之前直接在 onResume 里调用, 异常被 catch 吞掉后恒等于"没在回复", 于是每次回来都整页
      * reload (既闪白又让回复中分支成了死代码)。
@@ -523,32 +543,61 @@ public class MainActivity extends Activity {
             ServerManager.Status st = embedded.status();
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed() || webView == null) return;
-                if (st.replying) {
-                    // 回复进行中: 先让 UI 自己重连; 若后台时 SSE 已断(页面冻结在"思考中"不动),
-                    // 5s 后页面仍无任何进展则强制 reload 重新订阅 (reload 不打断 server 端回复)
+                if (!st.pending) {
+                    // 没有未完成消息: 离开期间有已完成的新结果才需要刷新, 否则页面本来就是最新的
+                    if (st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall) {
+                        webView.reload();
+                    }
+                    return;
+                }
+                // 有未完成消息: 先唤醒页面自身的重连逻辑
+                webView.evaluateJavascript(
+                        "(function(){try{" +
+                        "window.__ocBodyLen=document.body?document.body.innerText.length:-1;" +
+                        "document.dispatchEvent(new Event('visibilitychange'));" +
+                        "window.dispatchEvent(new Event('focus'));" +
+                        "}catch(e){}})()", null);
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    if (isFinishing() || isDestroyed() || webView == null) return;
                     webView.evaluateJavascript(
                             "(function(){try{" +
-                            "window.__ocBodyLen=document.body?document.body.innerText.length:-1;" +
-                            "document.dispatchEvent(new Event('visibilitychange'));" +
-                            "window.dispatchEvent(new Event('focus'));" +
-                            "}catch(e){}})()", null);
-                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                        if (isFinishing() || isDestroyed() || webView == null) return;
-                        webView.evaluateJavascript(
-                                "(function(){try{" +
-                                "return window.__ocBodyLen===document.body.innerText.length" +
-                                "}catch(e){return false}})()",
-                                v -> {
-                                    if ("true".equals(v)) webView.reload();
-                                });
-                    }, 5000);
-                } else if (st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall) {
-                    // 离开期间 server 侧有进展(回复已写完), 页面还停在旧状态 → 刷新拉最新结果
-                    webView.reload();
-                }
-                // 否则: 离开期间什么都没发生, 页面本来就是最新的 → 不刷新, 不闪白
+                            "return window.__ocBodyLen===document.body.innerText.length" +
+                            "}catch(e){return false}})()",
+                            v -> {
+                                if (isFinishing() || isDestroyed() || webView == null) return;
+                                if (!"true".equals(v)) return; // 页面在自己恢复/流式输出中, 不打扰
+                                resolveStalledPending(st);
+                            });
+                }, 5000);
             });
         }, "opencode-resync").start();
+    }
+
+    /** 页面卡死在有未完成消息的状态: 按 server 侧状态决定 reload 还是 abort+reload */
+    private void resolveStalledPending(ServerManager.Status st) {
+        if (st.replying) {
+            // 回复活跃: 重订阅 SSE 即可, 绝不能 abort (会杀掉正在跑的任务)
+            webView.reload();
+            return;
+        }
+        // 未完成但已无进展: 用 2s CPU 快检区分"活着的慢任务"和"冻结的孤儿"
+        new Thread(() -> {
+            boolean cpuBusy = embedded.cpuActiveQuickCheck();
+            if (cpuBusy) {
+                Log.i("MainActivity", "resume: pending stalled but cpu busy, reload only");
+                runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed() || webView == null) return;
+                    webView.reload();
+                });
+                return;
+            }
+            Log.i("MainActivity", "resume: orphan reply detected, abort + reload");
+            if (!st.sessionId.isEmpty()) embedded.abortSession(st.sessionId);
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed() || webView == null) return;
+                webView.reload();
+            });
+        }, "opencode-orphan").start();
     }
 
     @Override

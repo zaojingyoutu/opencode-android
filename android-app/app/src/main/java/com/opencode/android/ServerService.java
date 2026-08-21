@@ -35,6 +35,9 @@ public class ServerService extends Service {
     public static final String ACTION_STOP = "com.opencode.android.action.STOP";
     private static final String CHANNEL_ID = "opencode_server";
     private static final int NOTIF_ID = 1001;
+    /** 任务事件通知渠道 (回复完成/失败提醒, 带声音, 与常驻服务的静音渠道分开便于用户分别管理) */
+    private static final String TASK_CHANNEL_ID = "opencode_task";
+    private static final int NOTIF_ID_TASK = 1002;
 
     // ---- 空闲看护参数 ----
     private static final long WATCHDOG_PERIOD_MS = 60_000;        // 采样周期
@@ -56,6 +59,8 @@ public class ServerService extends Service {
     private long lastTicks = -1;
     private int idleMinutes = 0;
     private int busyMinutes = 0;
+    /** 上一轮看护采样到的状态, 用于检测"回复结束"边沿 (发完成通知) */
+    private ServerManager.Status lastStatus;
 
     @Override
     public void onCreate() {
@@ -110,6 +115,7 @@ public class ServerService extends Service {
         lastTicks = -1;
         idleMinutes = 0;
         busyMinutes = 0;
+        lastStatus = null;
         watchdog = new Thread(this::watchdogLoop, "opencode-watchdog");
         watchdog.setDaemon(true);
         watchdog.start();
@@ -138,7 +144,10 @@ public class ServerService extends Service {
 
     /** 空闲检测主逻辑 (后台线程) */
     private void watchdogTick() {
-        if (!server.isRunning()) return;
+        if (!server.isRunning()) {
+            lastStatus = null;
+            return;
+        }
         int pid = server.pid();
         if (pid != lastPid) {
             lastPid = pid;
@@ -151,6 +160,14 @@ public class ServerService extends Service {
         boolean interactive = pm.isInteractive();
         boolean clientActive = server.clientActiveWithinMs(CLIENT_ACTIVE_MS);
         boolean busy = delta >= BUSY_TICKS;
+        ServerManager.Status st = server.status();
+
+        // 回复结束边沿: 上一轮还在回复, 这一轮已无未完成消息 → 用户不在看就发通知
+        if (lastStatus != null && lastStatus.replying && !st.pending && st.sessionUpdated > 0
+                && (!interactive || !MainActivity.foreground)) {
+            notifyReplyFinished(st.error);
+        }
+        lastStatus = st;
 
         if (interactive || busy || clientActive) {
             // 亮屏 / 有任务在跑 / 用户近期在用
@@ -165,7 +182,7 @@ public class ServerService extends Service {
             }
         } else {
             // 疑似空闲: 再确认 AI 没有正在回复 (SSE 转发回复本地 CPU 很低, CPU 采样测不到)
-            if (server.status().replying) {
+            if (st.replying) {
                 idleMinutes = 0;
                 busyMinutes = 0;
                 acquireWakeLock();
@@ -246,6 +263,35 @@ public class ServerService extends Service {
         return b.build();
     }
 
+    /** 回复结束提醒 (息屏/App 在后台时才发, 点按打开 App 查看结果) */
+    private void notifyReplyFinished(boolean error) {
+        try {
+            if (Build.VERSION.SDK_INT >= 33 &&
+                    checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                Log.i(TAG, "no notification permission, skip finish notice");
+                return;
+            }
+            Intent open = new Intent(this, MainActivity.class);
+            open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            PendingIntent pi = PendingIntent.getActivity(this, 0, open,
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                    ? new Notification.Builder(this, TASK_CHANNEL_ID)
+                    : new Notification.Builder(this);
+            b.setSmallIcon(R.mipmap.ic_launcher)
+                    .setContentTitle(error ? "OpenCode 任务失败" : "OpenCode 回复完成")
+                    .setContentText("点按打开查看结果")
+                    .setContentIntent(pi)
+                    .setAutoCancel(true);
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            nm.notify(NOTIF_ID_TASK, b.build());
+            Log.i(TAG, "finish notice posted (error=" + error + ")");
+        } catch (Exception e) {
+            Log.w(TAG, "notify failed", e);
+        }
+    }
+
     private void createChannel() {
         if (Build.VERSION.SDK_INT < 26) return;
         NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "OpenCode 服务",
@@ -253,5 +299,9 @@ public class ServerService extends Service {
         ch.setShowBadge(false);
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         nm.createNotificationChannel(ch);
+        NotificationChannel task = new NotificationChannel(TASK_CHANNEL_ID, "任务提醒",
+                NotificationManager.IMPORTANCE_DEFAULT);
+        task.setDescription("AI 回复完成/失败时提醒");
+        nm.createNotificationChannel(task);
     }
 }

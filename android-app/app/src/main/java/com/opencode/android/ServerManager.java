@@ -47,8 +47,10 @@ public class ServerManager {
 
     private static final String TAG = "OpenCodeServer";
     private static final int PORT = 18888;
-    /** 未完成回复的"新鲜度"窗口: 超过此时长毫无进展的未完成消息视为中断残留, 不再算回复中 */
-    private static final long REPLY_FRESH_MS = 10 * 60_000L;
+    /** 未完成回复的"新鲜度"窗口: 超过此时长毫无进展的未完成消息视为疑似中断残留, 不再算回复中。
+     *  取 20 分钟: 长时间静默的工具调用 (大文件下载/长测试) part 时间戳可以很久不更新,
+     *  窗口太小会把活任务误判成孤儿 → 看护线程放锁 → CPU 休眠 → 任务被冻死 */
+    private static final long REPLY_FRESH_MS = 20 * 60_000L;
     private static final String ASSET_VERSION = "opencode/version.txt";
     private static final String ASSET_ROOTFS = "opencode/rootfs.tar";
     private static final String[] ASSET_PROOT_LIBS = {
@@ -137,12 +139,24 @@ public class ServerManager {
     public static final class Status {
         /** 最新会话的更新时间戳 (ms 墙上时间); server 不可用为 -1 */
         public final long sessionUpdated;
-        /** 是否有进行中的回复 (思考/生成中) */
+        /** 是否有进行中的回复 (思考/生成中) = pending 且最近仍有进展 */
         public final boolean replying;
+        /** 是否存在未完成消息 (无 completed 且无 error), 不论新鲜度。
+         *  后台被冻结/中断的回复进展时间戳会变旧 (replying=false) 但仍是 pending,
+         *  恢复前台的对齐逻辑必须看它, 否则页面会永远卡在"思考中" */
+        public final boolean pending;
+        /** 最新一条消息是否以错误收场 (供完成通知区分成功/失败) */
+        public final boolean error;
+        /** 最新会话 id, 用于 abort 孤儿回复; 空串表示未知 */
+        public final String sessionId;
 
-        Status(long sessionUpdated, boolean replying) {
+        Status(long sessionUpdated, String sessionId, boolean pending, boolean replying,
+                boolean error) {
             this.sessionUpdated = sessionUpdated;
+            this.sessionId = sessionId;
+            this.pending = pending;
             this.replying = replying;
+            this.error = error;
         }
     }
 
@@ -172,24 +186,28 @@ public class ServerManager {
                     latest = s;
                 }
             }
-            if (latest == null) return new Status(-1, false);
+            if (latest == null) return new Status(-1, "", false, false, false);
             String sid = latest.optString("id", "");
-            if (sid.isEmpty()) return new Status(updated, false);
-            // limit=1 只取最新一条: 整表实测 1.1MB, 这里只要 1.3KB (看护线程每分钟都要问)
+            if (sid.isEmpty()) return new Status(updated, "", false, false, false);
+            // 实测该端点按时间升序返回且 limit=1 拿到的是最老一条 (任何会话第一条都是
+            // 已完成的 user 消息 → replying 永远 false, 看护/恢复逻辑全部失效)。
+            // 必须取数组末尾才是最新消息; 大会话 (225 条实测 ~1MB) 每 60s 拉一次可接受,
+            // 若嫌大可在 server 侧支持降序 limit 时再改回。
             org.json.JSONArray msgs = new org.json.JSONArray(
-                    httpGet(serverUrl() + "/session/" + sid + "/message?limit=1"));
-            org.json.JSONObject msg = msgs.length() > 0 ? msgs.optJSONObject(0) : null;
+                    httpGet(serverUrl() + "/session/" + sid + "/message"));
+            org.json.JSONObject msg = msgs.length() > 0
+                    ? msgs.optJSONObject(msgs.length() - 1) : null;
             org.json.JSONObject info = msg != null ? msg.optJSONObject("info") : null;
-            if (info == null) return new Status(updated, false);
+            if (info == null) return new Status(updated, sid, false, false, false);
             org.json.JSONObject time = info.optJSONObject("time");
-            if (time != null && time.has("completed")) return new Status(updated, false);
-            if (!info.isNull("error")) return new Status(updated, false);
+            if (time != null && time.has("completed")) return new Status(updated, sid, false, false, false);
+            if (!info.isNull("error")) return new Status(updated, sid, false, false, true);
             long progress = Math.max(time != null ? time.optLong("created", -1) : -1,
                     latestPartTs(msg.optJSONArray("parts")));
             boolean fresh = progress > 0 && System.currentTimeMillis() - progress < REPLY_FRESH_MS;
-            return new Status(updated, fresh);
+            return new Status(updated, sid, true, fresh, false);
         } catch (Exception e) {
-            return new Status(-1, false);
+            return new Status(-1, "", false, false, false);
         }
     }
 
@@ -211,17 +229,55 @@ public class ServerManager {
         return time == null ? -1 : Math.max(time.optLong("start", -1), time.optLong("end", -1));
     }
 
+    /** 中止会话当前回复 (孤儿消息收尾用), <b>子线程调用</b>; 尽力而为, 失败只记日志 */
+    public void abortSession(String sid) {
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(
+                    serverUrl() + "/session/" + sid + "/abort").openConnection();
+            try {
+                conn.setRequestMethod("POST");
+                conn.setConnectTimeout(3000);
+                conn.setReadTimeout(3000);
+                int code = conn.getResponseCode();
+                Log.i(TAG, "abort " + sid + ": http " + code);
+            } finally {
+                conn.disconnect();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "abort failed: " + e);
+        }
+    }
+
+    /** 2 秒内容器进程树 CPU 是否明显在跑。
+     *  用于区分"活着的慢任务" (CPU 在烧, 不能 abort) 和"冻结的孤儿回复" (CPU 为零, abort 落定) */
+    public boolean cpuActiveQuickCheck() {
+        long t1 = totalCpuTicks();
+        try {
+            Thread.sleep(2000);
+        } catch (InterruptedException e) {
+            return false;
+        }
+        long t2 = totalCpuTicks();
+        // 100 tick = 1s CPU (100Hz jiffies), 2s 墙钟内 ≈ 50% 单核
+        return t2 - t1 >= 100;
+    }
+
     /** GET 指定 URL 返回响应体字符串, 失败抛异常 */
     private static String httpGet(String url) throws IOException {
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setRequestMethod("GET");
-        conn.setConnectTimeout(3000);
-        conn.setReadTimeout(3000);
-        int code = conn.getResponseCode();
-        String body = readText(conn.getInputStream());
-        conn.disconnect();
-        if (code != 200) throw new IOException("http " + code);
-        return body;
+        try {
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(3000);
+            conn.setReadTimeout(3000);
+            int code = conn.getResponseCode();
+            // 非 200 时 getInputStream() 会抛异常, 必须走 getErrorStream 才能读完并正常断开
+            java.io.InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+            String body = in == null ? "" : readText(in);
+            if (code != 200) throw new IOException("http " + code);
+            return body;
+        } finally {
+            conn.disconnect();
+        }
     }
 
     /**
@@ -287,12 +343,6 @@ public class ServerManager {
         } catch (Exception e) {
             return null;
         }
-    }
-
-    /** 读 /proc/<pid>/stat 的 utime+stime (字段 14,15) */
-    private static long cpuTicks(int pid) {
-        String[] f = statFields(pid);
-        return f == null ? 0 : Long.parseLong(f[11]) + Long.parseLong(f[12]);
     }
 
     private static String readProc(File f) {
@@ -472,9 +522,11 @@ public class ServerManager {
             return;
         }
         // 默认使用 opencode 内置免费模型 (models.dev 提供, 无需 API Key)
-        // 用户可在 Web UI 设置中添加其他 provider
+        // 用户可在 Web UI 设置中添加其他 provider。
+        // 注意: 免费模型会随 Zen 目录调整下架 (deepseek-v4-flash-free 已下架, 实测报
+        // ProviderModelNotFoundError), 若再次失效请按 server 日志提示换新模型名
         String config = "{\n" +
-            "  \"model\": \"opencode/deepseek-v4-flash-free\"\n" +
+            "  \"model\": \"opencode/hy3-free\"\n" +
             "}\n";
         try (OutputStream out = new FileOutputStream(configFile)) {
             out.write(config.getBytes(StandardCharsets.UTF_8));
