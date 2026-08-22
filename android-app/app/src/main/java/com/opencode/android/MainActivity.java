@@ -47,6 +47,13 @@ public class MainActivity extends Activity {
     private boolean hadAllFilesAccess;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean polling = new AtomicBoolean(false);
+    /** 健康检查专用单线程: 避免每秒新建线程 */
+    private final java.util.concurrent.ExecutorService pingExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "opencode-ping");
+                t.setDaemon(true);
+                return t;
+            });
     private boolean wasBackgrounded = false;
     /** App 是否在前台 (供 ServerService 看护线程判断"用户是否在看", 决定要不要发完成通知) */
     public static volatile boolean foreground;
@@ -113,12 +120,14 @@ public class MainActivity extends Activity {
                         "document.head.appendChild(s);", null);
             }
             @Override
-            public void onReceivedError(WebView view, int errorCode,
-                    String description, String failingUrl) {
-                super.onReceivedError(view, errorCode, description, failingUrl);
+            public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
+                    android.webkit.WebResourceError error) {
+                super.onReceivedError(view, request, error);
+                // 只处理主文档加载失败: 子资源 (图片/favicon 等) 失败不该盖错误页
+                if (!request.isForMainFrame()) return;
                 pageFailed = true;
                 progressBar.setVisibility(View.GONE);
-                error("内置服务器连接失败\n" + failingUrl +
+                error("内置服务器连接失败\n" + request.getUrl() +
                         "\n\n点击重试 (可先查看上方 server 日志)");
             }
         });
@@ -308,7 +317,7 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 if (!polling.get()) return;
-                new Thread(() -> {
+                pingExecutor.execute(() -> {
                     boolean ok = ping(embedded.serverUrl());
                     runOnUiThread(() -> {
                         if (ok) {
@@ -323,14 +332,15 @@ public class MainActivity extends Activity {
                             handler.postDelayed(this, 1000);
                         }
                     });
-                }).start();
+                });
             }
         });
     }
 
     private void load() {
         busy("正在加载界面...");
-        webView.loadUrl(embedded.serverUrl());
+        // Activity 可能在 ping 返回前后被销毁 (webView 已置空), 此时不能再碰
+        if (webView != null) webView.loadUrl(embedded.serverUrl());
     }
 
     /** 点击覆盖层/状态文字重试 */
@@ -580,9 +590,19 @@ public class MainActivity extends Activity {
             webView.reload();
             return;
         }
-        // 未完成但已无进展: 用 2s CPU 快检区分"活着的慢任务"和"冻结的孤儿"
+        // 未完成但已无进展: 用两轮间隔的 CPU 快检区分"活着的慢任务"和"冻结的孤儿"。
+        // 单次 2s 采样可能恰好落在网络等待的低谷而误判, 双重确认后才敢 abort,
+        // 绝不能把正在跑的回复杀掉 (误杀的表现就是"一进 App 会话就断了")
         new Thread(() -> {
             boolean cpuBusy = embedded.cpuActiveQuickCheck();
+            if (!cpuBusy) {
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                cpuBusy = embedded.cpuActiveQuickCheck();
+            }
             if (cpuBusy) {
                 Log.i("MainActivity", "resume: pending stalled but cpu busy, reload only");
                 runOnUiThread(() -> {
@@ -605,7 +625,13 @@ public class MainActivity extends Activity {
         super.onDestroy();
         polling.set(false);
         handler.removeCallbacksAndMessages(null);
-        // 不在这里停 server: 息屏/退出 App 后由 ServerService 保活, 长任务不中断;
-        // 用户可通过通知栏"停止"或重新打开 App 管理
+        pingExecutor.shutdownNow();
+        // 释放 WebView (Activity 被系统重建时避免泄漏旧的 JS 线程/SSE 连接);
+        // server 不在这里停: 息屏/退出 App 后由 ServerService 保活, 长任务不中断
+        if (webView != null) {
+            webView.removeAllViews();
+            webView.destroy();
+            webView = null;
+        }
     }
 }

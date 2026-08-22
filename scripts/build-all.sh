@@ -12,6 +12,9 @@ set -e
 
 VERSION_NAME="${1:-}"
 VERSION_CODE="${2:-}"
+# 可选第3参数: 并存包后缀 (如 beta), 生成的 APK 包名带 .beta 后缀,
+# 可与正式包同时安装在手机上; 端口自动改用 18889 避免冲突
+APP_ID_SUFFIX="${3:-}"
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 APP_DIR="$SCRIPT_DIR/../android-app"
@@ -28,6 +31,10 @@ cd "$APP_DIR"
 GRADLE_ARGS="assembleDebug --no-daemon"
 if [ -n "$VERSION_NAME" ]; then
     GRADLE_ARGS="$GRADLE_ARGS -PversionName=$VERSION_NAME -PversionCode=$VERSION_CODE"
+fi
+if [ -n "$APP_ID_SUFFIX" ]; then
+    echo "    并存包: com.opencode.android.$APP_ID_SUFFIX (端口 18889)"
+    GRADLE_ARGS="$GRADLE_ARGS -PappIdSuffix=$APP_ID_SUFFIX -Pport=18889"
 fi
 
 # aarch64/arm64: 注入 aapt2 override (dash 的 export 不支持带点变量名, 用 env 注入)

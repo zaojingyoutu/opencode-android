@@ -46,7 +46,8 @@ import java.util.zip.GZIPInputStream;
 public class ServerManager {
 
     private static final String TAG = "OpenCodeServer";
-    private static final int PORT = 18888;
+    // 端口由构建注入 (BuildConfig.SERVER_PORT, 默认 18888; 并存包用 -Pport=xxxx 换端口)
+    private static final int PORT = BuildConfig.SERVER_PORT;
     /** 未完成回复的"新鲜度"窗口: 超过此时长毫无进展的未完成消息视为疑似中断残留, 不再算回复中。
      *  取 20 分钟: 长时间静默的工具调用 (大文件下载/长测试) part 时间戳可以很久不更新,
      *  窗口太小会把活任务误判成孤儿 → 看护线程放锁 → CPU 休眠 → 任务被冻死 */
@@ -204,11 +205,35 @@ public class ServerManager {
             if (!info.isNull("error")) return new Status(updated, sid, false, false, true);
             long progress = Math.max(time != null ? time.optLong("created", -1) : -1,
                     latestPartTs(msg.optJSONArray("parts")));
+            // 关键: 长命令 (构建/安装/测试/下载) 执行期间不会产生任何时间戳更新,
+            // tool part 的 time.start 只在启动时写一次。只用"20 分钟内有进展"判断,
+            // 超过 20 分钟的单条命令会被误判为不在回复 → 看护线程放锁 → 任务冻死
+            // (实测就是"会话自己断开"的根源)。所以只要存在未结束的 tool part
+            // (running/pending) 就必须视为回复中, 新鲜度仅兜底纯文本生成阶段。
             boolean fresh = progress > 0 && System.currentTimeMillis() - progress < REPLY_FRESH_MS;
-            return new Status(updated, sid, true, fresh, false);
+            boolean replying = hasRunningTool(msg.optJSONArray("parts")) || fresh;
+            return new Status(updated, sid, true, replying, false);
         } catch (Exception e) {
             return new Status(-1, "", false, false, false);
         }
+    }
+
+    /** parts 里是否存在未结束的 tool part (state.status 为 running/pending, 或时间窗开了没关) */
+    private static boolean hasRunningTool(org.json.JSONArray parts) {
+        if (parts == null) return false;
+        for (int i = 0; i < parts.length(); i++) {
+            org.json.JSONObject p = parts.optJSONObject(i);
+            if (p == null) continue;
+            org.json.JSONObject state = p.optJSONObject("state");
+            if (state == null) continue;
+            String s = state.optString("status", "");
+            if ("running".equals(s) || "pending".equals(s)) return true;
+            org.json.JSONObject t = state.optJSONObject("time");
+            long start = t != null ? t.optLong("start", -1) : -1;
+            long end = t != null && t.has("end") ? t.optLong("end", -1) : -1;
+            if (start > 0 && end <= 0) return true;
+        }
+        return false;
     }
 
     /** parts 里最后一次进展时间: text part 取 time.start/end, tool part 取 state.time.start/end */
@@ -522,12 +547,16 @@ public class ServerManager {
             return;
         }
         // 默认使用 opencode 内置免费模型 (models.dev 提供, 无需 API Key)
-        // 用户可在 Web UI 设置中添加其他 provider。
+        // 模型名外置在 assets/opencode/default_config.jsonc, 免费模型下架换名时
+        // 只需改该资产重新打包, 不用动代码。
         // 注意: 免费模型会随 Zen 目录调整下架 (deepseek-v4-flash-free 已下架, 实测报
         // ProviderModelNotFoundError), 若再次失效请按 server 日志提示换新模型名
-        String config = "{\n" +
-            "  \"model\": \"opencode/hy3-free\"\n" +
-            "}\n";
+        String config;
+        try (InputStream in = ctx.getAssets().open("opencode/default_config.jsonc")) {
+            config = readText(in);
+        } catch (IOException e) {
+            config = "{\n  \"model\": \"opencode/hy3-free\"\n}\n";
+        }
         try (OutputStream out = new FileOutputStream(configFile)) {
             out.write(config.getBytes(StandardCharsets.UTF_8));
         }
@@ -621,7 +650,7 @@ public class ServerManager {
         }
     }
 
-    /** Process.pid() 是 API 26+, 这里用反射兼容 API 24/25 */
+    /** 读取 Process 私有 pid 字段 (Android 的 java.lang.Process 未暴露公开 pid 方法) */
     private static int pidOf(Process p) {
         try {
             java.lang.reflect.Field f = p.getClass().getDeclaredField("pid");
@@ -672,6 +701,12 @@ public class ServerManager {
         projects.mkdirs();
         home.mkdirs();
         logFile = new File(root, "server.log");
+        // 日志轮转: 超过 5MB 归档为 .old (覆盖旧归档), 防止长期使用占满存储
+        if (logFile.length() > 5 * 1024 * 1024L) {
+            File old = new File(root, "server.log.old");
+            old.delete();
+            logFile.renameTo(old);
+        }
 
         // 写入默认 opencode 配置 (容器内 XDG_CONFIG_HOME=/root/.config)
         writeDefaultConfig(new File(home, ".config"));
@@ -696,6 +731,13 @@ public class ServerManager {
                 "-w", "/workspace",
                 "--kill-on-exit",
                 "/bin/sh", "-c",
+                // LD_PRELOAD 必须写在容器内命令上而不是 proot 进程的环境里:
+                // proot 是 bionic 链接的 Android 二进制, 不能吃 musl/glibc 垫片。
+                // 原因: opencode musl 版内嵌的终端 pty 原生库是 glibc 链接的,
+                // Bun dlopen 时在 musl 下解析不到 glibc 符号 → /pty 接口 500 →
+                // Web UI 终端永远空白。gcompat 垫片先载入全局作用域后实测
+                // pty 建会话 + WS 流式输出全部正常 (沙盒端到端验证过)。
+                "LD_PRELOAD=/lib/libc.so.6:/lib/libpthread.so.0:/lib/libutil.so.1:/lib/libdl.so.2 " +
                 "opencode serve --port " + PORT + " --hostname 127.0.0.1");
         pb.redirectErrorStream(true);
         // proot 的 -w 会覆盖 cwd, 这里不设也无妨

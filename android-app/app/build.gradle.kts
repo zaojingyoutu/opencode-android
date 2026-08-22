@@ -9,18 +9,45 @@ plugins {
 
 val opencodeAssetDir = layout.projectDirectory.dir("src/main/assets/opencode")
 
-// 版本可由 CI 通过 -PversionName / -PversionCode 注入, 本地构建用默认值
+// 版本可由 CI 通过 -PversionName / -versionCode 注入, 本地构建用默认值
 val releaseVersionName = (project.findProperty("versionName") as String?) ?: "0.7.0"
 val releaseVersionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 1000007
 
+// 并存包: 本地验证新包时加 -PappIdSuffix=beta, 生成 com.opencode.android.beta,
+// 与正式包同时安装在手机上互不影响 (CI 不传该参数, 行为不变)。
+// 同时必须换端口: 两个包的 server 都绑 127.0.0.1:18888 会 Address already in use。
+val appIdSuffix = (project.findProperty("appIdSuffix") as String?)?.takeIf { it.isNotBlank() }
+val applicationIdFull = "com.opencode.android" + (appIdSuffix?.let { ".$it" } ?: "")
+val serverPort = ((project.findProperty("port") as String?)?.toIntOrNull()) ?: 18888
+val appLabel = if (appIdSuffix != null) "OpenCode $appIdSuffix" else "OpenCode"
+
+/** 简单重试: 网络抖动/限流导致的偶发失败不再让整个构建挂掉 (指数退避) */
+fun <T> retry(times: Int = 3, delayMs: Long = 5000, block: () -> T): T {
+    var last: Exception? = null
+    repeat(times) { i ->
+        try {
+            return block()
+        } catch (e: Exception) {
+            last = e
+            if (i < times - 1) {
+                logger.lifecycle("attempt ${i + 1}/$times failed: $e, retrying...")
+                Thread.sleep(delayMs * (i + 1))
+            }
+        }
+    }
+    throw last ?: error("retry failed")
+}
+
 fun httpGet(url: String): String {
-    val conn = URL(url).openConnection() as HttpURLConnection
-    conn.requestMethod = "GET"
-    conn.setRequestProperty("User-Agent", "opencode-android-build")
-    conn.instanceFollowRedirects = true
-    conn.connectTimeout = 30000
-    conn.readTimeout = 60000
-    return conn.inputStream.bufferedReader().use { it.readText() }
+    return retry {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.requestMethod = "GET"
+        conn.setRequestProperty("User-Agent", "opencode-android-build")
+        conn.instanceFollowRedirects = true
+        conn.connectTimeout = 30000
+        conn.readTimeout = 60000
+        conn.inputStream.bufferedReader().use { it.readText() }
+    }
 }
 
 fun download(url: String, dest: File) {
@@ -30,12 +57,22 @@ fun download(url: String, dest: File) {
         return
     }
     logger.lifecycle("downloading ${dest.name} ...")
-    val conn = URL(url).openConnection() as HttpURLConnection
-    conn.setRequestProperty("User-Agent", "opencode-android-build")
-    conn.connectTimeout = 60000
-    conn.readTimeout = 300000
-    conn.inputStream.use { input ->
-        FileOutputStream(dest).use { output -> input.copyTo(output) }
+    retry(delayMs = 10000) {
+        // 先写 .part 再原子改名: 中途失败不留半截文件 (否则下次会被 exists() 误判为缓存)
+        val tmp = File(dest.absolutePath + ".part")
+        try {
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.setRequestProperty("User-Agent", "opencode-android-build")
+            conn.connectTimeout = 60000
+            conn.readTimeout = 300000
+            conn.inputStream.use { input ->
+                FileOutputStream(tmp).use { output -> input.copyTo(output) }
+            }
+            if (!tmp.renameTo(dest)) throw IllegalStateException("rename ${tmp.name} failed")
+        } catch (e: Exception) {
+            tmp.delete()
+            throw e
+        }
     }
 }
 
@@ -111,16 +148,29 @@ tasks.register("downloadRootfs") {
         require(bin.exists()) { "opencode binary not extracted" }
 
         // ---- 2. alpine minirootfs (busybox + apk + musl) ----
-        val rtBase = "https://dl-cdn.alpinelinux.org/alpine/latest-stable"
-        val miniName = findLatest("$rtBase/releases/aarch64/", """href="(alpine-minirootfs-([\d.]+)-aarch64\.tar\.gz)"""")
-        val miniTarball = File(work, "minirootfs.tar.gz")
-        download("$rtBase/releases/aarch64/$miniName", miniTarball)
+        // 固定版本保证构建可复现 (升级需手动改这里); 用版本分支路径,
+        // latest-stable 目录在 alpine 升级后会移除旧版文件
+        val miniName = "alpine-minirootfs-3.24.1-aarch64.tar.gz"
+        val miniTarball = File(work, miniName)
+        download("https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/$miniName", miniTarball)
 
         // ---- 3. git + libcurl 依赖闭包 + CA (alpine v3.21 main) ----
         val gitApk = File(work, "git-2.47.3-r0.apk")
         download("$v321Main/git-2.47.3-r0.apk", gitApk)
         val caApk = File(work, "ca-certificates-bundle-20260413-r0.apk")
         download("$v321Main/ca-certificates-bundle-20260413-r0.apk", caApk)
+        // gcompat (glibc 兼容垫片): opencode musl 版内嵌的终端 pty 原生库是
+        // glibc 链接的, musl 容器里 dlopen 直接失败 → /pty 接口 500 → Web UI
+        // 终端永远空白。垫片提供 libc.so.6 等符号表; 配合 ServerManager 启动时
+        // LD_PRELOAD 进全局作用域后实测 /pty 建会话 + WS 流式输出全部正常。
+        val gcompatApk = File(work, "gcompat-1.1.0-r4.apk")
+        download("$v321Main/gcompat-1.1.0-r4.apk", gcompatApk)
+        // gcompat 垫片 (/lib/libc.so.6=libgcompat.so.0) 的 DT_NEEDED 依赖,
+        // 缺了任何一个 LD_PRELOAD 都会静默失败 → pty 修复无效
+        val ucontextApk = File(work, "libucontext-1.3.2-r0.apk")
+        download("$v321Main/libucontext-1.3.2-r0.apk", ucontextApk)
+        val obstackApk = File(work, "musl-obstack-1.2.3-r2.apk")
+        download("$v321Main/musl-obstack-1.2.3-r2.apk", obstackApk)
         val libApkFiles = alpineLibApks.map { name ->
             val f = File(work, name)
             download("$v321Main/${name.replace("+", "%2B")}", f)
@@ -136,6 +186,12 @@ tasks.register("downloadRootfs") {
                 "--out", rootfsOut.absolutePath,
                 "--bin-apk", gitApk.absolutePath,
                 *libArgs.toTypedArray(),
+                "--lib-apk", gcompatApk.absolutePath,
+                "--lib-apk", ucontextApk.absolutePath,
+                "--lib-apk", obstackApk.absolutePath,
+                // gcompat 包不带 libdl.so.2, 但 pty 库显式依赖它; glibc 2.34+
+                // 已把 dl 函数并入 libc, 软链过去即可
+                "--symlink", "lib/libdl.so.2=libc.so.6",
                 "--ca-apk", caApk.absolutePath)
 
         // version.txt = opencode tag + rootfs 内容指纹, ServerManager 据此判断是否需要重新解压
@@ -198,11 +254,17 @@ android {
         }
     }
     defaultConfig {
-        applicationId = "com.opencode.android"
+        applicationId = applicationIdFull
         minSdk = 24
         targetSdk = 34
         versionCode = releaseVersionCode
         versionName = releaseVersionName
+        // server 端口注入代码 (并存包用不同端口避免冲突)
+        buildConfigField("int", "SERVER_PORT", "$serverPort")
+        manifestPlaceholders["appLabel"] = appLabel
+    }
+    buildFeatures {
+        buildConfig = true
     }
     buildTypes {
         getByName("release") {

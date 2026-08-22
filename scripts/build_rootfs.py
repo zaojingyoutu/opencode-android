@@ -78,6 +78,10 @@ def main() -> None:
     ap.add_argument("--lib-apk", action="append", default=[])
     ap.add_argument("--bin-apk", action="append", default=[])
     ap.add_argument("--ca-apk")
+    # 额外软链, 格式 路径=目标 (相对 rootfs 根), 如 lib/libdl.so.2=libc.so.6。
+    # 用于补齐包缺失的链接: gcompat 不带 libdl.so.2, 而 opencode 的 pty
+    # 原生库 DT_NEEDED 里显式要求它 (glibc >= 2.34 已把 dl 并入 libc)。
+    ap.add_argument("--symlink", action="append", default=[])
     args = ap.parse_args()
 
     with open(args.opencode, "rb") as f:
@@ -107,7 +111,22 @@ def main() -> None:
             merge_dir(out_tar, apk, ("./usr/bin/", "usr/bin/", "./usr/libexec/git-core/", "usr/libexec/git-core/"), seen)
         for apk in args.lib_apk:
             print(f"merge lib: {os.path.basename(apk)}")
-            merge_dir(out_tar, apk, ("./usr/lib/", "usr/lib/"), seen)
+            # gcompat 等包装在 /lib (非 usr/lib), 两种前缀都收
+            merge_dir(out_tar, apk, ("./usr/lib/", "usr/lib/", "./lib/", "lib/"), seen)
+
+        for spec in args.symlink:
+            path, _, target = spec.partition("=")
+            base = path.rsplit("/", 1)[-1]
+            if base in seen:
+                continue
+            seen.add(base)
+            info = tarfile.TarInfo(path)
+            info.type = tarfile.SYMTYPE
+            info.linkname = target
+            info.mode = 0o777
+            info.mtime = 0
+            out_tar.addfile(info)
+            print(f"symlink: {path} -> {target}")
 
         if args.ca_apk:
             cacert = apk_file(args.ca_apk, "etc/ssl/certs/ca-certificates.crt")

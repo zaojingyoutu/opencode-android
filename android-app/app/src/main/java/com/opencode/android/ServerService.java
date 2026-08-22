@@ -26,7 +26,7 @@ import android.util.Log;
  *   - 连续空闲 RELEASE_MINUTES 分钟 → 释放唤醒锁 (息屏后 CPU 可休眠);
  *   - 连续空闲 STOP_MINUTES 分钟 → 自动停止 server + 前台服务 (彻底省电);
  *   - 屏幕熄灭且无客户端活动时容器仍持续高 CPU 超过 FORCE_STOP_MINUTES →
- *     视为失控进程, 强制停止 (防止后台空转烧电)。
+ *     视为失控进程, 强制停止 (防止后台空转烧电); AI 回复推进期间除外。
  */
 public class ServerService extends Service {
 
@@ -47,6 +47,7 @@ public class ServerService extends Service {
     private static final int RELEASE_MINUTES = 3;   // 连续空闲 3 分钟 → 释放唤醒锁
     private static final int STOP_MINUTES = 30;     // 连续空闲 30 分钟 → 自动停止
     private static final int FORCE_STOP_MINUTES = 90; // 息屏无客户端仍持续高 CPU → 强制停止
+    private static final int ORPHAN_ABORT_MINUTES = 15; // 持续无进展无 CPU → 判定孤儿并 abort 收尾
 
     private PowerManager.WakeLock wakeLock;
     private PowerManager pm;
@@ -59,6 +60,8 @@ public class ServerService extends Service {
     private long lastTicks = -1;
     private int idleMinutes = 0;
     private int busyMinutes = 0;
+    /** 连续"有未完成消息但无进展无 CPU"的分钟数, 用于识别并收尾断流孤儿 */
+    private int stalledMinutes = 0;
     /** 上一轮看护采样到的状态, 用于检测"回复结束"边沿 (发完成通知) */
     private ServerManager.Status lastStatus;
 
@@ -115,6 +118,7 @@ public class ServerService extends Service {
         lastTicks = -1;
         idleMinutes = 0;
         busyMinutes = 0;
+        stalledMinutes = 0;
         lastStatus = null;
         watchdog = new Thread(this::watchdogLoop, "opencode-watchdog");
         watchdog.setDaemon(true);
@@ -160,41 +164,71 @@ public class ServerService extends Service {
         boolean interactive = pm.isInteractive();
         boolean clientActive = server.clientActiveWithinMs(CLIENT_ACTIVE_MS);
         boolean busy = delta >= BUSY_TICKS;
+
+        if (interactive && MainActivity.foreground) {
+            // 用户正在看: 不需要完成通知, 也不需要空闲判断。
+            // 跳过 status() 的全量消息拉取 (大会话每次 ~1MB JSON), 省流量省电
+            lastStatus = null;
+            idleMinutes = 0;
+            busyMinutes = 0;
+            releaseWakeLock();
+            return;
+        }
+
         ServerManager.Status st = server.status();
 
-        // 回复结束边沿: 上一轮还在回复, 这一轮已无未完成消息 → 用户不在看就发通知
-        if (lastStatus != null && lastStatus.replying && !st.pending && st.sessionUpdated > 0
-                && (!interactive || !MainActivity.foreground)) {
+        // 回复结束边沿: 上一轮还有未完成消息, 这一轮没有了 → 用户不在看就发通知。
+        // 用 pending 而非 replying: 静默长任务 (大下载/长测试超 20 分钟无输出) 的
+        // replying 会因新鲜度窗口过期变 false, 用它做边沿会漏发完成通知
+        if (lastStatus != null && lastStatus.pending && !st.pending && st.sessionUpdated > 0) {
             notifyReplyFinished(st.error);
         }
         lastStatus = st;
 
-        if (interactive || busy || clientActive) {
-            // 亮屏 / 有任务在跑 / 用户近期在用
-            if (interactive) {
-                idleMinutes = 0;
-                busyMinutes = 0;
-                releaseWakeLock();
-            } else {
-                idleMinutes = 0;
-                busyMinutes = busy ? busyMinutes + 1 : 0;
-                acquireWakeLock();
-            }
+        if (interactive) {
+            // 亮屏 (不在本 App 前台): 屏幕本身保证 CPU 活跃, 不需要唤醒锁, 也不累计空闲
+            idleMinutes = 0;
+            busyMinutes = 0;
+            releaseWakeLock();
+        } else if (busy || clientActive) {
+            // 息屏但有任务在跑 / 用户近期在用
+            idleMinutes = 0;
+            busyMinutes = busy ? busyMinutes + 1 : 0;
+            acquireWakeLock();
         } else {
-            // 疑似空闲: 再确认 AI 没有正在回复 (SSE 转发回复本地 CPU 很低, CPU 采样测不到)
-            if (st.replying) {
+            // 息屏且 CPU 不忙: 只要还有未完成消息就继续保活。
+            // 不能只看 replying: SSE 转发/模型等待阶段本地 CPU 极低测不到,
+            // 且静默长任务的 replying 会过期; 放锁后 CPU 休眠 → 网络断 → 任务冻死。
+            // 真孤儿 (server 重启留下的永久 pending) 由下面的 stalledMinutes 自愈收尾,
+            // 不会像旧版那样永远占着唤醒锁。
+            if (st.pending) {
+                if (st.replying || busy) {
+                    stalledMinutes = 0;
+                } else {
+                    stalledMinutes++;
+                    // 连续 15 分钟既无进展也无 CPU: 基本可断定是断流孤儿,
+                    // 调 abort 把消息落定 (之后正常进入空闲流程), 不杀整个 server
+                    if (stalledMinutes >= ORPHAN_ABORT_MINUTES && !st.sessionId.isEmpty()) {
+                        Log.i(TAG, "orphan reply (no progress " + stalledMinutes
+                                + " min), aborting session " + st.sessionId);
+                        server.abortSession(st.sessionId);
+                        stalledMinutes = 0;
+                    }
+                }
                 idleMinutes = 0;
-                busyMinutes = 0;
                 acquireWakeLock();
             } else {
+                stalledMinutes = 0;
                 idleMinutes++;
                 busyMinutes = 0;
                 if (idleMinutes >= RELEASE_MINUTES) releaseWakeLock();
             }
         }
 
-        if (busyMinutes >= FORCE_STOP_MINUTES && !clientActive) {
-            // 息屏 + 无客户端活动 + 持续高 CPU → 失控进程, 强制停止防烧电
+        // 还有未完成消息时绝不参与失控强停: 息屏跑大型构建可能远超 FORCE_STOP_MINUTES。
+        // 高 CPU + 无未完成消息 + 息屏 + 无客户端活动才是真的失控空转
+        if (busyMinutes >= FORCE_STOP_MINUTES && !clientActive && !st.pending) {
+            // 息屏 + 无客户端活动 + 非任务高 CPU → 失控进程, 强制停止防烧电
             Log.i(TAG, "runaway busy, forcing stop (busyMinutes=" + busyMinutes +
                     ", cpuDelta=" + delta + ")");
             main.post(this::stopAll);
@@ -206,7 +240,9 @@ public class ServerService extends Service {
 
     private void acquireWakeLock() {
         if (wakeLock != null && !wakeLock.isHeld()) {
-            wakeLock.acquire();
+            // 带超时兜底: 即使逻辑异常忘记释放, 最多 10 分钟后系统也会回收;
+            // 看护线程每 60s 采样, 仍需要时会重新持有
+            wakeLock.acquire(10 * 60_000L);
             Log.i(TAG, "wake lock acquired (background active)");
         }
     }
