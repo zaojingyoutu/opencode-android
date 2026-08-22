@@ -2,6 +2,7 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.util.zip.GZIPInputStream
 
 plugins {
     id("com.android.application") version "8.5.2"
@@ -91,24 +92,64 @@ fun runPython(script: String, vararg args: String) {
 val scriptsDir = rootProject.projectDir.parentFile.resolve("scripts")
 val v321Main = "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64"
 
+/** 查询 alpine v3.21 main 仓库中某包的当前版本 (解析 APKINDEX) */
+fun alpineCurrentVersion(pkg: String): String {
+    return retry {
+        val conn = URL("$v321Main/APKINDEX.tar.gz").openConnection() as HttpURLConnection
+        conn.setRequestProperty("User-Agent", "opencode-android-build")
+        conn.connectTimeout = 30000
+        conn.readTimeout = 60000
+        GZIPInputStream(conn.inputStream).bufferedReader().use { reader ->
+            var curPkg = ""
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.startsWith("P:")) curPkg = line.substring(2)
+                if (line.startsWith("V:") && curPkg == pkg) return@retry line.substring(2)
+            }
+            throw IllegalStateException("package $pkg not found in $v321Main/APKINDEX")
+        }
+    }
+}
+
+/**
+ * 下载固定版本的 alpine main 包。上游安全重建会把旧版本文件从源里移除
+ * (如 libexpat-2.8.2-r0 被 2.8.3-r0 替换后 CI 直接 404), 此时自动回退到
+ * APKINDEX 当前版本并打日志, 流水线不再被上游重建卡死。
+ */
+fun downloadAlpineApk(pkg: String, pinnedVer: String, workDir: File): File {
+    val dest = File(workDir, "$pkg-$pinnedVer.apk")
+    try {
+        download("$v321Main/${dest.name.replace("+", "%2B")}", dest)
+        return dest
+    } catch (e: Exception) {
+        dest.delete()
+    }
+    val cur = alpineCurrentVersion(pkg)
+    logger.lifecycle("⚠️ 固定版本 ${dest.name} 已被源移除 (上游重建?), 回退到当前版本 $pkg-$cur")
+    val curFile = File(workDir, "$pkg-$cur.apk")
+    download("$v321Main/${curFile.name.replace("+", "%2B")}", curFile)
+    return curFile
+}
+
 // git (alpine v3.21) 及其动态依赖 libcurl 的完整闭包, 全部从 alpine main 仓库取二进制:
 // 保证内置 git 支持本地操作 + https 远程 (git-remote-http)。
+// Pair = 包名 to 固定版本 (升级需手动改; 被上游重建移除时自动回退当前版本, 见 downloadAlpineApk)
 val alpineLibApks = listOf(
-    "pcre2-10.43-r0.apk",
-    "zlib-1.3.2-r0.apk",
-    "libexpat-2.8.2-r0.apk",
-    "libcurl-8.14.1-r2.apk",
-    "brotli-libs-1.1.0-r2.apk",
-    "c-ares-1.34.8-r0.apk",
-    "libssl3-3.3.7-r0.apk",
-    "libcrypto3-3.3.7-r0.apk",
-    "libidn2-2.3.7-r0.apk",
-    "libunistring-1.2-r0.apk",
-    "libpsl-0.21.5-r3.apk",
-    "nghttp2-libs-1.69.0-r0.apk",
-    "zstd-libs-1.5.6-r2.apk",
-    "libgcc-14.2.0-r4.apk",
-    "libstdc++-14.2.0-r4.apk",
+    "pcre2" to "10.43-r0",
+    "zlib" to "1.3.2-r0",
+    "libexpat" to "2.8.3-r0",
+    "libcurl" to "8.14.1-r2",
+    "brotli-libs" to "1.1.0-r2",
+    "c-ares" to "1.34.8-r0",
+    "libssl3" to "3.3.7-r0",
+    "libcrypto3" to "3.3.7-r0",
+    "libidn2" to "2.3.7-r0",
+    "libunistring" to "1.2-r0",
+    "libpsl" to "0.21.5-r3",
+    "nghttp2-libs" to "1.69.0-r0",
+    "zstd-libs" to "1.5.6-r2",
+    "libgcc" to "14.2.0-r4",
+    "libstdc++" to "14.2.0-r4",
 )
 
 /**
@@ -155,27 +196,18 @@ tasks.register("downloadRootfs") {
         download("https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/$miniName", miniTarball)
 
         // ---- 3. git + libcurl 依赖闭包 + CA (alpine v3.21 main) ----
-        val gitApk = File(work, "git-2.47.3-r0.apk")
-        download("$v321Main/git-2.47.3-r0.apk", gitApk)
-        val caApk = File(work, "ca-certificates-bundle-20260413-r0.apk")
-        download("$v321Main/ca-certificates-bundle-20260413-r0.apk", caApk)
+        val gitApk = downloadAlpineApk("git", "2.47.3-r0", work)
+        val caApk = downloadAlpineApk("ca-certificates-bundle", "20260413-r0", work)
         // gcompat (glibc 兼容垫片): opencode musl 版内嵌的终端 pty 原生库是
         // glibc 链接的, musl 容器里 dlopen 直接失败 → /pty 接口 500 → Web UI
         // 终端永远空白。垫片提供 libc.so.6 等符号表; 配合 ServerManager 启动时
         // LD_PRELOAD 进全局作用域后实测 /pty 建会话 + WS 流式输出全部正常。
-        val gcompatApk = File(work, "gcompat-1.1.0-r4.apk")
-        download("$v321Main/gcompat-1.1.0-r4.apk", gcompatApk)
+        val gcompatApk = downloadAlpineApk("gcompat", "1.1.0-r4", work)
         // gcompat 垫片 (/lib/libc.so.6=libgcompat.so.0) 的 DT_NEEDED 依赖,
         // 缺了任何一个 LD_PRELOAD 都会静默失败 → pty 修复无效
-        val ucontextApk = File(work, "libucontext-1.3.2-r0.apk")
-        download("$v321Main/libucontext-1.3.2-r0.apk", ucontextApk)
-        val obstackApk = File(work, "musl-obstack-1.2.3-r2.apk")
-        download("$v321Main/musl-obstack-1.2.3-r2.apk", obstackApk)
-        val libApkFiles = alpineLibApks.map { name ->
-            val f = File(work, name)
-            download("$v321Main/${name.replace("+", "%2B")}", f)
-            f
-        }
+        val ucontextApk = downloadAlpineApk("libucontext", "1.3.2-r0", work)
+        val obstackApk = downloadAlpineApk("musl-obstack", "1.2.3-r2", work)
+        val libApkFiles = alpineLibApks.map { (pkg, ver) -> downloadAlpineApk(pkg, ver, work) }
 
         // ---- 4. 组装 rootfs.tar (纯 tar, 不 gzip, 见任务头部注释) ----
         val rootfsOut = File(outputDir.asFile, "rootfs.tar")

@@ -57,6 +57,67 @@ run_gradle() {
     fi
 }
 
+# musl JDK 修复: musl libc 的 remove() 不像 glibc 那样对目录回落 rmdir,
+# OpenJDK 的 java.io.File.delete() 因此删不掉任何目录 → AGP(apkzlib) 清理
+# /tmp/tempdir_* 失败 → :app:mergeDebugJavaResource 抛 "Failed to delete ..."。
+# 探测到该缺陷时, 用 NIO 实现替换 gradle 缓存里 apkzlib 的 TemporaryFile 类。
+# 正常 JDK (glibc/macOS/Windows) 探测通过, 直接跳过, 行为不变。
+fix_apkzlib_for_musl_jdk() {
+    command -v javac >/dev/null 2>&1 || return 0
+
+    probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/musl-probe.XXXXXX") || return 0
+    trap 'rm -rf "$probe_dir"' EXIT INT TERM
+    cat > "$probe_dir/Probe.java" <<'EOF'
+import java.io.File;
+public class Probe {
+    public static void main(String[] a) throws Exception {
+        File d = new File(a[0], "x");
+        d.mkdirs();
+        System.exit(d.delete() ? 0 : 1);
+    }
+}
+EOF
+    if ! javac -d "$probe_dir" "$probe_dir/Probe.java" 2>/dev/null \
+            || java -cp "$probe_dir" Probe "$probe_dir" 2>/dev/null; then
+        rm -rf "$probe_dir"; trap - EXIT INT TERM
+        return 0   # JDK 可正常删目录, 无需修补
+    fi
+    rm -rf "$probe_dir"; trap - EXIT INT TERM
+    echo "    检测到 musl JDK 缺陷 (File.delete 无法删除目录), 打 apkzlib 补丁..."
+
+    gradle_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+    jar_file=$(find "$gradle_home/caches/modules-2/files-2.1/com.android.tools.build/apkzlib" \
+        -name 'apkzlib-*.jar' 2>/dev/null | head -n 1)
+    [ -n "$jar_file" ] || { echo "⚠️  未找到缓存中的 apkzlib jar, 跳过补丁"; return 0; }
+
+    # 幂等: 已打过补丁则跳过 (标记文件与 jar 同目录)
+    if [ -f "$jar_file.musl-patched" ]; then
+        echo "    apkzlib 补丁已存在: $jar_file"
+        return 0
+    fi
+
+    classes="$probe_dir/classes"
+    mkdir -p "$classes"
+    if ! javac --release 11 -d "$classes" \
+            "$SCRIPT_DIR/apkzlib-musl-patch/TemporaryFile.java"; then
+        echo "⚠️  apkzlib 补丁编译失败, 构建可能因临时目录无法清理而失败"
+        return 0
+    fi
+    jar --update --file "$jar_file" -C "$classes" \
+        com/android/tools/build/apkzlib/bytestorage/TemporaryFile.class \
+        && touch "$jar_file.musl-patched"
+
+    # 清掉基于旧 jar 的字节码插桩缓存, 让 Gradle 用新 jar 重新生成
+    find "$gradle_home/caches" -type f -name 'instrumented-apkzlib*.jar' 2>/dev/null |
+        while IFS= read -r f; do rm -rf "$(dirname "$f")"; done
+    echo "    apkzlib 已修补: $jar_file"
+
+    # 清理之前失败构建遗留的空壳临时目录
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'tempdir_*' -type d -exec rm -rf {} + 2>/dev/null || :
+}
+
+fix_apkzlib_for_musl_jdk
+
 if [ -x ./gradlew ]; then
     echo "==> ./gradlew $GRADLE_ARGS"
     run_gradle ./gradlew $GRADLE_ARGS
