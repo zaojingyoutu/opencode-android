@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 需要 git 拉全量 tag, 用于推导最新版本号
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -36,14 +39,17 @@ jobs:
         run: |
           cd android-app
           REF="${GITHUB_REF_NAME}"
+          # 最新 vX.Y.Z tag → versionName 基准 (无 tag 时兜底)
+          BASE=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -n1)
+          [ -n "$BASE" ] || BASE="0.7.0"
           if echo "$REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            VER=$(echo "$REF" | sed 's/^v//')
-            IFS=. read -r MAJ MIN PAT <<< "$VER"
-            VCODE=$(( 1000000 + MAJ * 100000 + MIN * 100 + PAT ))
+            VER="$REF" ; VER="${VER#v}"            # tag 构建: 干净的 X.Y.Z
           else
-            VER="0.8.0"
-            VCODE=1000008
+            VER="$BASE-r${GITHUB_RUN_NUMBER}"       # 分支构建: 带构建号可区分每次 push
           fi
+          # 版本码全局单调递增 (run_number 严格递增; 2M 区间不与旧公式 1M 区间冲突),
+          # 任何新包都能覆盖安装手机上的旧包, 不再 VERSION_DOWNGRADE
+          VCODE=$(( 2000000 + GITHUB_RUN_NUMBER ))
           echo "Building $VER (code=$VCODE)"
           ./gradlew assembleDebug --no-daemon -PversionName="$VER" -PversionCode="$VCODE"
 
