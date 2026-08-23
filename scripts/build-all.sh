@@ -12,6 +12,29 @@ set -e
 
 VERSION_NAME="${1:-}"
 VERSION_CODE="${2:-}"
+if [ -z "$VERSION_NAME" ]; then
+    # 查找最近的 vX.Y.Z tag (如果有)
+    latest_tag=$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || true)
+    if [ -n "$latest_tag" ]; then
+        base="${latest_tag#v}"
+        # 当前 commit 是否恰好等于 tag commit → 直接使用 tag 版本
+        if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$latest_tag")" ]; then
+            VERSION_NAME="$base"
+        else
+            # 计算自 tag 以来的提交数作为递增编号
+            commit_cnt=$(git rev-list "$latest_tag"..HEAD --count)
+            VERSION_NAME="${base}-r${commit_cnt}"
+        fi
+    else
+        VERSION_NAME="0.7.0"
+    fi
+fi
+
+if [ -z "$VERSION_CODE" ]; then
+    # 采用全局递增的方案: 2_000_000 + (自仓库首个提交起的总提交数)
+    total_cnt=$(git rev-list --count HEAD)
+    VERSION_CODE=$((2000000 + total_cnt))
+fi
 # 可选第3参数: 并存包后缀 (如 beta), 生成的 APK 包名带 .beta 后缀,
 # 可与正式包同时安装在手机上; 端口自动改用 18889 避免冲突
 APP_ID_SUFFIX="${3:-}"
