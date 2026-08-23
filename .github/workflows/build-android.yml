@@ -39,17 +39,18 @@ jobs:
         run: |
           cd android-app
           REF="${GITHUB_REF_NAME}"
-          # 最新 vX.Y.Z tag → versionName 基准 (无 tag 时兜底)
+          # 与 scripts/build-all.sh 同一算法: 同一 commit 本地/CI 得到同一版本号
+          #   versionName = 最新 vX.Y.Z tag (非 tag commit 追加 -r<自 tag 起提交数>)
+          #   versionCode = 2000000 + 仓库总提交数 (单调递增, 高于旧公式 1xxxxxx 区间)
           BASE=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -n1)
           [ -n "$BASE" ] || BASE="0.7.0"
           if echo "$REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            VER="$REF" ; VER="${VER#v}"            # tag 构建: 干净的 X.Y.Z
+            VER="${REF#v}"                          # tag 构建: 干净的 X.Y.Z
           else
-            VER="$BASE-r${GITHUB_RUN_NUMBER}"       # 分支构建: 带构建号可区分每次 push
+            CNT=$(git rev-list "v${BASE}"..HEAD --count)
+            VER="$BASE-r$CNT"
           fi
-          # 版本码全局单调递增 (run_number 严格递增; 2M 区间不与旧公式 1M 区间冲突),
-          # 任何新包都能覆盖安装手机上的旧包, 不再 VERSION_DOWNGRADE
-          VCODE=$(( 2000000 + GITHUB_RUN_NUMBER ))
+          VCODE=$(( 2000000 + $(git rev-list --count HEAD) ))
           echo "Building $VER (code=$VCODE)"
           ./gradlew assembleDebug --no-daemon -PversionName="$VER" -PversionCode="$VCODE"
 
