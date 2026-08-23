@@ -132,6 +132,57 @@ fun downloadAlpineApk(pkg: String, pinnedVer: String, workDir: File): File {
     return curFile
 }
 
+/** 查询 termux repo (Packages 索引) 中某包的当前版本, 用于固定版本被源移除时回退 */
+fun termuxCurrentVersion(pkg: String): String {
+    return retry {
+        val conn = URL("https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages")
+            .openConnection() as HttpURLConnection
+        conn.setRequestProperty("User-Agent", "opencode-android-build")
+        conn.connectTimeout = 30000
+        conn.readTimeout = 60000
+        conn.inputStream.bufferedReader().use { reader ->
+            var name: String? = null
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.startsWith("Package: ")) name = line.substring("Package: ".length).trim()
+                if (name == pkg && line.startsWith("Version: ")) {
+                    return@retry line.substring("Version: ".length).trim()
+                }
+            }
+            throw IllegalStateException("package $pkg not found in termux Packages")
+        }
+    }
+}
+
+/** termux 包路径规则: pool/main/<首字母或libprefix>/<pkg>/<pkg>_<ver>_<arch>.deb */
+fun termuxDebPath(pkg: String): String {
+    val seg = when {
+        pkg.startsWith("liba") -> "liba"
+        pkg.startsWith("libt") -> "libt"
+        pkg.startsWith("lib") -> "lib${pkg[3]}"
+        else -> pkg.substring(0, 1)
+    }
+    return "$seg/$pkg"
+}
+
+/** 下载固定版本的 termux deb; 固定版本被源移除时回退到当前版本 */
+fun downloadTermuxDeb(pkg: String, pinnedVer: String, workDir: File): File {
+    val arch = "aarch64"
+    val base = "https://packages.termux.dev/apt/termux-main/pool/main"
+    val dest = File(workDir, "${pkg}_${pinnedVer}_${arch}.deb")
+    try {
+        download("$base/${termuxDebPath(pkg)}/${dest.name}", dest)
+        return dest
+    } catch (e: Exception) {
+        dest.delete()
+    }
+    val cur = termuxCurrentVersion(pkg)
+    logger.lifecycle("⚠️ 固定版本 ${dest.name} 已被源移除 (上游重建?), 回退到当前版本 ${pkg}_${cur}_$arch")
+    val curFile = File(workDir, "${pkg}_${cur}_${arch}.deb")
+    download("$base/${termuxDebPath(pkg)}/${curFile.name}", curFile)
+    return curFile
+}
+
 // git (alpine v3.24, 与 minirootfs 同版本线) 及其动态依赖 libcurl 的完整闭包,
 // 全部从 alpine main 仓库取二进制: 保证内置 git 支持本地操作 + https 远程 (git-remote-http)。
 // Pair = 包名 to 固定版本 (升级需手动改; 被上游重建移除时自动回退当前版本, 见 downloadAlpineApk)
@@ -255,12 +306,10 @@ tasks.register("downloadProot") {
         work.mkdirs()
 
         val base = "https://packages.termux.dev/apt/termux-main/pool/main"
-        val prootDeb = File(work, "proot.deb")
-        val tallocDeb = File(work, "libtalloc.deb")
-        val shmemDeb = File(work, "libandroid-shmem.deb")
-        download("$base/p/proot/proot_5.1.107.91_aarch64.deb", prootDeb)
-        download("$base/libt/libtalloc/libtalloc_2.4.3_aarch64.deb", tallocDeb)
-        download("$base/liba/libandroid-shmem/libandroid-shmem_0.7_aarch64.deb", shmemDeb)
+        // 钉版: 上游若安全重建移除旧文件, downloadTermuxDeb 会自动回退当前版本
+        val prootDeb = downloadTermuxDeb("proot", "5.1.107.92", work)
+        val tallocDeb = downloadTermuxDeb("libtalloc", "2.4.3", work)
+        val shmemDeb = downloadTermuxDeb("libandroid-shmem", "0.7", work)
 
         val assetProot = File(outputDir.asFile, "proot")
         runPython(scriptsDir.resolve("prepare_proot.py").absolutePath,
