@@ -120,3 +120,5 @@ scripts/
 **Q: 内置 server 启动失败**
 点击状态文字, 屏幕会显示 `server.log` 尾部内容, 据此排查
 (常见: 机型 ROM 限制 ptrace/seccomp, 可用 `adb shell am set-debug-app` 场景验证)。
+
+<!-- CI touch -->
