@@ -6,6 +6,10 @@ android-app/app/build/
 
 # 本地构建环境 (JDK/SDK/Gradle), 不入库
 .local/
+# 本地 Android SDK 目录（不上传）
+android-sdk/
+# 本地 Gradle 8.7 包（不上传）
+gradle-8.7/
 
 # gradle-wrapper.jar 由 CI 下载 (见 build-android.yml), 不入库
 android-app/gradle/wrapper/gradle-wrapper.jar
