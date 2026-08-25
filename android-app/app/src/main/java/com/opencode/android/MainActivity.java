@@ -24,6 +24,9 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.*;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -113,11 +116,55 @@ public class MainActivity extends Activity {
                 if (pageFailed) return;
                 // 页面加载完成: 隐藏加载覆盖层 (避免空白闪烁, 首次打开/后台恢复统一走这里)
                 startupOverlay.setVisibility(View.GONE);
-                // opencode 网页的错误信息在窄屏不换行, 注入 CSS 强制长文本折行
+                // opencode 网页的错误信息在窄屏不换行, 注入 CSS 强制长文本折行;
+                // 主页会话列表区块带 min-h-[calc(100cqh-72px)] (移动端强制最小高约一屏),
+                // 加上项目区和设置/帮助行后总高必超一屏, 设置/帮助按钮被挤出屏外,
+                // 这里将该最小高归零: 内容少时设置/帮助贴底可见, 会话多时照常滚动
                 view.evaluateJavascript(
                         "var s=document.createElement('style');" +
-                        "s.innerHTML='*{overflow-wrap:break-word!important;word-break:break-word!important;max-width:100%!important}';" +
+                        "s.innerHTML='*{overflow-wrap:break-word!important;word-break:break-word!important;max-width:100%!important}" +
+                        "[class*=\"min-h-[calc(100cqh-72px)\"]{min-height:0!important}';" +
                         "document.head.appendChild(s);", null);
+            }
+            @Override
+            public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view,
+                    android.webkit.WebResourceRequest request) {
+                Uri u = request.getUrl();
+                String path = u.getPath();
+                // 内嵌 Web UI 的终端用 ghostty-web (canvas) 渲染, 其脏行重绘逻辑有 bug:
+                // 光标移动时旧位置的光标条不被擦除, 屏幕上残留第二个光标。
+                // 这里拦截 ghostty-web-*.js, 在"检测到光标移动"处注入一句强制全屏重绘
+                // (g=!0 会让所有行重画, 旧光标必然被擦掉), 动态打补丁以兼容任意版本。
+                if (path != null && path.startsWith("/assets/ghostty-web-") && path.endsWith(".js")) {
+                    try {
+                        HttpURLConnection conn = (HttpURLConnection) new URL(u.toString()).openConnection();
+                        conn.setConnectTimeout(2500);
+                        conn.setReadTimeout(2500);
+                        if (conn.getResponseCode() == 200) {
+                            InputStream in = conn.getInputStream();
+                            ByteArrayOutputStream bos = new ByteArrayOutputStream(64 * 1024);
+                            byte[] buf = new byte[8192];
+                            int n;
+                            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+                            in.close();
+                            conn.disconnect();
+                            // ISO-8859-1 按字节原样往返, 不破坏 UTF-8 多字节字符
+                            String js = bos.toString("ISO-8859-1");
+                            final String anchor =
+                                    "const k=D.x!==this.lastCursorPosition.x||D.y!==this.lastCursorPosition.y;";
+                            if (js.contains(anchor)) {
+                                js = js.replace(anchor, anchor + "k&&(g=!0);");
+                            }
+                            return new android.webkit.WebResourceResponse(
+                                    "text/javascript", "UTF-8",
+                                    new ByteArrayInputStream(js.getBytes("ISO-8859-1")));
+                        }
+                        conn.disconnect();
+                    } catch (Exception e) {
+                        Log.w("MainActivity", "ghostty-web patch skipped: " + e);
+                    }
+                }
+                return null;
             }
             @Override
             public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
