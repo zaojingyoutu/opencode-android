@@ -150,20 +150,100 @@ public class ServerManager {
         public final boolean error;
         /** 最新会话 id, 用于 abort 孤儿回复; 空串表示未知 */
         public final String sessionId;
+        /** 最新会话标题 (完成通知展示用); 无为空串 */
+        public final String sessionTitle;
+        /** 最新回复的文本摘要 (最后一条 text part, 折叠空白后截 100 字, 通知展示用) */
+        public final String lastText;
 
-        Status(long sessionUpdated, String sessionId, boolean pending, boolean replying,
-                boolean error) {
+        Status(long sessionUpdated, String sessionId, String sessionTitle,
+                boolean pending, boolean replying, boolean error, String lastText) {
             this.sessionUpdated = sessionUpdated;
             this.sessionId = sessionId;
+            this.sessionTitle = sessionTitle;
             this.pending = pending;
             this.replying = replying;
             this.error = error;
+            this.lastText = lastText;
         }
     }
 
+    // ---- status() 增量拉取缓存 ----
+    // 大会话全量消息实测 ~1MB, 看护线程每 60s 拉一次太浪费。session.time.updated
+    // 在回复完成/新消息落定时才会变 (实测推进中不变), 所以 updated+sessionId 都没变
+    // 时直接复用上次结果; pending 期间最多隔 5 轮强制全量一次兜底。
+    private final Object statusLock = new Object();
+    private long cachedUpdated = Long.MIN_VALUE;
+    private String cachedSid = null;
+    private Status cachedStatus;
+    private int pendingTicks;
+    /** pending 期间每隔几轮强制全量拉取一次 (防缓存与真实状态长期背离) */
+    private static final int PENDING_FULL_PULL_TICKS = 5;
+
+    /** 查询 server 侧状态, <b>必须在子线程调用</b> (主线程会抛 NetworkOnMainThreadException)。 */
+    public Status status() {
+        return status(false);
+    }
+
     /**
-     * 查询 server 侧状态, <b>必须在子线程调用</b> (主线程会抛 NetworkOnMainThreadException)。
-     *
+     * @param forceFull true 跳过缓存强制全量拉取 (恢复前台对齐等要求最新值的场景)
+     */
+    public Status status(boolean forceFull) {
+        synchronized (statusLock) {
+            try {
+                org.json.JSONArray sessions = new org.json.JSONArray(
+                        httpGet(serverUrl() + "/session"));
+                int li = latestSessionIndex(sessions);
+                long updated = -1;
+                String sid = "";
+                if (li >= 0) {
+                    org.json.JSONObject latest = sessions.optJSONObject(li);
+                    org.json.JSONObject t = latest.optJSONObject("time");
+                    updated = t != null ? t.optLong("updated", -1) : -1;
+                    sid = latest.optString("id", "");
+                }
+                if (!forceFull && cachedStatus != null && updated == cachedUpdated
+                        && sid.equals(cachedSid)
+                        && (!cachedStatus.pending || ++pendingTicks < PENDING_FULL_PULL_TICKS)) {
+                    return cachedStatus;
+                }
+                pendingTicks = 0;
+                // 实测该端点按时间升序返回且 limit=1 拿到的是最老一条 (任何会话第一条都是
+                // 已完成的 user 消息 → replying 永远 false, 看护/恢复逻辑全部失效)。
+                // 必须取数组末尾才是最新消息 (解析在 parseStatus, 有单元测试覆盖)。
+                org.json.JSONArray msgs = sid.isEmpty()
+                        ? new org.json.JSONArray()
+                        : new org.json.JSONArray(httpGet(serverUrl() + "/session/" + sid + "/message"));
+                Status s = parseStatus(sessions, msgs, System.currentTimeMillis());
+                cachedUpdated = updated;
+                cachedSid = sid;
+                cachedStatus = s;
+                return s;
+            } catch (Exception e) {
+                // 失败不缓存 (下轮重试), 返回不可用状态
+                return new Status(-1, "", "", false, false, false, "");
+            }
+        }
+    }
+
+    /** sessions 里 time.updated 最大的下标, 空数组/全无效返回 -1 */
+    private static int latestSessionIndex(org.json.JSONArray sessions) {
+        int best = -1;
+        long updated = -1;
+        for (int i = 0; i < sessions.length(); i++) {
+            org.json.JSONObject s = sessions.optJSONObject(i);
+            if (s == null) continue;
+            org.json.JSONObject t = s.optJSONObject("time");
+            long up = t != null ? t.optLong("updated", -1) : -1;
+            if (up > updated) {
+                updated = up;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * 纯解析逻辑 (不碰网络/Android API, 可单元测试)。
      * 回复中判定: 最新一条消息没有 time.completed、没有 error, 且最近仍有进展。
      * 两个坑都是实测踩出来的:
      * 1) 必须叠加"最近有进展": server 被杀/回复被打断会永久留下没有 completed 的孤儿消息
@@ -172,50 +252,48 @@ public class ServerManager {
      * 2) 进展时间不能用会话的 time.updated: 实测它基本等于上一条消息的 completed 时刻;
      *    真正的流式进展在 part 上 (text part 的 time.start/end, tool part 的 state.time.start/end)。
      */
-    public Status status() {
-        try {
-            org.json.JSONArray sessions = new org.json.JSONArray(httpGet(serverUrl() + "/session"));
-            org.json.JSONObject latest = null;
-            long updated = -1;
-            for (int i = 0; i < sessions.length(); i++) {
-                org.json.JSONObject s = sessions.optJSONObject(i);
-                if (s == null) continue;
-                org.json.JSONObject t = s.optJSONObject("time");
-                long up = t != null ? t.optLong("updated", -1) : -1;
-                if (up > updated) {
-                    updated = up;
-                    latest = s;
-                }
-            }
-            if (latest == null) return new Status(-1, "", false, false, false);
-            String sid = latest.optString("id", "");
-            if (sid.isEmpty()) return new Status(updated, "", false, false, false);
-            // 实测该端点按时间升序返回且 limit=1 拿到的是最老一条 (任何会话第一条都是
-            // 已完成的 user 消息 → replying 永远 false, 看护/恢复逻辑全部失效)。
-            // 必须取数组末尾才是最新消息; 大会话 (225 条实测 ~1MB) 每 60s 拉一次可接受,
-            // 若嫌大可在 server 侧支持降序 limit 时再改回。
-            org.json.JSONArray msgs = new org.json.JSONArray(
-                    httpGet(serverUrl() + "/session/" + sid + "/message"));
-            org.json.JSONObject msg = msgs.length() > 0
-                    ? msgs.optJSONObject(msgs.length() - 1) : null;
-            org.json.JSONObject info = msg != null ? msg.optJSONObject("info") : null;
-            if (info == null) return new Status(updated, sid, false, false, false);
-            org.json.JSONObject time = info.optJSONObject("time");
-            if (time != null && time.has("completed")) return new Status(updated, sid, false, false, false);
-            if (!info.isNull("error")) return new Status(updated, sid, false, false, true);
-            long progress = Math.max(time != null ? time.optLong("created", -1) : -1,
-                    latestPartTs(msg.optJSONArray("parts")));
-            // 关键: 长命令 (构建/安装/测试/下载) 执行期间不会产生任何时间戳更新,
-            // tool part 的 time.start 只在启动时写一次。只用"20 分钟内有进展"判断,
-            // 超过 20 分钟的单条命令会被误判为不在回复 → 看护线程放锁 → 任务冻死
-            // (实测就是"会话自己断开"的根源)。所以只要存在未结束的 tool part
-            // (running/pending) 就必须视为回复中, 新鲜度仅兜底纯文本生成阶段。
-            boolean fresh = progress > 0 && System.currentTimeMillis() - progress < REPLY_FRESH_MS;
-            boolean replying = hasRunningTool(msg.optJSONArray("parts")) || fresh;
-            return new Status(updated, sid, true, replying, false);
-        } catch (Exception e) {
-            return new Status(-1, "", false, false, false);
+    static Status parseStatus(org.json.JSONArray sessions, org.json.JSONArray msgs, long nowMs) {
+        int li = latestSessionIndex(sessions);
+        if (li < 0) return new Status(-1, "", "", false, false, false, "");
+        org.json.JSONObject latest = sessions.optJSONObject(li);
+        org.json.JSONObject st = latest.optJSONObject("time");
+        long updated = st != null ? st.optLong("updated", -1) : -1;
+        String sid = latest.optString("id", "");
+        String title = latest.optString("title", "");
+        if (sid.isEmpty()) return new Status(updated, "", title, false, false, false, "");
+        org.json.JSONObject msg = msgs.length() > 0
+                ? msgs.optJSONObject(msgs.length() - 1) : null;
+        org.json.JSONObject info = msg != null ? msg.optJSONObject("info") : null;
+        if (info == null) return new Status(updated, sid, title, false, false, false, "");
+        org.json.JSONObject time = info.optJSONObject("time");
+        if (time != null && time.has("completed"))
+            return new Status(updated, sid, title, false, false, false, "");
+        if (!info.isNull("error"))
+            return new Status(updated, sid, title, false, false, true, "");
+        org.json.JSONArray parts = msg.optJSONArray("parts");
+        long progress = Math.max(time != null ? time.optLong("created", -1) : -1,
+                latestPartTs(parts));
+        // 关键: 长命令 (构建/安装/测试/下载) 执行期间不会产生任何时间戳更新,
+        // tool part 的 time.start 只在启动时写一次。只用"20 分钟内有进展"判断,
+        // 超过 20 分钟的单条命令会被误判为不在回复 → 看护线程放锁 → 任务冻死
+        // (实测就是"会话自己断开"的根源)。所以只要存在未结束的 tool part
+        // (running/pending) 就必须视为回复中, 新鲜度仅兜底纯文本生成阶段。
+        boolean fresh = progress > 0 && nowMs - progress < REPLY_FRESH_MS;
+        boolean replying = hasRunningTool(parts) || fresh;
+        return new Status(updated, sid, title, true, replying, false, lastTextOf(parts));
+    }
+
+    /** 最后一条 text part 的文本摘要 (通知展示用): 折叠空白, 截断 100 字 */
+    private static String lastTextOf(org.json.JSONArray parts) {
+        if (parts == null) return "";
+        for (int i = parts.length() - 1; i >= 0; i--) {
+            org.json.JSONObject p = parts.optJSONObject(i);
+            if (p == null || !"text".equals(p.optString("type", ""))) continue;
+            String text = p.optString("text", "").replaceAll("\\s+", " ").trim();
+            if (text.isEmpty()) continue;
+            return text.length() > 100 ? text.substring(0, 100) + "…" : text;
         }
+        return "";
     }
 
     /** parts 里是否存在未结束的 tool part (state.status 为 running/pending, 或时间窗开了没关) */
@@ -263,6 +341,7 @@ public class ServerManager {
                 conn.setRequestMethod("POST");
                 conn.setConnectTimeout(3000);
                 conn.setReadTimeout(3000);
+                conn.setRequestProperty("Authorization", basicAuth());
                 int code = conn.getResponseCode();
                 Log.i(TAG, "abort " + sid + ": http " + code);
             } finally {
@@ -287,13 +366,14 @@ public class ServerManager {
         return t2 - t1 >= 100;
     }
 
-    /** GET 指定 URL 返回响应体字符串, 失败抛异常 */
-    private static String httpGet(String url) throws IOException {
+    /** GET 指定 URL 返回响应体字符串, 失败抛异常 (自带 Basic 认证) */
+    private String httpGet(String url) throws IOException {
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
         try {
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(3000);
             conn.setReadTimeout(3000);
+            conn.setRequestProperty("Authorization", basicAuth());
             int code = conn.getResponseCode();
             // 非 200 时 getInputStream() 会抛异常, 必须走 getErrorStream 才能读完并正常断开
             java.io.InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
@@ -383,6 +463,87 @@ public class ServerManager {
 
     public String serverUrl() {
         return "http://127.0.0.1:" + PORT;
+    }
+
+    // ------------------------------------------------------------------
+    // 局域网访问: 电脑/平板浏览器直接打开手机上的 opencode Web UI (大屏玩法)。
+    // 安全: HTTP Basic 认证 (用户名 opencode, 密码首启随机生成并持久化),
+    // 关闭时只绑 127.0.0.1。注意 Basic auth 明文传输, 公共 Wi-Fi 建议关闭。
+    // ------------------------------------------------------------------
+
+    private static final String LAN_USER = "opencode";
+
+    public static String lanUsername() {
+        return LAN_USER;
+    }
+
+    /** 局域网访问是否开启 (默认开; 关闭时只绑 127.0.0.1) */
+    public boolean isLanEnabled() {
+        return ctx.getSharedPreferences("opencode_prefs", Context.MODE_PRIVATE)
+                .getBoolean("lan_enabled", true);
+    }
+
+    public void setLanEnabled(boolean on) {
+        ctx.getSharedPreferences("opencode_prefs", Context.MODE_PRIVATE)
+                .edit().putBoolean("lan_enabled", on).apply();
+    }
+
+    /** Basic 认证密码 (首次生成并持久化) */
+    public String lanPassword() {
+        android.content.SharedPreferences p =
+                ctx.getSharedPreferences("opencode_prefs", Context.MODE_PRIVATE);
+        String pw = p.getString("lan_password", null);
+        if (pw == null) {
+            pw = genPassword();
+            p.edit().putString("lan_password", pw).apply();
+        }
+        return pw;
+    }
+
+    /** 使用自定义密码 (调用方需重启 server 生效) */
+    public void setLanPassword(String pw) {
+        ctx.getSharedPreferences("opencode_prefs", Context.MODE_PRIVATE)
+                .edit().putString("lan_password", pw).apply();
+    }
+
+    private static String genPassword() {
+        // 去掉易混淆字符 (i/l/o/0/1) 的 12 位随机串
+        final String cs = "abcdefghjkmnpqrstuvwxyzACDEFGHJKLMNPQRSTUVWXYZ23456789";
+        java.security.SecureRandom r = new java.security.SecureRandom();
+        StringBuilder sb = new StringBuilder(12);
+        for (int i = 0; i < 12; i++) sb.append(cs.charAt(r.nextInt(cs.length())));
+        return sb.toString();
+    }
+
+    /** Basic 认证头值 */
+    public String basicAuth() {
+        String cred = LAN_USER + ":" + lanPassword();
+        return "Basic " + android.util.Base64.encodeToString(
+                cred.getBytes(StandardCharsets.UTF_8), android.util.Base64.NO_WRAP);
+    }
+
+    /** 局域网访问地址 (取站点内 IPv4), 未开启/取不到 IP 返回空串 */
+    public String lanUrl() {
+        if (!isLanEnabled()) return "";
+        String ip = siteLocalIpv4();
+        return ip.isEmpty() ? "" : "http://" + ip + ":" + PORT;
+    }
+
+    private static String siteLocalIpv4() {
+        try {
+            for (java.util.Enumeration<java.net.NetworkInterface> en =
+                    java.net.NetworkInterface.getNetworkInterfaces(); en.hasMoreElements(); ) {
+                java.net.NetworkInterface ni = en.nextElement();
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                for (java.net.InetAddress a : java.util.Collections.list(ni.getInetAddresses())) {
+                    if (a.isSiteLocalAddress() && a.getHostAddress().indexOf(':') < 0) {
+                        return a.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
     }
 
     public interface Callback {
@@ -504,7 +665,47 @@ public class ServerManager {
             }
             if (rootfs.exists()) deleteRecursive(rootfs);
             rootfs.mkdirs();
-            extractTarGz(ctx.getAssets().open(ASSET_ROOTFS), rootfs);
+            // 解压进度: 包装输入流计数, 每 8MB 上报一次。总大小取不到 (APK 内该资产
+            // 被压缩时 AssetFileDescriptor 不可用) 就只报已解压 MB 数
+            long totalSize = -1;
+            try {
+                totalSize = ctx.getAssets().openFd(ASSET_ROOTFS).getLength();
+            } catch (Exception ignored) {
+            }
+            final Progress prog = progress;
+            final long total = totalSize;
+            final InputStream raw = ctx.getAssets().open(ASSET_ROOTFS);
+            InputStream counted = new InputStream() {
+                private long count, lastReport;
+                @Override
+                public int read() throws IOException {
+                    int b = raw.read();
+                    if (b >= 0) onBytes(1);
+                    return b;
+                }
+                @Override
+                public int read(byte[] b, int off, int len) throws IOException {
+                    int n = raw.read(b, off, len);
+                    if (n > 0) onBytes(n);
+                    return n;
+                }
+                private void onBytes(int n) {
+                    count += n;
+                    if (prog == null || count - lastReport < 8 * 1024 * 1024L) return;
+                    lastReport = count;
+                    long mb = count >> 20;
+                    if (total > 0) {
+                        prog.onProgress("正在解压内置运行环境... " + (count * 100 / total) + "% (" + mb + "MB)");
+                    } else {
+                        prog.onProgress("正在解压内置运行环境... " + mb + "MB");
+                    }
+                }
+                @Override
+                public int available() throws IOException { return raw.available(); }
+                @Override
+                public void close() throws IOException { raw.close(); }
+            };
+            extractTarGz(counted, rootfs);
             try (OutputStream out = new FileOutputStream(verFile)) {
                 out.write(assetVersion.getBytes(StandardCharsets.UTF_8));
             }
@@ -738,7 +939,8 @@ public class ServerManager {
                 // Web UI 终端永远空白。gcompat 垫片先载入全局作用域后实测
                 // pty 建会话 + WS 流式输出全部正常 (沙盒端到端验证过)。
                 "LD_PRELOAD=/lib/libc.so.6:/lib/libpthread.so.0:/lib/libutil.so.1:/lib/libdl.so.2 " +
-                "opencode serve --port " + PORT + " --hostname 127.0.0.1");
+                "opencode serve --port " + PORT + " --hostname "
+                + (isLanEnabled() ? "0.0.0.0" : "127.0.0.1"));
         pb.redirectErrorStream(true);
         // proot 的 -w 会覆盖 cwd, 这里不设也无妨
         pb.directory(projects);
@@ -764,6 +966,8 @@ public class ServerManager {
         // (opencode/容器内二进制都经由 loader 加载, 只需读权限)
         env.put("PROOT_LOADER", new File(nativeLibDir, "libproot-loader.so").getAbsolutePath());
         env.put("PROOT_LOADER_32", new File(nativeLibDir, "libproot-loader32.so").getAbsolutePath());
+        // HTTP Basic 认证: 局域网开放时必须; 本机回环也统一启用 (WebView/内部 HTTP 都带凭证)
+        env.put("OPENCODE_SERVER_PASSWORD", lanPassword());
 
         process = pb.start();
         final Process proc = process;

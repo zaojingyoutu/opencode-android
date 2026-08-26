@@ -33,6 +33,8 @@ public class ServerService extends Service {
     private static final String TAG = "ServerService";
     public static final String ACTION_START = "com.opencode.android.action.START";
     public static final String ACTION_STOP = "com.opencode.android.action.STOP";
+    /** 切换局域网访问开关 (重启 server 生效) */
+    public static final String ACTION_LAN_TOGGLE = "com.opencode.android.action.LAN_TOGGLE";
     private static final String CHANNEL_ID = "opencode_server";
     private static final int NOTIF_ID = 1001;
     /** 任务事件通知渠道 (回复完成/失败提醒, 带声音, 与常驻服务的静音渠道分开便于用户分别管理) */
@@ -83,6 +85,20 @@ public class ServerService extends Service {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             stopAll();
             return START_NOT_STICKY;
+        }
+        if (intent != null && ACTION_LAN_TOGGLE.equals(intent.getAction())) {
+            boolean on = !server.isLanEnabled();
+            server.setLanEnabled(on);
+            android.widget.Toast.makeText(this,
+                    on ? "局域网访问已开启, 服务重启中..." : "已切换为仅本机访问, 服务重启中...",
+                    android.widget.Toast.LENGTH_SHORT).show();
+            Log.i(TAG, "lan toggled: " + on + ", restarting server");
+            server.stop();
+            if (!server.isRunning() && !server.isStarting()) {
+                server.start((ok, msg) -> Log.i(TAG, "start result: ok=" + ok + " " + msg), null);
+            }
+            refreshNotification();
+            return START_STICKY;
         }
         try {
             if (Build.VERSION.SDK_INT >= 29) {
@@ -152,6 +168,9 @@ public class ServerService extends Service {
             lastStatus = null;
             return;
         }
+        // 每轮刷新常驻通知: 密码/局域网开关/Wi-Fi IP 变更后自动同步,
+        // 也保证 Web UI 设置面板里改的密码不会在通知栏残留旧值
+        refreshNotification();
         int pid = server.pid();
         if (pid != lastPid) {
             lastPid = pid;
@@ -181,7 +200,7 @@ public class ServerService extends Service {
         // 用 pending 而非 replying: 静默长任务 (大下载/长测试超 20 分钟无输出) 的
         // replying 会因新鲜度窗口过期变 false, 用它做边沿会漏发完成通知
         if (lastStatus != null && lastStatus.pending && !st.pending && st.sessionUpdated > 0) {
-            notifyReplyFinished(st.error);
+            notifyReplyFinished(st);
         }
         lastStatus = st;
 
@@ -286,21 +305,48 @@ public class ServerService extends Service {
         PendingIntent stopPi = PendingIntent.getService(this, 1, stop,
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
 
+        Intent lan = new Intent(this, ServerService.class).setAction(ACTION_LAN_TOGGLE);
+        PendingIntent lanPi = PendingIntent.getService(this, 2, lan,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
+        boolean lanOn = server.isLanEnabled();
+        String lanInfo = "";
+        if (lanOn) {
+            String url = server.lanUrl();
+            lanInfo = url.isEmpty()
+                    ? "\n局域网已开启 (未获取到 Wi-Fi IP)"
+                    : "\n电脑/平板浏览器打开: " + url
+                      + "\n用户 " + ServerManager.lanUsername() + "  密码 " + server.lanPassword();
+        }
+
         Notification.Builder b = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
         b.setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle("OpenCode 正在运行")
-                .setContentText("内置 Linux 环境后台运行中 · 空闲自动停止")
+                .setContentText("后台运行中 · " + (lanOn ? "局域网可访问" : "仅本机"))
                 .setContentIntent(contentPi)
                 .setOngoing(true)
                 .setShowWhen(false)
+                .setStyle(new Notification.BigTextStyle().bigText(
+                        "内置 Linux 环境后台运行中 · 空闲自动停止" + lanInfo))
+                .addAction(0, lanOn ? "关闭局域网" : "开启局域网", lanPi)
                 .addAction(0, "停止", stopPi);
         return b.build();
     }
 
-    /** 回复结束提醒 (息屏/App 在后台时才发, 点按打开 App 查看结果) */
-    private void notifyReplyFinished(boolean error) {
+    /** 局域网开关切换后刷新常驻通知 */
+    private void refreshNotification() {
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            nm.notify(NOTIF_ID, buildNotification());
+        } catch (Exception e) {
+            Log.w(TAG, "refresh notification failed", e);
+        }
+    }
+
+    /** 回复结束提醒 (息屏/App 在后台时才发), 带会话标题和结果摘要, 点按打开 App 查看 */
+    private void notifyReplyFinished(ServerManager.Status st) {
         try {
             if (Build.VERSION.SDK_INT >= 33 &&
                     checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
@@ -312,17 +358,21 @@ public class ServerService extends Service {
             open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
             PendingIntent pi = PendingIntent.getActivity(this, 0, open,
                     PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            String title = st.sessionTitle.isEmpty() ? "OpenCode"
+                    : st.sessionTitle;
+            String text = st.lastText.isEmpty() ? "点按打开查看结果" : st.lastText;
             Notification.Builder b = Build.VERSION.SDK_INT >= 26
                     ? new Notification.Builder(this, TASK_CHANNEL_ID)
                     : new Notification.Builder(this);
             b.setSmallIcon(R.mipmap.ic_launcher)
-                    .setContentTitle(error ? "OpenCode 任务失败" : "OpenCode 回复完成")
-                    .setContentText("点按打开查看结果")
+                    .setContentTitle((st.error ? "任务失败 · " : "回复完成 · ") + title)
+                    .setContentText(text)
+                    .setStyle(new Notification.BigTextStyle().bigText(text))
                     .setContentIntent(pi)
                     .setAutoCancel(true);
             NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
             nm.notify(NOTIF_ID_TASK, b.build());
-            Log.i(TAG, "finish notice posted (error=" + error + ")");
+            Log.i(TAG, "finish notice posted (error=" + st.error + ", session=" + st.sessionTitle + ")");
         } catch (Exception e) {
             Log.w(TAG, "notify failed", e);
         }

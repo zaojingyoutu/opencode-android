@@ -35,6 +35,11 @@ jobs:
             "https://raw.githubusercontent.com/gradle/gradle/v8.7.0/gradle/wrapper/gradle-wrapper.jar"
           chmod +x android-app/gradlew
 
+      - name: Run unit tests
+        run: |
+          cd android-app
+          ./gradlew testDebugUnitTest --no-daemon
+
       - name: Build APK
         run: |
           cd android-app

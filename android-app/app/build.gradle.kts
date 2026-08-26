@@ -372,3 +372,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
 }
+
+dependencies {
+    // 纯 JVM 单元测试 (ServerManager 的 JSON 解析等纯函数)。
+    // org.json 用真实现: 单测跑在 JVM 上, android.jar 里的 org.json 只是抛异常的 stub
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
+}

@@ -62,6 +62,8 @@ public class MainActivity extends Activity {
     public static volatile boolean foreground;
     private boolean pendingFileChooser = false;
     private boolean pageFailed = false;
+    /** 当前页面 URL (onPageStarted 在 UI 线程更新; 供 JS 桥后台线程做来源校验) */
+    private volatile String webViewUrl;
     private long lastPauseElapsed;
     /** 进入后台时的墙上时间, 用于和 server 侧会话更新时间比较, 判断离开期间有无进展 */
     private long lastPauseWall;
@@ -100,11 +102,20 @@ public class MainActivity extends Activity {
         ws.setCacheMode(WebSettings.LOAD_DEFAULT);
         ws.setMediaPlaybackRequiresUserGesture(false);
 
+        // JS 桥: Web UI 里的悬浮 "LAN" 按钮点击后唤起原生设置对话框。
+        // 桥只暴露 openSettings() 一个信号方法, 密码等敏感数据不经 JS 传递
+        webView.addJavascriptInterface(new LanBridge(), "OcLan");
+        // 远程调试 (仅 debug 包): chrome://inspect 或 CDP 可直连手机 WebView 排查注入问题
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            WebView.setWebContentsDebuggingEnabled(true);
+        }
+
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
                 pageFailed = false;
+                webViewUrl = url;
                 progressBar.setProgress(5);
                 progressBar.setVisibility(View.VISIBLE);
             }
@@ -125,6 +136,14 @@ public class MainActivity extends Activity {
                         "s.innerHTML='*{overflow-wrap:break-word!important;word-break:break-word!important;max-width:100%!important}" +
                         "[class*=\"min-h-[calc(100cqh-72px)\"]{min-height:0!important}';" +
                         "document.head.appendChild(s);", null);
+                // 注入 "局域网访问" 设置节: 脚本在 assets/inject/lan.js (node --check 验证过语法),
+                // MutationObserver 检测设置面板打开 (role=tab 文本 General) 后在 tabpanel
+                // 底部追加一节, 样式贴近其暗色主题; 走 OcLan JS 桥操作
+                String lanJs = lanInjectJs();
+                if (lanJs != null) {
+                    view.evaluateJavascript(
+                            lanJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
+                }
             }
             @Override
             public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view,
@@ -136,8 +155,9 @@ public class MainActivity extends Activity {
                 // 这里拦截 ghostty-web-*.js, 在"检测到光标移动"处注入一句强制全屏重绘
                 // (g=!0 会让所有行重画, 旧光标必然被擦掉), 动态打补丁以兼容任意版本。
                 if (path != null && path.startsWith("/assets/ghostty-web-") && path.endsWith(".js")) {
+                    HttpURLConnection conn = null;
                     try {
-                        HttpURLConnection conn = (HttpURLConnection) new URL(u.toString()).openConnection();
+                        conn = (HttpURLConnection) new URL(u.toString()).openConnection();
                         conn.setConnectTimeout(2500);
                         conn.setReadTimeout(2500);
                         if (conn.getResponseCode() == 200) {
@@ -147,7 +167,6 @@ public class MainActivity extends Activity {
                             int n;
                             while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
                             in.close();
-                            conn.disconnect();
                             // ISO-8859-1 按字节原样往返, 不破坏 UTF-8 多字节字符
                             String js = bos.toString("ISO-8859-1");
                             final String anchor =
@@ -159,12 +178,19 @@ public class MainActivity extends Activity {
                                     "text/javascript", "UTF-8",
                                     new ByteArrayInputStream(js.getBytes("ISO-8859-1")));
                         }
-                        conn.disconnect();
                     } catch (Exception e) {
                         Log.w("MainActivity", "ghostty-web patch skipped: " + e);
+                    } finally {
+                        if (conn != null) conn.disconnect();
                     }
                 }
                 return null;
+            }
+            @Override
+            public void onReceivedHttpAuthRequest(WebView view,
+                    android.webkit.HttpAuthHandler handler, String host, String realm) {
+                // server 开了 Basic 认证 (局域网访问用), WebView 自动带上凭证
+                handler.proceed(ServerManager.lanUsername(), embedded.lanPassword());
             }
             @Override
             public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
@@ -505,18 +531,117 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    // ------------------------------------------------------------------
+    // 局域网访问设置 (Web UI 悬浮按钮 → JS 桥 → 原生对话框)
+    // ------------------------------------------------------------------
+
+    private class LanBridge {
+        /** 只允许本地 server 的页面调用 (防止 WebView 里的外部页面读取凭证)。
+         *  注意: 桥方法跑在 JS 桥后台线程, 不能直接调 webView.getUrl() (WebView 方法
+         *  要求 UI 线程, 否则抛异常 → 桥调用整体失败), 这里用 onPageStarted 缓存的 URL */
+        private boolean guard() {
+            String u = webViewUrl;
+            return u != null && u.startsWith(embedded.serverUrl());
+        }
+
+        @android.webkit.JavascriptInterface
+        public String info() {
+            if (!guard()) return "{}";
+            try {
+                return new org.json.JSONObject()
+                        .put("enabled", embedded.isLanEnabled())
+                        .put("url", embedded.lanUrl())
+                        .put("user", ServerManager.lanUsername())
+                        .put("password", embedded.lanPassword())
+                        .toString();
+            } catch (Exception e) {
+                return "{}";
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        public void setEnabled(boolean on) {
+            if (!guard()) return;
+            runOnUiThread(() -> {
+                embedded.setLanEnabled(on);
+                restartServerSoon();
+            });
+        }
+
+        @android.webkit.JavascriptInterface
+        public void setPassword(String pw) {
+            if (!guard() || pw == null) return;
+            final String v = pw.trim();
+            runOnUiThread(() -> {
+                if (v.length() < 6 || v.length() > 64) {
+                    android.widget.Toast.makeText(MainActivity.this,
+                            "密码长度需 6~64 位", android.widget.Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                embedded.setLanPassword(v);
+                restartServerSoon();
+            });
+        }
+
+        @android.webkit.JavascriptInterface
+        public void copy() {
+            if (!guard()) return;
+            runOnUiThread(() -> {
+                String url = embedded.lanUrl();
+                android.content.ClipboardManager cm =
+                        (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("opencode-lan",
+                        (url.isEmpty() ? "(未获取到 IP)" : url) + "\n"
+                                + ServerManager.lanUsername() + " / " + embedded.lanPassword()));
+                android.widget.Toast.makeText(MainActivity.this, "已复制",
+                        android.widget.Toast.LENGTH_SHORT).show();
+            });
+        }
+    }
+
+    private String lanInjectJsCache;
+
+    /** 读取注入脚本 (assets/inject/lan.js), 缺失时返回 null 静默跳过 */
+    private String lanInjectJs() {
+        if (lanInjectJsCache != null) return lanInjectJsCache.isEmpty() ? null : lanInjectJsCache;
+        try (InputStream in = getAssets().open("inject/lan.js")) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(8192);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            lanInjectJsCache = bos.toString("UTF-8");
+        } catch (Exception e) {
+            lanInjectJsCache = "";
+        }
+        return lanInjectJsCache.isEmpty() ? null : lanInjectJsCache;
+    }
+
+    /** 改动 LAN 配置后重启 server, 就绪后自动重载页面 */
+    private void restartServerSoon() {
+        android.widget.Toast.makeText(this, "服务重启中...", android.widget.Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            embedded.stop();
+            embedded.start((ok, msg) -> {
+                if (ok) pollHealth(30);
+                else error("服务重启失败\n" + msg + "\n\n点击重试");
+            }, null);
+        }, "opencode-restart").start();
+    }
+
     private boolean ping(String url) {
+        HttpURLConnection conn = null;
         try {
             URL u = new URL(url + "/api/health");
-            HttpURLConnection conn = (HttpURLConnection) u.openConnection();
+            conn = (HttpURLConnection) u.openConnection();
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(2500);
             conn.setReadTimeout(2500);
-            int code = conn.getResponseCode();
-            conn.disconnect();
-            return code == 200;
+            conn.setRequestProperty("Authorization", embedded.basicAuth());
+            return conn.getResponseCode() == 200;
         } catch (Exception e) {
             return false;
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 
@@ -597,7 +722,7 @@ public class MainActivity extends Activity {
     private void resyncAfterBackground() {
         final long pausedAtWall = lastPauseWall;
         new Thread(() -> {
-            ServerManager.Status st = embedded.status();
+            ServerManager.Status st = embedded.status(true); // 恢复对齐要求最新值, 跳过缓存
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed() || webView == null) return;
                 if (!st.pending) {
