@@ -477,10 +477,10 @@ public class ServerManager {
         return LAN_USER;
     }
 
-    /** 局域网访问是否开启 (默认开; 关闭时只绑 127.0.0.1) */
+    /** 局域网访问是否开启 (默认关: 仅本机, 用户在通知栏或设置面板手动开启) */
     public boolean isLanEnabled() {
         return ctx.getSharedPreferences("opencode_prefs", Context.MODE_PRIVATE)
-                .getBoolean("lan_enabled", true);
+                .getBoolean("lan_enabled", false);
     }
 
     public void setLanEnabled(boolean on) {
