@@ -15,10 +15,16 @@ toolchain is required:
     --bin-apk FILE   merge usr/bin/ and usr/libexec/git-core/ into the rootfs
                      (e.g. the git apk, which ships git + its git-core
                      helpers and symlinks).
+    --bin-out FILE   instead of embedding the opencode binary into the tar,
+                     write it out as a standalone file (so the App can
+                     upgrade the binary in place without re-extracting the
+                     whole rootfs). The tar then contains only the base
+                     system (minirootfs + git + libs + certs).
 
 Usage:
   build_rootfs.py --minirootfs minirootfs.tar.gz --opencode opencode-binary \
-                  --out rootfs.tar.gz [--lib-apk file.apk]... [--bin-apk file.apk]...
+                  --out rootfs.tar.gz [--bin-out FILE]
+                  [--lib-apk file.apk]... [--bin-apk file.apk]...
                   [--ca-apk file.apk]
 """
 import argparse
@@ -75,6 +81,7 @@ def main() -> None:
     ap.add_argument("--minirootfs", required=True)
     ap.add_argument("--opencode", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--bin-out")
     ap.add_argument("--lib-apk", action="append", default=[])
     ap.add_argument("--bin-apk", action="append", default=[])
     ap.add_argument("--ca-apk")
@@ -87,6 +94,15 @@ def main() -> None:
     with open(args.opencode, "rb") as f:
         opencode_bytes = f.read()
     print(f"opencode binary: {len(opencode_bytes)} bytes")
+
+    # 二进制独立输出: App 端升级时只需原位覆盖这一个文件, 不重解 rootfs
+    if args.bin_out:
+        with open(args.bin_out, "wb") as f:
+            f.write(opencode_bytes)
+        print(f"bin written: {args.bin_out}")
+        embed_bin = False
+    else:
+        embed_bin = True
 
     seen = set()
     # 输出压缩方式由 --out 后缀决定: *.tar.gz 用 gzip, 否则纯 tar。
@@ -104,7 +120,9 @@ def main() -> None:
             if m.isfile() or m.issym():
                 seen.add(m.name.rsplit("/", 1)[-1])
 
-        add_file(out_tar, "usr/local/bin/opencode", opencode_bytes, 0o755)
+        if embed_bin:
+            add_file(out_tar, "usr/local/bin/opencode", opencode_bytes, 0o755)
+            seen.add("opencode")
 
         for apk in args.bin_apk:
             print(f"merge bin: {os.path.basename(apk)}")

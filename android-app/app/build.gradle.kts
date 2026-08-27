@@ -205,11 +205,12 @@ val alpineLibApks = listOf(
 )
 
 /**
- * 构建 proot 容器运行时 (assets/opencode/rootfs.tar.gz + version.txt):
- *   - opencode linux-arm64-musl 二进制 → rootfs/usr/local/bin/opencode
+ * 构建 proot 容器运行时 (assets/opencode/base.tar + opencode-bin + version.txt):
+ *   - opencode linux-arm64-musl 二进制 → assets/opencode/opencode-bin (独立文件)
  *   - alpine-minirootfs 基础系统 (busybox + apk, 用户可在容器内 apk add 任意工具)
- *   - git + libcurl 依赖闭包 + CA 证书 → rootfs (opencode 的 AI 子进程要用 git)
- * 运行时由 ServerManager 解压到 files/opencode/rootfs, 再通过 proot 启动。
+ *     + git + libcurl 依赖闭包 + CA 证书 → assets/opencode/base.tar
+ * 运行时由 ServerManager 解压到 files/opencode/rootfs, 再通过 proot 启动;
+ * 二进制与基础系统分离, 升级时只有二进制变化可原位覆盖、保留用户安装的工具。
  */
 tasks.register("downloadRootfs") {
     description = "Build Alpine rootfs (opencode + git) into src/main/assets/opencode"
@@ -217,7 +218,7 @@ tasks.register("downloadRootfs") {
     outputs.dir(outputDir)
     // 注意: 不用 .tar.gz 后缀 — AGP 打包 assets 时会把 .gz 资产解压并改名成 .tar,
     // 这里直接产出纯 .tar, ServerManager 端按需解 gzip (探测 magic)。
-    onlyIf { !file("$outputDir/rootfs.tar").exists() }
+    onlyIf { !file("$outputDir/base.tar").exists() || !file("$outputDir/opencode-bin").exists() }
     doLast {
         val build = layout.buildDirectory
         val work = build.dir("rootfs-work").get().asFile
@@ -261,13 +262,18 @@ tasks.register("downloadRootfs") {
         val obstackApk = downloadAlpineApk("musl-obstack", "1.2.3-r2", work)
         val libApkFiles = alpineLibApks.map { (pkg, ver) -> downloadAlpineApk(pkg, ver, work) }
 
-        // ---- 4. 组装 rootfs.tar (纯 tar, 不 gzip, 见任务头部注释) ----
-        val rootfsOut = File(outputDir.asFile, "rootfs.tar")
+        // ---- 4. 组装 base.tar (纯 tar, 不 gzip, 见任务头部注释) + opencode-bin ----
+        // 拆成两份: base.tar 是基础系统 (minirootfs+git+libs+certs, ~26MB),
+        // opencode-bin 是独立二进制 (~190MB)。ServerManager 据此实现增量升级:
+        // 只有二进制变化时原位覆盖, 用户在容器内 apk add 的工具得以保留。
+        val baseOut = File(outputDir.asFile, "base.tar")
+        val binOut = File(outputDir.asFile, "opencode-bin")
         val libArgs = libApkFiles.flatMap { listOf("--lib-apk", it.absolutePath) }
         runPython(scriptsDir.resolve("build_rootfs.py").absolutePath,
                 "--minirootfs", miniTarball.absolutePath,
                 "--opencode", bin.absolutePath,
-                "--out", rootfsOut.absolutePath,
+                "--out", baseOut.absolutePath,
+                "--bin-out", binOut.absolutePath,
                 "--bin-apk", gitApk.absolutePath,
                 *libArgs.toTypedArray(),
                 "--lib-apk", gcompatApk.absolutePath,
@@ -278,11 +284,17 @@ tasks.register("downloadRootfs") {
                 "--symlink", "lib/libdl.so.2=libc.so.6",
                 "--ca-apk", caApk.absolutePath)
 
-        // version.txt = opencode tag + rootfs 内容指纹, ServerManager 据此判断是否需要重新解压
-        val hash = MessageDigest.getInstance("SHA-256")
-            .digest(rootfsOut.readBytes()).take(8).joinToString("") { "%02x".format(it) }
-        file("$outputDir/version.txt").writeText("$tag-$hash")
-        logger.lifecycle("rootfs ready ($tag-$hash): ${rootfsOut.name} ${rootfsOut.length()} bytes")
+        // version.txt: base=基础系统指纹, bin=二进制指纹 (均取 SHA-256 前 8 字节)。
+        // ServerManager 分别比对: base 变了才整删重装, 只有 bin 变则原位覆盖。
+        fun sha8(f: File): String =
+            MessageDigest.getInstance("SHA-256").digest(f.readBytes())
+                .take(8).joinToString("") { "%02x".format(it) }
+        val baseHash = sha8(baseOut)
+        val binHash = sha8(binOut)
+        file("$outputDir/version.txt")
+            .writeText("base=$baseHash\nbin=$binHash\nopencode=$tag\n")
+        logger.lifecycle("rootfs ready (base=$baseHash bin=$binHash opencode=$tag): " +
+                "${baseOut.name} ${baseOut.length()} bytes, ${binOut.name} ${binOut.length()} bytes")
     }
 }
 

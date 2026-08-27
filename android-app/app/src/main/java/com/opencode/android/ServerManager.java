@@ -53,7 +53,17 @@ public class ServerManager {
      *  窗口太小会把活任务误判成孤儿 → 看护线程放锁 → CPU 休眠 → 任务被冻死 */
     private static final long REPLY_FRESH_MS = 20 * 60_000L;
     private static final String ASSET_VERSION = "opencode/version.txt";
-    private static final String ASSET_ROOTFS = "opencode/rootfs.tar";
+    /** 基础系统 (minirootfs + git + libs + 证书), ~26MB */
+    private static final String ASSET_BASE = "opencode/base.tar";
+    /** opencode 独立二进制, ~190MB, 升级时可原位覆盖保留用户安装的工具 */
+    private static final String ASSET_BIN = "opencode/opencode-bin";
+    /** rootfs 内二进制路径 (相对 rootfs 根) */
+    private static final String BIN_REL_PATH = "usr/local/bin/opencode";
+    /** rootfs 内两个版本标记文件名 */
+    private static final String MARKER_BASE = ".opencode-base-version";
+    private static final String MARKER_BIN = ".opencode-bin-version";
+    /** 旧版整包指纹标记 (rootfs.tar 方案), 迁移到新方案时触发一次全量重装 */
+    private static final String MARKER_LEGACY = ".opencode-version";
     private static final String[] ASSET_PROOT_LIBS = {
             "opencode/proot/libtalloc.so.2",
             "opencode/proot/libandroid-shmem.so",
@@ -636,7 +646,13 @@ public class ServerManager {
     }
 
     /**
-     * 确保 proot 依赖库 + rootfs 就位 (版本变化时重新解压), 返回 proot 二进制路径。
+     * 确保 proot 依赖库 + rootfs 就位 (增量升级), 返回 proot 二进制路径。
+     *
+     * 基础系统 (base.tar) 与 opencode 二进制 (opencode-bin) 分开管理:
+     *   - 只有二进制版本变化 → 原位覆盖 usr/local/bin/opencode,
+     *     用户在容器里 apk add 的工具全部保留;
+     *   - 基础系统版本变化 (极少, 主动升 alpine/git/libs) → 整删重装;
+     *   - 检测到旧版 (.opencode-version 整包指纹) → 迁移, 一次性全量重装。
      */
     private File ensureRuntime(Progress progress) throws IOException {
         File root = dataRoot();
@@ -654,64 +670,152 @@ public class ServerManager {
             }
         }
 
-        String assetVersion = readText(ctx.getAssets().open(ASSET_VERSION));
-        File verFile = new File(rootfs, ".opencode-version");
-        String localVersion = verFile.exists() ? readText(new FileInputStream(verFile)) : "";
-        boolean upToDate = new File(rootfs, "usr/local/bin/opencode").exists()
-                && localVersion.equals(assetVersion);
-        if (!upToDate) {
+        String[] marks = parseVersionFile(readText(ctx.getAssets().open(ASSET_VERSION)));
+        File binPath = new File(rootfs, BIN_REL_PATH);
+        boolean binExists = binPath.exists();
+        boolean baseUpToDate = binExists && marks[0].equals(readMarker(rootfs, MARKER_BASE));
+        boolean binUpToDate = binExists && marks[1].equals(readMarker(rootfs, MARKER_BIN));
+        boolean hasLegacy = new File(rootfs, MARKER_LEGACY).exists();
+        EnsureAction action = decideEnsure(binExists, baseUpToDate, binUpToDate, hasLegacy);
+
+        if (action == EnsureAction.FULL_EXTRACT) {
             if (progress != null) {
                 progress.onProgress("正在解压内置运行环境 (首次约需 30 秒)...");
             }
             if (rootfs.exists()) deleteRecursive(rootfs);
             rootfs.mkdirs();
-            // 解压进度: 包装输入流计数, 每 8MB 上报一次。总大小取不到 (APK 内该资产
-            // 被压缩时 AssetFileDescriptor 不可用) 就只报已解压 MB 数
             long totalSize = -1;
             try {
-                totalSize = ctx.getAssets().openFd(ASSET_ROOTFS).getLength();
+                totalSize = ctx.getAssets().openFd(ASSET_BASE).getLength();
             } catch (Exception ignored) {
             }
-            final Progress prog = progress;
-            final long total = totalSize;
-            final InputStream raw = ctx.getAssets().open(ASSET_ROOTFS);
-            InputStream counted = new InputStream() {
-                private long count, lastReport;
-                @Override
-                public int read() throws IOException {
-                    int b = raw.read();
-                    if (b >= 0) onBytes(1);
-                    return b;
-                }
-                @Override
-                public int read(byte[] b, int off, int len) throws IOException {
-                    int n = raw.read(b, off, len);
-                    if (n > 0) onBytes(n);
-                    return n;
-                }
-                private void onBytes(int n) {
-                    count += n;
-                    if (prog == null || count - lastReport < 8 * 1024 * 1024L) return;
-                    lastReport = count;
-                    long mb = count >> 20;
-                    if (total > 0) {
-                        prog.onProgress("正在解压内置运行环境... " + (count * 100 / total) + "% (" + mb + "MB)");
-                    } else {
-                        prog.onProgress("正在解压内置运行环境... " + mb + "MB");
-                    }
-                }
-                @Override
-                public int available() throws IOException { return raw.available(); }
-                @Override
-                public void close() throws IOException { raw.close(); }
-            };
-            extractTarGz(counted, rootfs);
-            try (OutputStream out = new FileOutputStream(verFile)) {
-                out.write(assetVersion.getBytes(StandardCharsets.UTF_8));
-            }
-            Log.i(TAG, "rootfs extracted, version=" + assetVersion);
+            extractTarGz(countedStream(ctx.getAssets().open(ASSET_BASE), progress, totalSize), rootfs);
+            writeMarker(rootfs, MARKER_BASE, marks[0]);
+            Log.i(TAG, "base extracted, version=" + marks[0]);
         }
+
+        if (action == EnsureAction.FULL_EXTRACT || action == EnsureAction.BIN_ONLY) {
+            if (action == EnsureAction.BIN_ONLY && progress != null) {
+                progress.onProgress("正在更新内置 opencode...");
+            }
+            installBin(ctx.getAssets().open(ASSET_BIN), binPath);
+            writeMarker(rootfs, MARKER_BIN, marks[1]);
+            Log.i(TAG, "opencode bin installed, version=" + marks[1]);
+        }
+
+        // 清理旧版整包指纹标记 (迁移完成)
+        new File(rootfs, MARKER_LEGACY).delete();
         return prootFile();
+    }
+
+    /** 升级决策 (纯逻辑, 可单元测试) */
+    enum EnsureAction {
+        /** 基础系统缺失/变更或旧版迁移: 整删重装 */
+        FULL_EXTRACT,
+        /** 仅二进制变化: 原位覆盖, 保留用户安装的工具 */
+        BIN_ONLY,
+        /** 无需任何动作 */
+        NOTHING
+    }
+
+    static EnsureAction decideEnsure(boolean binExists, boolean baseUpToDate,
+            boolean binUpToDate, boolean hasLegacy) {
+        if (!binExists || !baseUpToDate || hasLegacy) return EnsureAction.FULL_EXTRACT;
+        if (!binUpToDate) return EnsureAction.BIN_ONLY;
+        return EnsureAction.NOTHING;
+    }
+
+    /** 解析 version.txt (base=xxx / bin=xxx / opencode=tag 三行), 缺项返回 null 串 */
+    static String[] parseVersionFile(String content) {
+        String base = null, bin = null;
+        if (content != null) {
+            for (String line : content.split("\n")) {
+                String t = line.trim();
+                if (t.startsWith("base=")) base = t.substring(5).trim();
+                else if (t.startsWith("bin=")) bin = t.substring(4).trim();
+            }
+        }
+        return new String[]{base != null ? base : "", bin != null ? bin : ""};
+    }
+
+    private String readMarker(File rootfs, String name) {
+        File f = new File(rootfs, name);
+        if (!f.exists()) return "";
+        try (FileInputStream in = new FileInputStream(f)) {
+            return readText(in).trim();
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
+    private static void writeMarker(File rootfs, String name, String value) throws IOException {
+        File f = new File(rootfs, name);
+        try (OutputStream out = new FileOutputStream(f)) {
+            out.write(value.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    /** 原子写入 opencode 二进制: 先写临时文件再 rename, 避免半截损坏 */
+    private static void installBin(InputStream in, File binPath) throws IOException {
+        File dir = binPath.getParentFile();
+        if (dir != null) dir.mkdirs();
+        File tmp = new File(dir, ".opencode-bin.tmp");
+        try (InputStream src = in; OutputStream out = new FileOutputStream(tmp)) {
+            byte[] buf = new byte[128 * 1024];
+            int n;
+            while ((n = src.read(buf)) > 0) out.write(buf, 0, n);
+        }
+        tmp.setExecutable(true, false);
+        setReadable(tmp);
+        binPath.delete();
+        if (!tmp.renameTo(binPath)) {
+            // rename 失败 (跨挂载点等): 退化为直接拷贝
+            try (InputStream src = new FileInputStream(tmp);
+                 OutputStream out = new FileOutputStream(binPath)) {
+                byte[] buf = new byte[128 * 1024];
+                int n;
+                while ((n = src.read(buf)) > 0) out.write(buf, 0, n);
+            }
+            binPath.setExecutable(true, false);
+            setReadable(binPath);
+            tmp.delete();
+        }
+    }
+
+    /** 包装输入流按字节计数上报进度 (每 8MB 一次); 总大小取不到时只报 MB 数 */
+    private static InputStream countedStream(final InputStream raw, final Progress prog,
+            long totalSize) {
+        final long total = totalSize > 0 ? totalSize : -1;
+        return new InputStream() {
+            private long count, lastReport;
+            @Override
+            public int read() throws IOException {
+                int b = raw.read();
+                if (b >= 0) onBytes(1);
+                return b;
+            }
+            @Override
+            public int read(byte[] b, int off, int len) throws IOException {
+                int n = raw.read(b, off, len);
+                if (n > 0) onBytes(n);
+                return n;
+            }
+            private void onBytes(int n) {
+                count += n;
+                if (prog == null || count - lastReport < 8 * 1024 * 1024L) return;
+                lastReport = count;
+                long mb = count >> 20;
+                if (total > 0) {
+                    prog.onProgress("正在解压内置运行环境... " + (count * 100 / total) + "% (" + mb + "MB)");
+                } else {
+                    prog.onProgress("正在解压内置运行环境... " + mb + "MB");
+                }
+            }
+            @Override
+            public int available() throws IOException { return raw.available(); }
+            @Override
+            public void close() throws IOException { raw.close(); }
+        };
     }
 
     private void extractAsset(String asset, File dest) throws IOException {
