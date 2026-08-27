@@ -21,11 +21,21 @@ APP_DIR="$SCRIPT_DIR/../android-app"
 OUT_APK="$APP_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
 # 未显式传参时用 git 信息自动推导 (与 CI 同一算法: 同一 commit 得到同一版本号):
-#   versionName = 最新 vX.Y.Z tag, 非 tag commit 追加 -r<自 tag 起提交数>
+#   versionName = 最近 vX.Y.Z tag; 恰好在 tag 上 → X.Y.Z, 否则 → X.Y.Z-r<自该 tag 起提交数>
 #   versionCode = 2000000 + 仓库总提交数 (单调递增, 高于旧公式 1xxxxxx 区间)
-# 注意必须在 APP_DIR 里执行 git, 否则从其他目录调用脚本会拿错仓库
+# 注意: 只认严格 SemVer 的 vX.Y.Z 作版本基座 (4 段如 v0.9.4.1 等畸形 tag 不参与,
+# 会回退到最近的合法 vX.Y.Z)。必须在 APP_DIR 里执行 git, 否则拿错仓库。
 if [ -z "$VERSION_NAME" ]; then
-    latest_tag=$(git -C "$APP_DIR" describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || true)
+    # 只认严格 SemVer 的 vX.Y.Z; 从所有合法 tag 中选 HEAD 可达且距离最近的一个
+    # (4 段如 v0.9.4.1 等畸形 tag 不参与, 会自动落到最近的合法 vX.Y.Z)
+    latest_tag=""
+    best=999999
+    for t in $(git -C "$APP_DIR" tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'); do
+        if git -C "$APP_DIR" merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
+            c=$(git -C "$APP_DIR" rev-list "$t"..HEAD --count)
+            if [ "$c" -lt "$best" ]; then best="$c"; latest_tag="$t"; fi
+        fi
+    done
     if [ -n "$latest_tag" ]; then
         base="${latest_tag#v}"
         if [ "$(git -C "$APP_DIR" rev-parse HEAD)" = "$(git -C "$APP_DIR" rev-parse "$latest_tag")" ]; then

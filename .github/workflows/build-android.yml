@@ -45,13 +45,23 @@ jobs:
           cd android-app
           REF="${GITHUB_REF_NAME}"
           # 与 scripts/build-all.sh 同一算法: 同一 commit 本地/CI 得到同一版本号
-          #   versionName = 最新 vX.Y.Z tag (非 tag commit 追加 -r<自 tag 起提交数>)
+          #   versionName = tag 构建时用 tag 名本身 (保证 tag==versionName);
+          #                 main 构建时 = 最近 vX.Y.Z tag, 非 tag commit 追加 -r<提交数>
           #   versionCode = 2000000 + 仓库总提交数 (单调递增, 高于旧公式 1xxxxxx 区间)
-          BASE=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -n1)
-          [ -n "$BASE" ] || BASE="0.7.0"
-          if echo "$REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            VER="${REF#v}"                          # tag 构建: 干净的 X.Y.Z
+          # 只认严格 SemVer 的 vX.Y.Z 作版本基座 (4 段如 v0.9.4.1 不参与版本派生)
+          if printf '%s' "$REF" | grep -qE '^v'; then
+            VER="${REF#v}"
           else
+            # 只认严格 SemVer 的 vX.Y.Z; 取 HEAD 可达且距离最近的一个作版本基座
+            BASE=""
+            BEST=999999
+            for t in $(git tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'); do
+              if git merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
+                C=$(git rev-list "$t"..HEAD --count)
+                if [ "$C" -lt "$BEST" ]; then BEST="$C"; BASE="${t#v}"; fi
+              fi
+            done
+            [ -n "$BASE" ] || BASE="0.7.0"
             CNT=$(git rev-list "v${BASE}"..HEAD --count)
             VER="$BASE-r$CNT"
           fi
