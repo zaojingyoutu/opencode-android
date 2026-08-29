@@ -92,8 +92,8 @@
     var list = el('div', 'data-component', null);
     list.setAttribute('data-component', 'settings-v2-list');
 
-    // 开关行 (原生 Switch)
-    list.appendChild(row('局域网访问',
+    // 开关行 (原生 Switch)。标题用"启用"而非"局域网访问", 避免与区块标题重复
+    list.appendChild(row('启用',
       '开启后同一 Wi-Fi 下的电脑/平板可打开本页 (大屏使用)',
       makeSwitch(!!d.enabled, function (v) { window.OcLan.setEnabled(v); })));
 
@@ -103,20 +103,23 @@
       urlDesc.textContent = d.url || '(未获取到 Wi-Fi IP)';
       urlDesc.style.userSelect = 'text';
       urlDesc.style.opacity = '.85';
+      urlDesc.style.wordBreak = 'break-all';
       list.appendChild(row('访问地址', '', null));
       var urlRow = list.lastChild;
-      urlRow.querySelector('[data-slot="settings-v2-row-description"]').replaceWith(urlDesc);
-      urlRow.querySelector('[data-slot="settings-v2-row-control"]').appendChild(miniBtn('复制', function () { window.OcLan.copy(); }));
+      var urlCtrl = urlRow.querySelector('[data-slot="settings-v2-row-control"]');
+      urlCtrl.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end;min-width:0';
+      urlCtrl.appendChild(miniBtn('复制', function () { window.OcLan.copy(); }));
 
       // 密码行: 当前密码 + 自定义输入 + 保存/随机
       var pwInput = document.createElement('input');
       pwInput.type = 'text';
       pwInput.placeholder = '输入新密码 (至少 6 位)';
-      pwInput.style.cssText = 'font-size:12px;padding:3px 8px;width:130px;color:inherit;' +
+      // 自适应宽度: 不写死, 允许随容器收缩; 窄屏时与"保存"按钮自动换行
+      pwInput.style.cssText = 'flex:1 1 auto;min-width:96px;max-width:180px;font-size:12px;padding:3px 8px;color:inherit;' +
         'background:transparent;border:1px solid color-mix(in srgb, currentColor 30%, transparent);' +
         'border-radius:8px';
       var pwCtl = el('div');
-      pwCtl.style.cssText = 'display:flex;gap:6px;align-items:center';
+      pwCtl.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end;min-width:0';
       pwCtl.appendChild(pwInput);
       pwCtl.appendChild(miniBtn('保存', function () {
         var v = pwInput.value.trim();
@@ -134,20 +137,30 @@
     return sec;
   }
   function findSettingsPanel() {
-    var tabs = document.querySelectorAll('[role="tab"]');
+    // 找"通用"tab (设置弹窗的 tab 用 role=tab; 兼容 aria-selected 的按钮)
+    var tabs = document.querySelectorAll('[role="tab"], [aria-selected]');
     var generalTab = null;
     for (var i = 0; i < tabs.length; i++) {
       var label = (tabs[i].textContent || '').trim();
       if (label === 'General' || label === '通用') { generalTab = tabs[i]; break; }
     }
     if (!generalTab) return null;
-    var anc = generalTab, panel = null;
+    // 从 tab 向上找内容容器: 优先 .settings-v2-tab-body (带 40px 内边距,
+    // 设置弹窗的真实内容区), 否则回退 [role=tabpanel]。注: 设置弹窗用的是
+    // .settings-v2-tab-body, 没有 role=tabpanel (那是 session 面板的),
+    // 之前 append 到 role=tabpanel 会缺失水平内边距 → 区块贴左。
+    var anc = generalTab;
     while (anc && anc !== document.body) {
+      var bodies = anc.querySelectorAll('.settings-v2-tab-body');
+      for (var b = 0; b < bodies.length; b++) {
+        var st = getComputedStyle(bodies[b]);
+        if (st.display !== 'none') return bodies[b];
+      }
       var p = anc.querySelector('[role="tabpanel"]');
-      if (p) { panel = p; break; }
+      if (p) return p;
       anc = anc.parentElement;
     }
-    return panel;
+    return null;
   }
   function tryInject() {
     // 只在"通用"tab 下显示: 所有 tab 共用同一个 tabpanel 容器 (切换只换内容),
