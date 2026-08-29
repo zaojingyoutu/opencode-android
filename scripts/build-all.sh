@@ -26,26 +26,33 @@ OUT_APK="$APP_DIR/app/build/outputs/apk/debug/app-debug.apk"
 # 注意: 只认严格 SemVer 的 vX.Y.Z 作版本基座 (4 段如 v0.9.4.1 等畸形 tag 不参与,
 # 会回退到最近的合法 vX.Y.Z)。必须在 APP_DIR 里执行 git, 否则拿错仓库。
 if [ -z "$VERSION_NAME" ]; then
-    # 只认严格 SemVer 的 vX.Y.Z; 从所有合法 tag 中选 HEAD 可达且距离最近的一个
-    # (4 段如 v0.9.4.1 等畸形 tag 不参与, 会自动落到最近的合法 vX.Y.Z)
-    latest_tag=""
-    best=999999
-    for t in $(git -C "$APP_DIR" tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'); do
-        if git -C "$APP_DIR" merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
-            c=$(git -C "$APP_DIR" rev-list "$t"..HEAD --count)
-            if [ "$c" -lt "$best" ]; then best="$c"; latest_tag="$t"; fi
-        fi
-    done
-    if [ -n "$latest_tag" ]; then
-        base="${latest_tag#v}"
-        if [ "$(git -C "$APP_DIR" rev-parse HEAD)" = "$(git -C "$APP_DIR" rev-parse "$latest_tag")" ]; then
-            VERSION_NAME="$base"
-        else
-            commit_cnt=$(git -C "$APP_DIR" rev-list "$latest_tag"..HEAD --count)
-            VERSION_NAME="${base}-r${commit_cnt}"
-        fi
+    # HEAD 恰好就在某个 v 开头 tag 上: versionName = tag 名 (与 CI tag 构建一致,
+    # 保证本地/CI 同一 commit 得到同一版本号)
+    exact_tag=$(git -C "$APP_DIR" tag --points-at HEAD 2>/dev/null | grep -E '^v' | head -n1)
+    if [ -n "$exact_tag" ]; then
+        VERSION_NAME="${exact_tag#v}"
     else
-        VERSION_NAME="0.7.0"
+        # 只认严格 SemVer 的 vX.Y.Z; 从所有合法 tag 中选 HEAD 可达且距离最近的一个
+        # (4 段如 v0.9.4.1 等畸形 tag 不参与, 会自动落到最近的合法 vX.Y.Z)
+        latest_tag=""
+        best=999999
+        for t in $(git -C "$APP_DIR" tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'); do
+            if git -C "$APP_DIR" merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
+                c=$(git -C "$APP_DIR" rev-list "$t"..HEAD --count)
+                if [ "$c" -lt "$best" ]; then best="$c"; latest_tag="$t"; fi
+            fi
+        done
+        if [ -n "$latest_tag" ]; then
+            base="${latest_tag#v}"
+            if [ "$(git -C "$APP_DIR" rev-parse HEAD)" = "$(git -C "$APP_DIR" rev-parse "$latest_tag")" ]; then
+                VERSION_NAME="$base"
+            else
+                commit_cnt=$(git -C "$APP_DIR" rev-list "$latest_tag"..HEAD --count)
+                VERSION_NAME="${base}-r${commit_cnt}"
+            fi
+        else
+            VERSION_NAME="0.7.0"
+        fi
     fi
 fi
 
