@@ -395,7 +395,25 @@ public class MainActivity extends Activity {
                     runOnUiThread(() -> {
                         if (ok) {
                             polling.set(false);
-                            load();
+                            // 模型自愈 (HTTP 探测, 必须后台线程): 免费模型会被 models.dev
+                            // 下架, 失效模型会让 agent 报错 (无回复/无权限请求)。就绪后探测
+                            // 一次, 无效则换可用免费模型并重启 server 生效 (只改默认模型,
+                            // 用户手动选的模型不碰; 最多一轮不循环)
+                            pingExecutor.execute(() -> {
+                                boolean fixed = embedded.autoFixModel();
+                                runOnUiThread(() -> {
+                                    if (fixed) {
+                                        Log.i("MainActivity", "model fixed, restarting server");
+                                        embedded.stop();
+                                        embedded.start((ok2, msg2) -> {
+                                            if (ok2) pollHealth(120);
+                                            else error("服务重启失败\n" + msg2 + "\n\n点击重试");
+                                        }, null);
+                                    } else {
+                                        load();
+                                    }
+                                });
+                            });
                         } else if (waited[0] >= seconds) {
                             polling.set(false);
                             error("内置服务器启动超时\n\n日志:\n" +

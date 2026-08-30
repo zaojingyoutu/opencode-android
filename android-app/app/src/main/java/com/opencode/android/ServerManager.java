@@ -64,6 +64,8 @@ public class ServerManager {
     private static final String MARKER_BIN = ".opencode-bin-version";
     /** 旧版整包指纹标记 (rootfs.tar 方案), 迁移到新方案时触发一次全量重装 */
     private static final String MARKER_LEGACY = ".opencode-version";
+    /** prefs 里记录的"我们自动管理的默认模型", autoFixModel 只替换它 (用户手动选的模型不碰) */
+    private static final String PREF_AUTO_MODEL = "auto_model";
     private static final String[] ASSET_PROOT_LIBS = {
             "opencode/proot/libtalloc.so.2",
             "opencode/proot/libandroid-shmem.so",
@@ -121,8 +123,7 @@ public class ServerManager {
         long wall = System.currentTimeMillis();
         if (wall - lastWriteWall < 60_000) return;
         lastWriteWall = wall;
-        ctx.getSharedPreferences("opencode_prefs", Context.MODE_PRIVATE)
-                .edit().putLong("last_activity_wall", wall).apply();
+        prefs().edit().putLong("last_activity_wall", wall).apply();
     }
 
     /** 距上次客户端活动是否在窗口 ms 内 (内存时间戳, 进程被杀后失效) */
@@ -133,9 +134,12 @@ public class ServerManager {
 
     /** 距上次客户端活动是否在窗口 ms 内 (持久化时间戳, 跨进程重启可用) */
     public boolean recentlyUsed(long windowMs) {
-        long last = ctx.getSharedPreferences("opencode_prefs", Context.MODE_PRIVATE)
-                .getLong("last_activity_wall", 0);
+        long last = prefs().getLong("last_activity_wall", 0);
         return last != 0 && System.currentTimeMillis() - last < windowMs;
+    }
+
+    private android.content.SharedPreferences prefs() {
+        return ctx.getSharedPreferences("opencode_prefs", Context.MODE_PRIVATE);
     }
 
     /** proot 进程 pid, 未运行返回 0 */
@@ -164,9 +168,15 @@ public class ServerManager {
         public final String sessionTitle;
         /** 最新回复的文本摘要 (最后一条 text part, 折叠空白后截 100 字, 通知展示用) */
         public final String lastText;
+        /** 是否有待用户批准的工具调用 (state.status == "pending" = 权限未批, agent 被卡住)。
+         *  这是最该提醒用户的情形: 整个任务停摆, 只差用户点一下批准 */
+        public final boolean waitingApproval;
+        /** 待批准工具的摘要 (工具名+输入, 通知展示用); 无为空串 */
+        public final String permissionText;
 
         Status(long sessionUpdated, String sessionId, String sessionTitle,
-                boolean pending, boolean replying, boolean error, String lastText) {
+                boolean pending, boolean replying, boolean error, String lastText,
+                boolean waitingApproval, String permissionText) {
             this.sessionUpdated = sessionUpdated;
             this.sessionId = sessionId;
             this.sessionTitle = sessionTitle;
@@ -174,6 +184,8 @@ public class ServerManager {
             this.replying = replying;
             this.error = error;
             this.lastText = lastText;
+            this.waitingApproval = waitingApproval;
+            this.permissionText = permissionText;
         }
     }
 
@@ -230,7 +242,7 @@ public class ServerManager {
                 return s;
             } catch (Exception e) {
                 // 失败不缓存 (下轮重试), 返回不可用状态
-                return new Status(-1, "", "", false, false, false, "");
+                return new Status(-1, "", "", false, false, false, "", false, "");
             }
         }
     }
@@ -264,22 +276,22 @@ public class ServerManager {
      */
     static Status parseStatus(org.json.JSONArray sessions, org.json.JSONArray msgs, long nowMs) {
         int li = latestSessionIndex(sessions);
-        if (li < 0) return new Status(-1, "", "", false, false, false, "");
+        if (li < 0) return new Status(-1, "", "", false, false, false, "", false, "");
         org.json.JSONObject latest = sessions.optJSONObject(li);
         org.json.JSONObject st = latest.optJSONObject("time");
         long updated = st != null ? st.optLong("updated", -1) : -1;
         String sid = latest.optString("id", "");
         String title = latest.optString("title", "");
-        if (sid.isEmpty()) return new Status(updated, "", title, false, false, false, "");
+        if (sid.isEmpty()) return new Status(updated, "", title, false, false, false, "", false, "");
         org.json.JSONObject msg = msgs.length() > 0
                 ? msgs.optJSONObject(msgs.length() - 1) : null;
         org.json.JSONObject info = msg != null ? msg.optJSONObject("info") : null;
-        if (info == null) return new Status(updated, sid, title, false, false, false, "");
+        if (info == null) return new Status(updated, sid, title, false, false, false, "", false, "");
         org.json.JSONObject time = info.optJSONObject("time");
         if (time != null && time.has("completed"))
-            return new Status(updated, sid, title, false, false, false, "");
+            return new Status(updated, sid, title, false, false, false, "", false, "");
         if (!info.isNull("error"))
-            return new Status(updated, sid, title, false, false, true, "");
+            return new Status(updated, sid, title, false, false, true, "", false, "");
         org.json.JSONArray parts = msg.optJSONArray("parts");
         long progress = Math.max(time != null ? time.optLong("created", -1) : -1,
                 latestPartTs(parts));
@@ -290,7 +302,39 @@ public class ServerManager {
         // (running/pending) 就必须视为回复中, 新鲜度仅兜底纯文本生成阶段。
         boolean fresh = progress > 0 && nowMs - progress < REPLY_FRESH_MS;
         boolean replying = hasRunningTool(parts) || fresh;
-        return new Status(updated, sid, title, true, replying, false, lastTextOf(parts));
+        // 待批准工具调用 (status==pending): agent 等用户批准, 需要醒目的息屏/横幅提醒
+        return new Status(updated, sid, title, true, replying, false, lastTextOf(parts),
+                hasPendingTool(parts), pendingToolSummary(parts));
+    }
+
+    /** 是否存在待用户批准的工具调用 (state.status == "pending" = 权限未批, 区别于已批准的 running) */
+    private static boolean hasPendingTool(org.json.JSONArray parts) {
+        if (parts == null) return false;
+        for (int i = 0; i < parts.length(); i++) {
+            org.json.JSONObject p = parts.optJSONObject(i);
+            if (p == null || !"tool".equals(p.optString("type", ""))) continue;
+            org.json.JSONObject state = p.optJSONObject("state");
+            if (state != null && "pending".equals(state.optString("status", ""))) return true;
+        }
+        return false;
+    }
+
+    /** 待批准工具摘要: "工具名 输入前 50 字" (通知展示用); 无返回空串。
+     *  用最后一条待批准的 tool part; 输入只取 raw (字符串原始输入, 如 bash 命令),
+     *  不回退到 input JSON 对象 (机器格式, 塞进通知可读性差) */
+    private static String pendingToolSummary(org.json.JSONArray parts) {
+        if (parts == null) return "";
+        for (int i = parts.length() - 1; i >= 0; i--) {
+            org.json.JSONObject p = parts.optJSONObject(i);
+            if (p == null || !"tool".equals(p.optString("type", ""))) continue;
+            org.json.JSONObject state = p.optJSONObject("state");
+            if (state == null || !"pending".equals(state.optString("status", ""))) continue;
+            String tool = p.optString("tool", "");
+            String input = state.optString("raw", "").replaceAll("\\s+", " ").trim();
+            if (input.length() > 50) input = input.substring(0, 50) + "…";
+            return input.isEmpty() ? tool : tool + " " + input;
+        }
+        return "";
     }
 
     /** 最后一条 text part 的文本摘要 (通知展示用): 折叠空白, 截断 100 字 */
@@ -359,6 +403,45 @@ public class ServerManager {
             }
         } catch (Exception e) {
             Log.w(TAG, "abort failed: " + e);
+        }
+    }
+
+    /** 查询待批准的权限请求 (GET /permission, 含 request id 供通知按钮直接回复),
+     *  <b>子线程调用</b>; 失败返回 null */
+    public org.json.JSONArray listPendingPermissions() {
+        try {
+            return new org.json.JSONArray(httpGet(serverUrl() + "/permission"));
+        } catch (Exception e) {
+            Log.w(TAG, "list pending permissions failed: " + e);
+            return null;
+        }
+    }
+
+    /** 回复权限请求: reply = "once"(批准一次) / "reject"(拒绝), <b>子线程调用</b>;
+     *  成功返回 true */
+    public boolean replyPermission(String requestId, String reply) {
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(
+                    serverUrl() + "/permission/" + requestId + "/reply").openConnection();
+            try {
+                conn.setRequestMethod("POST");
+                conn.setConnectTimeout(3000);
+                conn.setReadTimeout(3000);
+                conn.setRequestProperty("Authorization", basicAuth());
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setDoOutput(true);
+                byte[] body = ("{\"reply\":\"" + reply + "\"}").getBytes(StandardCharsets.UTF_8);
+                conn.setFixedLengthStreamingMode(body.length);
+                conn.getOutputStream().write(body);
+                int code = conn.getResponseCode();
+                Log.i(TAG, "permission reply " + requestId + " " + reply + ": http " + code);
+                return code == 200;
+            } finally {
+                conn.disconnect();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "permission reply failed: " + e);
+            return false;
         }
     }
 
@@ -473,6 +556,27 @@ public class ServerManager {
 
     public String serverUrl() {
         return "http://127.0.0.1:" + PORT;
+    }
+
+    /** 探测 server 是否响应 (2 秒超时), <b>子线程调用</b>。
+     *  用于检测挂死: opencode 这版在权限待批等场景会卡死事件循环 (ServeError),
+     *  此时所有接口超时, 通知检测永久失效, 需要靠它触发自动重启 */
+    public boolean isHealthy() {
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(
+                    serverUrl() + "/api/health").openConnection();
+            try {
+                conn.setRequestMethod("GET");
+                conn.setConnectTimeout(2000);
+                conn.setReadTimeout(2000);
+                conn.setRequestProperty("Authorization", basicAuth());
+                return conn.getResponseCode() == 200;
+            } finally {
+                conn.disconnect();
+            }
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -865,7 +969,127 @@ public class ServerManager {
         try (OutputStream out = new FileOutputStream(configFile)) {
             out.write(config.getBytes(StandardCharsets.UTF_8));
         }
+        // 记录我们写入的默认模型 (仅当是 opencode 内置免费模型时), 供 autoFixModel 判断
+        // 该模型是否仍"由我们自动管理" — 用户手动选过模型后配置会变, 不能再自动替换
+        String model = readModelFromConfig(config);
+        if (model.startsWith("opencode/")) {
+            prefs().edit().putString(PREF_AUTO_MODEL, model).apply();
+        }
         Log.i(TAG, "default config written: " + configFile.getAbsolutePath());
+    }
+
+    /** 从配置文本里提取 model 字段 (JSONC 容忍注释); 无返回空串 */
+    private static String readModelFromConfig(String content) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\"model\"\\s*:\\s*\"([^\"]+)\"").matcher(content);
+        return m.find() ? m.group(1) : "";
+    }
+
+    // ------------------------------------------------------------------
+    // 启动时自动修复失效模型: 免费模型会被 models.dev 下架 (hy3-free 已下架),
+    // 配置写死的模型一旦失效 agent 就报错。每次启动探测可用模型, 无效则替换为
+    // 可用的免费模型, 避免用户一脸茫然。
+    // ------------------------------------------------------------------
+
+    /** 配置文件的绝对路径 (HOME 下 .config/opencode/opencode.jsonc) */
+    File configFile() {
+        return new File(new File(ctx.getFilesDir(), "home"), ".config/opencode/opencode.jsonc");
+    }
+
+    /** 查询 server 可用模型列表 (GET /provider), 返回 model id 集合 (provider/model 形式);
+     *  失败返回 null */
+    public java.util.Set<String> listAvailableModels() {
+        try {
+            org.json.JSONObject prov = new org.json.JSONObject(httpGet(serverUrl() + "/provider"));
+            org.json.JSONArray all = prov.optJSONArray("all");
+            java.util.Set<String> ids = new java.util.HashSet<>();
+            if (all != null) {
+                for (int i = 0; i < all.length(); i++) {
+                    org.json.JSONObject p = all.optJSONObject(i);
+                    org.json.JSONObject models = p != null ? p.optJSONObject("models") : null;
+                    if (models == null) continue;
+                    java.util.Iterator<String> it = models.keys();
+                    while (it.hasNext()) ids.add(it.next());
+                }
+            }
+            return ids;
+        } catch (Exception e) {
+            Log.w(TAG, "list available models failed: " + e);
+            return null;
+        }
+    }
+
+    /** 从可用模型里挑一个免费模型 (优先 opencode 内置, 无需 API key); 无返回空串 */
+    public static String pickFreeModel(java.util.Set<String> available) {
+        if (available == null) return "";
+        String fallback = "";
+        for (String id : available) {
+            if (id.startsWith("opencode/") && id.contains("free")) return id;
+        }
+        for (String id : available) {
+            if (id.contains("free")) { fallback = id; break; }
+        }
+        return fallback;
+    }
+
+    /** 读取配置里的 model 字段 (JSONC 容忍注释); 无返回空串 */
+    private String configuredModel(File configFile) {
+        try {
+            return readModelFromConfig(readText(new FileInputStream(configFile)));
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
+    /**
+     * 检测配置里的模型是否还可用; 不可用则替换为可用的免费模型并写回配置 (保留其余字段)。
+     * 只替换"我们自动管理的默认模型" (写入默认配置时记录的, 或 opencode 内置免费模型),
+     * 用户手动选过的模型 (配置与自动记录不一致 / 非 opencode 内置) 一律不碰。
+     * @return true 表示改动了配置 (调用方应重启 server 使新模型生效)
+     */
+    public boolean autoFixModel() {
+        try {
+            File configFile = configFile();
+            if (!configFile.exists()) return false;
+            String current = configuredModel(configFile);
+            if (current.isEmpty()) return false;
+            java.util.Set<String> available = listAvailableModels();
+            if (available == null || available.isEmpty()) return false;
+            // 当前模型还在 server 列表里 → 有效, 不动
+            if (available.contains(current)) return false;
+
+            // 只处理"由我们自动管理"的模型:
+            //  - 首次默认写入时记录了 PREF_AUTO_MODEL → 配置必须还是它 (用户没改过)
+            //  - 老用户首次升级没有记录 → 只接管 opencode 内置免费模型, 自定义 provider 不动
+            String autoModel = prefs().getString(PREF_AUTO_MODEL, "");
+            boolean managed = autoModel.isEmpty()
+                    ? current.startsWith("opencode/")
+                    : current.equals(autoModel);
+            if (!managed) {
+                Log.i(TAG, "model invalid but user-selected (" + current + "), not touching");
+                return false;
+            }
+
+            String picked = pickFreeModel(available);
+            if (picked.isEmpty()) {
+                Log.w(TAG, "model invalid (" + current + ") but no free model found");
+                return false;
+            }
+            String content = readText(new FileInputStream(configFile));
+            String updated = content.replaceFirst(
+                    "\"model\"\\s*:\\s*\"[^\"]*\"", "\"model\": \"" + picked + "\"");
+            if (updated.equals(content)) return false;
+            try (OutputStream out = new FileOutputStream(configFile)) {
+                out.write(updated.getBytes(StandardCharsets.UTF_8));
+            }
+            // 更新自动管理标记, 下次仍只认这个模型
+            prefs().edit().putString(PREF_AUTO_MODEL, picked).apply();
+            Log.i(TAG, "model auto-fixed: " + current + " -> " + picked);
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "autoFixModel failed: " + e);
+            return false;
+        }
     }
 
     /** 写 resolv.conf, 通过 proot -b 绑定到容器 /etc/resolv.conf (musl 的 getaddrinfo 从这里读) */

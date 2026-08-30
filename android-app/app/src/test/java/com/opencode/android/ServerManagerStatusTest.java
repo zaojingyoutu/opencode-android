@@ -143,6 +143,52 @@ public class ServerManagerStatusTest {
         assertTrue(s.replying);
     }
 
+    // ---- 待批准工具 (等待用户权限) ----
+
+    @Test
+    public void pendingTool_waitingApproval() throws Exception {
+        // state.status == "pending" 是权限未批, agent 被卡住等用户批准 (与 running 区分)
+        String toolPart = "[{\"type\":\"tool\",\"tool\":\"bash\","
+                + "\"state\":{\"status\":\"pending\",\"raw\":\"rm -rf build\",\"input\":{}}}]";
+        String msgs = "[" + msg("assistant", NOW - MIN, false, false, toolPart) + "]";
+        ServerManager.Status s = parse("[" + session("ses_1", "t", NOW) + "]", msgs);
+        assertTrue(s.waitingApproval);
+        assertEquals("bash rm -rf build", s.permissionText);
+    }
+
+    @Test
+    public void runningTool_notWaitingApproval() throws Exception {
+        // 已批准的 running 不算待批准, 否则会把正在跑的长命令误报成"等你批准"
+        String toolPart = "[{\"type\":\"tool\",\"tool\":\"bash\","
+                + "\"state\":{\"status\":\"running\",\"input\":{},\"time\":{\"start\":" + (NOW - MIN) + "}}}]";
+        String msgs = "[" + msg("assistant", NOW - MIN, false, false, toolPart) + "]";
+        ServerManager.Status s = parse("[" + session("ses_1", "t", NOW) + "]", msgs);
+        assertFalse(s.waitingApproval);
+    }
+
+    @Test
+    public void pendingTool_summaryFallsBackToToolName() throws Exception {
+        String toolPart = "[{\"type\":\"tool\",\"tool\":\"webfetch\","
+                + "\"state\":{\"status\":\"pending\",\"input\":{},\"raw\":\"\"}}]";
+        String msgs = "[" + msg("assistant", NOW - MIN, false, false, toolPart) + "]";
+        ServerManager.Status s = parse("[" + session("ses_1", "t", NOW) + "]", msgs);
+        assertTrue(s.waitingApproval);
+        assertEquals("webfetch", s.permissionText);
+    }
+
+    @Test
+    public void pendingTool_summaryTruncatedTo50() throws Exception {
+        StringBuilder cmd = new StringBuilder("echo ");
+        for (int i = 0; i < 60; i++) cmd.append("字");
+        String toolPart = "[{\"type\":\"tool\",\"tool\":\"bash\","
+                + "\"state\":{\"status\":\"pending\",\"raw\":\"" + cmd + "\"}}]";
+        String msgs = "[" + msg("assistant", NOW - MIN, false, false, toolPart) + "]";
+        ServerManager.Status s = parse("[" + session("ses_1", "t", NOW) + "]", msgs);
+        assertTrue(s.waitingApproval);
+        // 65 字输入截断到 50 + 省略号, 前缀 "bash "
+        assertEquals("bash " + "echo " + "字".repeat(45) + "…", s.permissionText);
+    }
+
     // ---- 通知摘要 ----
 
     @Test

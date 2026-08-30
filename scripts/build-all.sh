@@ -67,7 +67,12 @@ echo "    versionName=$VERSION_NAME versionCode=$VERSION_CODE"
 cd "$APP_DIR"
 
 # 可选版本参数
-GRADLE_ARGS="assembleDebug --no-daemon"
+# 本地迭代复用 Gradle daemon: 冷启动配置阶段约 29s, 热 daemon 降到 ~5s;
+# CI 单次构建用 --no-daemon, 避免虚拟机里残留后台进程
+GRADLE_ARGS="assembleDebug"
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    GRADLE_ARGS="$GRADLE_ARGS --no-daemon"
+fi
 if [ -n "$VERSION_NAME" ]; then
     GRADLE_ARGS="$GRADLE_ARGS -PversionName=$VERSION_NAME -PversionCode=$VERSION_CODE"
 fi
