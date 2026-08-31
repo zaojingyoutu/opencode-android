@@ -406,6 +406,75 @@ public class ServerManager {
         }
     }
 
+    // ---- 通知/权限/SSE 纯逻辑 (不碰 Android API/网络, 可单元测试) ----
+
+    /** 一条权限请求的通知文案 (标题 + 正文): 从请求 JSON 提取详情,
+     *  详情顺序 metadata.command → patterns[0], 都没有则退回权限类型/占位 */
+    public static final class PermissionNotice {
+        public final String id;
+        public final String title;
+        public final String text;
+
+        PermissionNotice(String id, String title, String text) {
+            this.id = id;
+            this.title = title;
+            this.text = text;
+        }
+    }
+
+    /** 权限请求 → 通知文案; sessionTitle 为空时用 "OpenCode" 兜底。
+     *  详情为空时正文是 "AI 请求" + 权限类型 (无类型则 "批准操作") */
+    public static PermissionNotice permissionNotice(org.json.JSONObject req, String sessionTitle) {
+        if (req == null) return new PermissionNotice("", "OpenCode", "AI 请求批准操作");
+        String reqId = req.optString("id", "");
+        String permType = req.optString("permission", "");
+        String detail = "";
+        org.json.JSONObject meta = req.optJSONObject("metadata");
+        if (meta != null) detail = meta.optString("command", "");
+        if (detail.isEmpty()) {
+            org.json.JSONArray pats = req.optJSONArray("patterns");
+            if (pats != null && pats.length() > 0) detail = pats.optString(0);
+        }
+        String title = (sessionTitle == null || sessionTitle.isEmpty())
+                ? "OpenCode" : sessionTitle;
+        String text = detail.isEmpty()
+                ? "AI 请求" + (permType.isEmpty() ? "批准操作" : " " + permType)
+                : "AI 请求: " + detail;
+        return new PermissionNotice(reqId, title, text);
+    }
+
+    /** 通知按钮的回复文案: reject → "已拒绝", 其余 (once/always) → "已批准" */
+    public static String permReplyLabel(String reply) {
+        return "reject".equals(reply) ? "已拒绝" : "已批准";
+    }
+
+    /** 权限回复接口 URL: baseUrl + "/permission/<id>/reply" */
+    public static String permissionReplyUrl(String baseUrl, String requestId) {
+        return baseUrl + "/permission/" + requestId + "/reply";
+    }
+
+    /** 权限回复请求体 JSON: {"reply":"once"} */
+    public static String permissionReplyBody(String reply) {
+        return "{\"reply\":\"" + reply + "\"}";
+    }
+
+    /** SSE 事件分类: "permission" (permission.asked) / "message" (message 更新) / "" */
+    public static String sseEventKind(String json) {
+        if (json == null) return "";
+        if (json.contains("permission.asked")) return "permission";
+        if (json.contains("message.updated") || json.contains("message.part.updated")) return "message";
+        return "";
+    }
+
+    /** SSE permission 事件 → 带 id 的请求对象 (properties 扁平结构容错); 无 id 返回 null */
+    public static org.json.JSONObject ssePermissionPayload(String json)
+            throws org.json.JSONException {
+        org.json.JSONObject req = new org.json.JSONObject(json);
+        org.json.JSONObject p = req.optJSONObject("properties");
+        if (p == null || !p.has("id")) p = req;
+        return p.optString("id", "").isEmpty() ? null : p;
+    }
+
     /** 查询待批准的权限请求 (GET /permission, 含 request id 供通知按钮直接回复),
      *  <b>子线程调用</b>; 失败返回 null */
     public org.json.JSONArray listPendingPermissions() {
@@ -422,7 +491,7 @@ public class ServerManager {
     public boolean replyPermission(String requestId, String reply) {
         try {
             HttpURLConnection conn = (HttpURLConnection) new URL(
-                    serverUrl() + "/permission/" + requestId + "/reply").openConnection();
+                    permissionReplyUrl(serverUrl(), requestId)).openConnection();
             try {
                 conn.setRequestMethod("POST");
                 conn.setConnectTimeout(3000);
@@ -430,7 +499,7 @@ public class ServerManager {
                 conn.setRequestProperty("Authorization", basicAuth());
                 conn.setRequestProperty("Content-Type", "application/json");
                 conn.setDoOutput(true);
-                byte[] body = ("{\"reply\":\"" + reply + "\"}").getBytes(StandardCharsets.UTF_8);
+                byte[] body = permissionReplyBody(reply).getBytes(StandardCharsets.UTF_8);
                 conn.setFixedLengthStreamingMode(body.length);
                 conn.getOutputStream().write(body);
                 int code = conn.getResponseCode();

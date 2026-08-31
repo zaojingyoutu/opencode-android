@@ -120,6 +120,19 @@ public class ServerService extends Service {
             return START_STICKY;
         }
         if (intent != null && ACTION_PERM_REPLY.equals(intent.getAction())) {
+            // 点击通知按钮可能冷启动进程: 确保自己是前台服务 (Android 8+ 若以
+            // startForegroundService 启动则 5 秒内必须 startForeground, 否则
+            // ForegroundServiceDidNotStartInTimeException 会杀掉整个进程)
+            try {
+                if (Build.VERSION.SDK_INT >= 29) {
+                    startForeground(NOTIF_ID, buildNotification(),
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                } else {
+                    startForeground(NOTIF_ID, buildNotification());
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "startForeground failed on perm reply: " + e);
+            }
             handlePermissionReply(intent);
             return START_STICKY;
         }
@@ -278,17 +291,17 @@ public class ServerService extends Service {
      *  message.updated 触发一次完成检测 (节流) */
     private void handleServerEvent(String json) {
         try {
-            if (json.contains("permission.asked")) {
-                org.json.JSONObject req = new org.json.JSONObject(json);
-                org.json.JSONObject p = req.optJSONObject("properties");
-                if (p == null || !p.has("id")) p = req; // 容错: 事件可能是扁平结构
-                String id = p.optString("id", "");
-                if (!id.isEmpty() && !permissionNotifiedKey.contains(id + ",")) {
-                    permissionNotifiedKey += id + ",";
-                    notifyPermissionFromEvent(p);
+            String kind = ServerManager.sseEventKind(json);
+            if ("permission".equals(kind)) {
+                org.json.JSONObject p = ServerManager.ssePermissionPayload(json);
+                if (p != null) {
+                    String id = p.optString("id", "");
+                    if (!permissionNotifiedKey.contains(id + ",")) {
+                        permissionNotifiedKey += id + ",";
+                        notifyPermissionFromEvent(p);
+                    }
                 }
-            } else if (json.contains("message.updated")
-                    || json.contains("message.part.updated")) {
+            } else if ("message".equals(kind)) {
                 long now = android.os.SystemClock.elapsedRealtime();
                 if (now - lastSseCheckMs > 2000) {
                     lastSseCheckMs = now;
@@ -607,12 +620,19 @@ public class ServerService extends Service {
         final String id = intent.getStringExtra("perm_id");
         final String reply = intent.getStringExtra("perm_reply");
         if (id == null || reply == null) return;
-        final String label = "reject".equals(reply) ? "已拒绝" : "已批准";
+        final String label = ServerManager.permReplyLabel(reply);
         new Thread(() -> {
-            boolean ok = server.replyPermission(id, reply);
-            android.widget.Toast.makeText(this,
-                    ok ? label + "该操作" : "操作失败 (可能已处理)",
-                    android.widget.Toast.LENGTH_SHORT).show();
+            boolean ok;
+            try {
+                ok = server.replyPermission(id, reply);
+            } catch (Exception e) {
+                Log.w(TAG, "perm reply threw: " + e);
+                ok = false;
+            }
+            final String toast = ok ? label + "该操作" : "操作失败 (可能已处理)";
+            // Toast 必须在主线程 (后台线程调用在部分 ROM 会抛异常)
+            main.post(() -> android.widget.Toast.makeText(this, toast,
+                    android.widget.Toast.LENGTH_SHORT).show());
             Log.i(TAG, "perm reply via notif: " + id + " " + reply + " ok=" + ok);
         }, "opencode-perm-reply").start();
     }
@@ -630,23 +650,10 @@ public class ServerService extends Service {
             }
             // 取第一条待批准请求: id 供按钮直接回复, permission/metadata/patterns 做描述
             org.json.JSONObject req = perms.optJSONObject(0);
-            String reqId = req != null ? req.optString("id", "") : "";
-            String permType = req != null ? req.optString("permission", "") : "";
-            String detail = "";
-            if (req != null) {
-                org.json.JSONObject meta = req.optJSONObject("metadata");
-                detail = meta != null ? meta.optString("command", "") : "";
-                if (detail.isEmpty()) {
-                    org.json.JSONArray pats = req.optJSONArray("patterns");
-                    if (pats != null && pats.length() > 0) detail = pats.optString(0);
-                }
-            }
-            String title = st.sessionTitle.isEmpty() ? "OpenCode" : st.sessionTitle;
-            String text = detail.isEmpty()
-                    ? "AI 请求" + (permType.isEmpty() ? "批准操作" : " " + permType) : "AI 请求: " + detail;
-            postPermissionNotification(reqId, title, text);
+            ServerManager.PermissionNotice n = ServerManager.permissionNotice(req, st.sessionTitle);
+            postPermissionNotification(n.id, n.title, n.text);
             Log.i(TAG, "permission notice posted (session=" + st.sessionTitle
-                    + ", detail=" + detail + ", req=" + reqId + ")");
+                    + ", detail=" + n.text + ", req=" + n.id + ")");
         } catch (Exception e) {
             Log.w(TAG, "permission notify failed", e);
         }
@@ -698,21 +705,9 @@ public class ServerService extends Service {
                             != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                 return;
             }
-            String reqId = req.optString("id", "");
-            String permType = req.optString("permission", "");
-            String detail = "";
-            org.json.JSONObject meta = req.optJSONObject("metadata");
-            if (meta != null) detail = meta.optString("command", "");
-            if (detail.isEmpty()) {
-                org.json.JSONArray pats = req.optJSONArray("patterns");
-                if (pats != null && pats.length() > 0) detail = pats.optString(0);
-            }
-            String title = lastSessionTitle == null || lastSessionTitle.isEmpty()
-                    ? "OpenCode" : lastSessionTitle;
-            String text = detail.isEmpty()
-                    ? "AI 请求" + (permType.isEmpty() ? "批准操作" : " " + permType) : "AI 请求: " + detail;
-            postPermissionNotification(reqId, title, text);
-            Log.i(TAG, "permission notice via sse (detail=" + detail + ", req=" + reqId + ")");
+            ServerManager.PermissionNotice n = ServerManager.permissionNotice(req, lastSessionTitle);
+            postPermissionNotification(n.id, n.title, n.text);
+            Log.i(TAG, "permission notice via sse (detail=" + n.text + ", req=" + n.id + ")");
         } catch (Exception e) {
             Log.w(TAG, "sse permission notify failed", e);
         }
