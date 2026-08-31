@@ -113,20 +113,20 @@ public class ServerService extends Service {
                     android.widget.Toast.LENGTH_SHORT).show();
             Log.i(TAG, "lan toggled: " + on + ", restarting server");
             server.stop();
-            if (!server.isRunning() && !server.isStarting()) {
-                server.start((ok, msg) -> Log.i(TAG, "start result: ok=" + ok + " " + msg), null);
-            }
+            // 端口 TIME_WAIT 需短暂等待再起，否则 Address already in use
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                if (!server.isRunning() && !server.isStarting()) {
+                    server.start((ok, msg) -> Log.i(TAG, "start result: ok=" + ok + " " + msg), null);
+                }
+            }, 800);
             refreshNotification();
             return START_STICKY;
         }
         if (intent != null && ACTION_PERM_REPLY.equals(intent.getAction())) {
-            // 点击通知按钮可能冷启动进程: 确保自己是前台服务 (Android 8+ 若以
-            // startForegroundService 启动则 5 秒内必须 startForeground, 否则
-            // ForegroundServiceDidNotStartInTimeException 会杀掉整个进程)
             try {
                 if (Build.VERSION.SDK_INT >= 29) {
                     startForeground(NOTIF_ID, buildNotification(),
-                            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
                 } else {
                     startForeground(NOTIF_ID, buildNotification());
                 }
@@ -139,7 +139,7 @@ public class ServerService extends Service {
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 startForeground(NOTIF_ID, buildNotification(),
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
             } else {
                 startForeground(NOTIF_ID, buildNotification());
             }
@@ -225,9 +225,8 @@ public class ServerService extends Service {
     // 已送达, 订阅同一事件流就能在同一瞬间发出通知, 抢在 server 挂死之前
     private Thread sseThread;
     private volatile boolean sseRunning;
-    /** 最近一次会话标题 (SSE 触发的通知用, 免再查一次 HTTP) */
+    private volatile java.net.HttpURLConnection sseConn;
     private volatile String lastSessionTitle = "";
-    /** SSE 触发完成检测的节流: 流式期间事件很密, 别打爆 server */
     private volatile long lastSseCheckMs;
 
     private void startSseSubscription() {
@@ -240,6 +239,7 @@ public class ServerService extends Service {
 
     private void stopSseSubscription() {
         sseRunning = false;
+        if (sseConn != null) try { sseConn.disconnect(); } catch (Exception ignored) {}
         if (sseThread != null) sseThread.interrupt();
     }
 
@@ -253,9 +253,9 @@ public class ServerService extends Service {
                 }
                 conn = (java.net.HttpURLConnection) new java.net.URL(
                         server.serverUrl() + "/event").openConnection();
+                sseConn = conn;
                 conn.setRequestProperty("Authorization", server.basicAuth());
                 conn.setConnectTimeout(5000);
-                // 15s 读超时: 事件流空闲时也算健康, 到点重连一次防半死连接
                 conn.setReadTimeout(15_000);
                 if (conn.getResponseCode() != 200) {
                     Thread.sleep(5000);
@@ -477,9 +477,7 @@ public class ServerService extends Service {
 
     private void acquireWakeLock() {
         if (wakeLock != null && !wakeLock.isHeld()) {
-            // 带超时兜底: 即使逻辑异常忘记释放, 最多 10 分钟后系统也会回收;
-            // 看护线程每 60s 采样, 仍需要时会重新持有
-            wakeLock.acquire(10 * 60_000L);
+            wakeLock.acquire();
             Log.i(TAG, "wake lock acquired (background active)");
         }
     }
@@ -533,8 +531,7 @@ public class ServerService extends Service {
             String url = server.lanUrl();
             lanInfo = url.isEmpty()
                     ? "\n局域网已开启 (未获取到 Wi-Fi IP)"
-                    : "\n电脑/平板浏览器打开: " + url
-                      + "\n用户 " + ServerManager.lanUsername() + "  密码 " + server.lanPassword();
+                    : "\n局域网: " + url + " （密码在应用内查看）";
         }
 
         Notification.Builder b = Build.VERSION.SDK_INT >= 26
@@ -569,12 +566,10 @@ public class ServerService extends Service {
         }
     }
 
-    /** 常驻通知内容指纹: 内容没变就不重发 (避免 MIUI 重发响铃) */
     private String notifContentKey() {
         boolean lanOn = server.isLanEnabled();
         String ip = lanOn ? server.lanUrl() : "";
-        String pw = lanOn ? server.lanPassword() : "";
-        return lanOn + "|" + ip + "|" + pw;
+        return lanOn + "|" + ip;
     }
 
     private String lastNotifKey = "";
@@ -752,7 +747,7 @@ public class ServerService extends Service {
         ch.setDescription(desc);
         ch.enableVibration(true);
         ch.setVibrationPattern(vibrate);
-        ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+        ch.setLockscreenVisibility(Notification.VISIBILITY_PRIVATE);
         nm.createNotificationChannel(ch);
     }
 }

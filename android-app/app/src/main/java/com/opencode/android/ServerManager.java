@@ -210,41 +210,47 @@ public class ServerManager {
      * @param forceFull true 跳过缓存强制全量拉取 (恢复前台对齐等要求最新值的场景)
      */
     public Status status(boolean forceFull) {
+        org.json.JSONArray sessions;
+        long updated;
+        String sid;
+        try {
+            sessions = new org.json.JSONArray(httpGet(serverUrl() + "/session"));
+            int li = latestSessionIndex(sessions);
+            updated = -1;
+            sid = "";
+            if (li >= 0) {
+                org.json.JSONObject latest = sessions.optJSONObject(li);
+                org.json.JSONObject t = latest.optJSONObject("time");
+                updated = t != null ? t.optLong("updated", -1) : -1;
+                sid = latest.optString("id", "");
+            }
+        } catch (Exception e) {
+            return new Status(-1, "", "", false, false, false, "", false, "");
+        }
+        // 缓存命中检查（仅加锁比对，不持锁做网络）
         synchronized (statusLock) {
-            try {
-                org.json.JSONArray sessions = new org.json.JSONArray(
-                        httpGet(serverUrl() + "/session"));
-                int li = latestSessionIndex(sessions);
-                long updated = -1;
-                String sid = "";
-                if (li >= 0) {
-                    org.json.JSONObject latest = sessions.optJSONObject(li);
-                    org.json.JSONObject t = latest.optJSONObject("time");
-                    updated = t != null ? t.optLong("updated", -1) : -1;
-                    sid = latest.optString("id", "");
-                }
-                if (!forceFull && cachedStatus != null && updated == cachedUpdated
-                        && sid.equals(cachedSid)
-                        && (!cachedStatus.pending || ++pendingTicks < PENDING_FULL_PULL_TICKS)) {
-                    return cachedStatus;
-                }
-                pendingTicks = 0;
-                // 实测该端点按时间升序返回且 limit=1 拿到的是最老一条 (任何会话第一条都是
-                // 已完成的 user 消息 → replying 永远 false, 看护/恢复逻辑全部失效)。
-                // 必须取数组末尾才是最新消息 (解析在 parseStatus, 有单元测试覆盖)。
-                org.json.JSONArray msgs = sid.isEmpty()
-                        ? new org.json.JSONArray()
-                        : new org.json.JSONArray(httpGet(serverUrl() + "/session/" + sid + "/message"));
-                Status s = parseStatus(sessions, msgs, System.currentTimeMillis());
-                cachedUpdated = updated;
-                cachedSid = sid;
-                cachedStatus = s;
-                return s;
-            } catch (Exception e) {
-                // 失败不缓存 (下轮重试), 返回不可用状态
-                return new Status(-1, "", "", false, false, false, "", false, "");
+            if (!forceFull && cachedStatus != null && updated == cachedUpdated
+                    && sid.equals(cachedSid)
+                    && (!cachedStatus.pending || ++pendingTicks < PENDING_FULL_PULL_TICKS)) {
+                return cachedStatus;
             }
         }
+        org.json.JSONArray msgs;
+        try {
+            msgs = sid.isEmpty()
+                    ? new org.json.JSONArray()
+                    : new org.json.JSONArray(httpGet(serverUrl() + "/session/" + sid + "/message"));
+        } catch (Exception e) {
+            return new Status(-1, "", "", false, false, false, "", false, "");
+        }
+        Status s = parseStatus(sessions, msgs, System.currentTimeMillis());
+        synchronized (statusLock) {
+            pendingTicks = 0;
+            cachedUpdated = updated;
+            cachedSid = sid;
+            cachedStatus = s;
+        }
+        return s;
     }
 
     /** sessions 里 time.updated 最大的下标, 空数组/全无效返回 -1 */
@@ -537,11 +543,11 @@ public class ServerManager {
             conn.setReadTimeout(3000);
             conn.setRequestProperty("Authorization", basicAuth());
             int code = conn.getResponseCode();
-            // 非 200 时 getInputStream() 会抛异常, 必须走 getErrorStream 才能读完并正常断开
-            java.io.InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
-            String body = in == null ? "" : readText(in);
-            if (code != 200) throw new IOException("http " + code);
-            return body;
+            try (java.io.InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream()) {
+                String body = in == null ? "" : readText(in);
+                if (code != 200) throw new IOException("http " + code);
+                return body;
+            }
         } finally {
             conn.disconnect();
         }
@@ -1248,15 +1254,23 @@ public class ServerManager {
         }
     }
 
-    /** 读取 Process 私有 pid 字段 (Android 的 java.lang.Process 未暴露公开 pid 方法) */
     private static int pidOf(Process p) {
         try {
             java.lang.reflect.Field f = p.getClass().getDeclaredField("pid");
             f.setAccessible(true);
             return f.getInt(p);
-        } catch (Exception e) {
-            return -1;
-        }
+        } catch (Exception ignored) {}
+        try {
+            java.lang.reflect.Method m = p.getClass().getMethod("pid");
+            Object v = m.invoke(p);
+            if (v instanceof Number) return ((Number) v).intValue();
+        } catch (Exception ignored) {}
+        try {
+            java.lang.reflect.Field f2 = p.getClass().getDeclaredField("mPid");
+            f2.setAccessible(true);
+            return f2.getInt(p);
+        } catch (Exception ignored) {}
+        return -1;
     }
 
     /** 项目目录: 固定 /sdcard/opencode (卸载不丢, 文件管理器可见);
@@ -1436,8 +1450,13 @@ public class ServerManager {
                         pendingName = null;
                         pendingLink = null;
                         name = stripDotSlash(name);
-                        if (name.isEmpty() || name.startsWith("..")) break;
+                        if (name.isEmpty() || name.startsWith("..") || name.startsWith("/")) break;
                         File target = new File(destDir, name);
+                        try {
+                            String canonDest = destDir.getCanonicalPath() + File.separator;
+                            String canonTarget = target.getCanonicalPath();
+                            if (!canonTarget.startsWith(canonDest) && !canonTarget.equals(destDir.getCanonicalPath())) break;
+                        } catch (IOException ignored) { break; }
                         if (e.type == '5' || e.type == 'D') { // dir
                             target.mkdirs();
                         } else if (e.type == '2') { // symlink

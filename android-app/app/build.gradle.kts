@@ -53,13 +53,13 @@ fun httpGet(url: String): String {
 
 fun download(url: String, dest: File) {
     dest.parentFile.mkdirs()
-    if (dest.exists()) {
-        logger.lifecycle("cached: ${dest.name}")
+    if (dest.exists() && dest.length() > 0) {
+        logger.lifecycle("cached: ${dest.name} (${dest.length()} bytes)")
         return
     }
+    if (dest.exists() && dest.length() == 0L) dest.delete()
     logger.lifecycle("downloading ${dest.name} ...")
     retry(delayMs = 10000) {
-        // 先写 .part 再原子改名: 中途失败不留半截文件 (否则下次会被 exists() 误判为缓存)
         val tmp = File(dest.absolutePath + ".part")
         try {
             val conn = URL(url).openConnection() as HttpURLConnection
@@ -69,6 +69,11 @@ fun download(url: String, dest: File) {
             conn.inputStream.use { input ->
                 FileOutputStream(tmp).use { output -> input.copyTo(output) }
             }
+            val expected = conn.contentLengthLong
+            if (expected > 0 && tmp.length() != expected) {
+                throw IllegalStateException("size mismatch ${tmp.length()} != $expected")
+            }
+            if (tmp.length() == 0L) throw IllegalStateException("empty download")
             if (!tmp.renameTo(dest)) throw IllegalStateException("rename ${tmp.name} failed")
         } catch (e: Exception) {
             tmp.delete()
@@ -77,12 +82,7 @@ fun download(url: String, dest: File) {
     }
 }
 
-fun findLatest(url: String, pattern: String): String {
-    val html = httpGet(url)
-    val m = Regex(pattern).findAll(html)
-    val names = m.map { it.groupValues[1] }.toList().distinct()
-    return names.maxOrNull() ?: error("no match for $pattern at $url")
-}
+
 
 fun runPython(script: String, vararg args: String) {
     val python = if (System.getProperty("os.name").lowercase().contains("win")) "python" else "python3"
@@ -218,20 +218,35 @@ tasks.register("downloadRootfs") {
     outputs.dir(outputDir)
     // 注意: 不用 .tar.gz 后缀 — AGP 打包 assets 时会把 .gz 资产解压并改名成 .tar,
     // 这里直接产出纯 .tar, ServerManager 端按需解 gzip (探测 magic)。
-    onlyIf { !file("$outputDir/base.tar").exists() || !file("$outputDir/opencode-bin").exists() }
+    outputs.file("$outputDir/base.tar")
+    outputs.file("$outputDir/opencode-bin")
+    outputs.file("$outputDir/version.txt")
+    onlyIf {
+        val v = File("$outputDir/version.txt")
+        !v.exists() || !v.readText().contains("opencode=") ||
+                !file("$outputDir/base.tar").exists() || !file("$outputDir/opencode-bin").exists()
+    }
     doLast {
         val build = layout.buildDirectory
         val work = build.dir("rootfs-work").get().asFile
         work.mkdirs()
 
         // ---- 1. opencode 二进制 ----
-        val api = "https://api.github.com/repos/anomalyco/opencode/releases/latest"
-        val json = httpGet(api)
-        val tag = Regex("\"tag_name\"\\s*:\\s*\"([^\"]+)\"").find(json)
-            ?.groupValues?.get(1) ?: error("cannot parse tag_name from GitHub API")
-        val dl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*linux-arm64-musl[^\"]*tar\\.gz)\"")
-            .find(json)?.groupValues?.get(1)
-            ?: error("cannot find linux-arm64-musl.tar.gz asset in latest release")
+        var tag: String? = null
+        var dl: String? = null
+        try {
+            val api = "https://api.github.com/repos/anomalyco/opencode/releases/latest"
+            val json = httpGet(api)
+            tag = Regex("\"tag_name\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)
+            dl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*linux-arm64-musl[^\"]*tar\\.gz)\"")
+                .find(json)?.groupValues?.get(1)
+        } catch (e: Exception) {
+            logger.lifecycle("GitHub API failed (${e.message}), fallback to v1.18.25")
+        }
+        if (tag == null || dl == null) {
+            tag = "v1.18.25"
+            dl = "https://github.com/anomalyco/opencode/releases/download/$tag/opencode-linux-arm64-musl.tar.gz"
+        }
         val tarball = File(work, "opencode-$tag.tar.gz")
         download(dl, tarball)
         copy {

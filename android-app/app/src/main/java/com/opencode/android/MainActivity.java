@@ -150,10 +150,6 @@ public class MainActivity extends Activity {
                     android.webkit.WebResourceRequest request) {
                 Uri u = request.getUrl();
                 String path = u.getPath();
-                // 内嵌 Web UI 的终端用 ghostty-web (canvas) 渲染, 其脏行重绘逻辑有 bug:
-                // 光标移动时旧位置的光标条不被擦除, 屏幕上残留第二个光标。
-                // 这里拦截 ghostty-web-*.js, 在"检测到光标移动"处注入一句强制全屏重绘
-                // (g=!0 会让所有行重画, 旧光标必然被擦掉), 动态打补丁以兼容任意版本。
                 if (path != null && path.startsWith("/assets/ghostty-web-") && path.endsWith(".js")) {
                     HttpURLConnection conn = null;
                     try {
@@ -161,22 +157,27 @@ public class MainActivity extends Activity {
                         conn.setConnectTimeout(2500);
                         conn.setReadTimeout(2500);
                         if (conn.getResponseCode() == 200) {
-                            InputStream in = conn.getInputStream();
-                            ByteArrayOutputStream bos = new ByteArrayOutputStream(64 * 1024);
-                            byte[] buf = new byte[8192];
-                            int n;
-                            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
-                            in.close();
-                            // ISO-8859-1 按字节原样往返, 不破坏 UTF-8 多字节字符
-                            String js = bos.toString("ISO-8859-1");
-                            final String anchor =
-                                    "const k=D.x!==this.lastCursorPosition.x||D.y!==this.lastCursorPosition.y;";
-                            if (js.contains(anchor)) {
-                                js = js.replace(anchor, anchor + "k&&(g=!0);");
+                            // 限 2MB 防异常大文件 OOM
+                            try (InputStream rawIn = conn.getInputStream();
+                                 ByteArrayOutputStream bos = new ByteArrayOutputStream(64 * 1024)) {
+                                byte[] buf = new byte[8192];
+                                int n;
+                                int total = 0;
+                                while ((n = rawIn.read(buf)) != -1) {
+                                    total += n;
+                                    if (total > 2 * 1024 * 1024) break;
+                                    bos.write(buf, 0, n);
+                                }
+                                String js = bos.toString("ISO-8859-1");
+                                final String anchor =
+                                        "const k=D.x!==this.lastCursorPosition.x||D.y!==this.lastCursorPosition.y;";
+                                if (js.contains(anchor)) {
+                                    js = js.replace(anchor, anchor + "k&&(g=!0);");
+                                }
+                                return new android.webkit.WebResourceResponse(
+                                        "text/javascript", "UTF-8",
+                                        new ByteArrayInputStream(js.getBytes("ISO-8859-1")));
                             }
-                            return new android.webkit.WebResourceResponse(
-                                    "text/javascript", "UTF-8",
-                                    new ByteArrayInputStream(js.getBytes("ISO-8859-1")));
                         }
                     } catch (Exception e) {
                         Log.w("MainActivity", "ghostty-web patch skipped: " + e);
@@ -189,8 +190,22 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedHttpAuthRequest(WebView view,
                     android.webkit.HttpAuthHandler handler, String host, String realm) {
-                // server 开了 Basic 认证 (局域网访问用), WebView 自动带上凭证
-                handler.proceed(ServerManager.lanUsername(), embedded.lanPassword());
+                // 仅对本机 server 回应凭证，外部站点 401 不泄露密码
+                String url = embedded.serverUrl();
+                boolean localHost = "127.0.0.1".equals(host) || "localhost".equals(host);
+                // serverUrl 形如 http://127.0.0.1:18888，端口也需匹配
+                boolean portOk = true;
+                try {
+                    int port = Uri.parse(url).getPort();
+                    // handler 未暴露端口，host 已校验为本地则直接放行
+                    portOk = port == 18888 || port == -1;
+                } catch (Exception ignored) {}
+                if (localHost && portOk) {
+                    handler.proceed(ServerManager.lanUsername(), embedded.lanPassword());
+                } else {
+                    handler.cancel();
+                    Log.w("MainActivity", "auth rejected for foreign host: " + host);
+                }
             }
             @Override
             public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
@@ -381,6 +396,14 @@ public class MainActivity extends Activity {
         }));
     }
 
+    private void safeExecute(Runnable r) {
+        try {
+            pingExecutor.execute(r);
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            Log.w("MainActivity", "executor rejected: " + e.getMessage());
+        }
+    }
+
     /** 每 1s ping 一次内置 server, 最多 seconds 秒 (首次启动含解压+加载 192MB 二进制, 放宽到 2 分钟) */
     private void pollHealth(final int seconds) {
         if (!polling.compareAndSet(false, true)) return;
@@ -390,16 +413,12 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 if (!polling.get()) return;
-                pingExecutor.execute(() -> {
+                safeExecute(() -> {
                     boolean ok = ping(embedded.serverUrl());
                     runOnUiThread(() -> {
                         if (ok) {
                             polling.set(false);
-                            // 模型自愈 (HTTP 探测, 必须后台线程): 免费模型会被 models.dev
-                            // 下架, 失效模型会让 agent 报错 (无回复/无权限请求)。就绪后探测
-                            // 一次, 无效则换可用免费模型并重启 server 生效 (只改默认模型,
-                            // 用户手动选的模型不碰; 最多一轮不循环)
-                            pingExecutor.execute(() -> {
+                            safeExecute(() -> {
                                 boolean fixed = embedded.autoFixModel();
                                 runOnUiThread(() -> {
                                     if (fixed) {
@@ -554,12 +573,20 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------
 
     private class LanBridge {
-        /** 只允许本地 server 的页面调用 (防止 WebView 里的外部页面读取凭证)。
-         *  注意: 桥方法跑在 JS 桥后台线程, 不能直接调 webView.getUrl() (WebView 方法
-         *  要求 UI 线程, 否则抛异常 → 桥调用整体失败), 这里用 onPageStarted 缓存的 URL */
         private boolean guard() {
             String u = webViewUrl;
-            return u != null && u.startsWith(embedded.serverUrl());
+            if (u == null) return false;
+            try {
+                Uri uri = Uri.parse(u);
+                Uri srv = Uri.parse(embedded.serverUrl());
+                String h = uri.getHost();
+                String sh = srv.getHost();
+                int p = uri.getPort();
+                int sp = srv.getPort();
+                return h != null && h.equals(sh) && p == sp;
+            } catch (Exception e) {
+                return false;
+            }
         }
 
         @android.webkit.JavascriptInterface
@@ -816,12 +843,24 @@ public class MainActivity extends Activity {
         polling.set(false);
         handler.removeCallbacksAndMessages(null);
         pingExecutor.shutdownNow();
-        // 释放 WebView (Activity 被系统重建时避免泄漏旧的 JS 线程/SSE 连接);
-        // server 不在这里停: 息屏/退出 App 后由 ServerService 保活, 长任务不中断
+        if (filePathCallback != null) {
+            filePathCallback.onReceiveValue(null);
+            filePathCallback = null;
+        }
         if (webView != null) {
             webView.removeAllViews();
             webView.destroy();
             webView = null;
         }
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (webView != null && webView.canGoBack()) {
+            webView.goBack();
+            embedded.noteClientActivity();
+            return;
+        }
+        super.onBackPressed();
     }
 }
