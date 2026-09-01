@@ -71,6 +71,9 @@ public class MainActivity extends Activity {
     private static final long BG_REFRESH_THRESHOLD_MS = 30_000;
     private static final int FILECHOOSER_RESULT_CODE = 1001;
     private ValueCallback<Uri[]> filePathCallback;
+    // 深链：来自审批横幅的目录/会话，点开后 WebView 需切到对应项目/会话
+    private String pendingDirectory;
+    private String pendingSessionId;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -79,11 +82,51 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences("opencode_prefs", MODE_PRIVATE);
         embedded = ServerManager.get(this);
         hadAllFilesAccess = Environment.isExternalStorageManager();
+        handlePermissionIntent(getIntent());
 
         buildUI();
         setupRetry();
         startServer();
         maybePromptAllFilesAccess();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handlePermissionIntent(intent);
+        // 若 WebView 已就绪，直接尝试深链跳转；否则 pending 会在 onPageFinished 时消费
+        if (webView != null && pendingDirectory != null) {
+            webView.evaluateJavascript(pendingDeepLinkJs(), null);
+        }
+    }
+
+    private void handlePermissionIntent(Intent intent) {
+        if (intent == null) return;
+        String dir = intent.getStringExtra("opencode_directory");
+        String sess = intent.getStringExtra("opencode_session");
+        if (dir != null && !dir.isEmpty()) pendingDirectory = dir;
+        if (sess != null && !sess.isEmpty()) pendingSessionId = sess;
+        // 兼容旧横幅仅带 perm_id 的情况：不清除已有的 pending
+        if (dir != null || sess != null) {
+            Log.i("MainActivity", "deep link from perm: dir=" + dir + " sess=" + sess);
+        }
+    }
+
+    private String pendingDeepLinkJs() {
+        if (pendingDirectory == null && pendingSessionId == null) return "null";
+        String dir = pendingDirectory != null ? pendingDirectory.replace("'", "\\'") : "";
+        String sess = pendingSessionId != null ? pendingSessionId.replace("'", "\\'") : "";
+        // 多策略深链：1) localStorage 常见键 2) hash 路由 3) 兜底 reload 带 ?directory=
+        return "(function(){try{"
+                + "var d='" + dir + "';var s='" + sess + "';"
+                + "if(d){try{localStorage.setItem('opencode-directory',d);}catch(e){}"
+                + "try{localStorage.setItem('opencode:directory',d);}catch(e){}"
+                + "try{localStorage.setItem('directory',d);}catch(e){}"
+                + "try{sessionStorage.setItem('opencode-directory',d);}catch(e){}}"
+                + "if(s){location.hash='#/session/'+s;}"
+                + "if(d&&!s){var u=new URL(location.href);u.searchParams.set('directory',d);location.href=u.toString();}"
+                + "}catch(e){}})()";
     }
 
     private void buildUI() {
@@ -143,6 +186,22 @@ public class MainActivity extends Activity {
                 if (lanJs != null) {
                     view.evaluateJavascript(
                             lanJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
+                }
+                // 深链：审批横幅点进来的目录/会话，切到对应项目并打开会话
+                if (pendingDirectory != null || pendingSessionId != null) {
+                    String deepJs = pendingDeepLinkJs();
+                    if (deepJs != null && !"null".equals(deepJs)) {
+                        view.evaluateJavascript(deepJs, null);
+                    }
+                    // 消费会话，其余目录保留给 shouldInterceptRequest 的头注入短期使用
+                    pendingSessionId = null;
+                    // 3s 后清掉 pendingDirectory，避免后续正常请求一直带旧目录
+                    final String dirSnapshot = pendingDirectory;
+                    if (dirSnapshot != null) {
+                        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                            if (dirSnapshot.equals(pendingDirectory)) pendingDirectory = null;
+                        }, 3000);
+                    }
                 }
             }
             @Override

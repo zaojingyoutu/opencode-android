@@ -30,3 +30,6 @@ android-app/debug-cert.pem
 
 # python 字节码缓存
 __pycache__/
+
+# 本地打包 skill (不入库, 仅本机开发用)
+.opencode/

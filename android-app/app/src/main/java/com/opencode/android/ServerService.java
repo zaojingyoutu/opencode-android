@@ -85,6 +85,8 @@ public class ServerService extends Service {
     private String permissionNotifiedKey = "";
     /** 连续探测 server 不响应的次数: opencode 这版权限待批会卡死事件循环, 超阈值自动重启自愈 */
     private int serverDownTicks = 0;
+    /** 最近一次轮询是否发现待批请求，供 watchdog 在后台持锁用（避免仅凭 st.pending 漏判多目录/非最新会话的待批） */
+    private volatile boolean hasPendingApproval = false;
 
     @Override
     public void onCreate() {
@@ -190,6 +192,7 @@ public class ServerService extends Service {
         notifyWatcherRunning = true;
         lastStatus = null;
         permissionNotifiedKey = "";
+        hasPendingApproval = false;
         notifyWatcher = new Thread(this::notifyWatcherLoop, "opencode-notify");
         notifyWatcher.setDaemon(true);
         notifyWatcher.start();
@@ -383,15 +386,18 @@ public class ServerService extends Service {
         // 新请求会被旧请求盖住, 横幅永远显示第一条 → 表现为"新目录的审批没通知"。
         // 现在按 id 逐条判断, 任何会话/目录的每个待批准请求都会弹横幅。
         org.json.JSONArray perms = server.listPendingPermissions();
-        if (perms != null && perms.length() > 0) {
-            for (org.json.JSONObject req : ServerManager.pendingNotifications(perms, permissionNotifiedKey)) {
-                permissionNotifiedKey += req.optString("id", "") + ",";
-                notifyPermissionFromEvent(req);
+        if (perms != null) {
+            hasPendingApproval = perms.length() > 0;
+            if (hasPendingApproval) {
+                for (org.json.JSONObject req : ServerManager.pendingNotifications(perms, permissionNotifiedKey)) {
+                    permissionNotifiedKey += req.optString("id", "") + ",";
+                    notifyPermissionFromEvent(req);
+                }
+            } else if (st.sessionUpdated > 0) {
+                // 只在确认无待批准请求时才撤提醒; perms==null 是拉取失败(server 忙/挂),
+                // 不能撤 — 否则通知会闪一下就被清掉
+                clearPermissionReminder();
             }
-        } else if (perms != null && st.sessionUpdated > 0) {
-            // 只在确认无待批准请求时才撤提醒; perms==null 是拉取失败(server 忙/挂),
-            // 不能撤 — 否则通知会闪一下就被清掉
-            clearPermissionReminder();
         }
 
         // 回复结束边沿: 上一轮还有未完成消息, 这一轮没有了 → 用户不在看就发通知。
@@ -466,19 +472,23 @@ public class ServerService extends Service {
             busyMinutes = busy ? busyMinutes + 1 : 0;
             acquireWakeLock();
         } else {
-            // 息屏且 CPU 不忙: 只要还有未完成消息就继续保活。
+            // 息屏且 CPU 不忙: 只要还有未完成消息或待批请求就继续保活。
             // 不能只看 replying: SSE 转发/模型等待阶段本地 CPU 极低测不到,
             // 且静默长任务的 replying 会过期; 放锁后 CPU 休眠 → 网络断 → 任务冻死。
             // 真孤儿 (server 重启留下的永久 pending) 由下面的 stalledMinutes 自愈收尾,
             // 不会像旧版那样永远占着唤醒锁。
-            if (st.pending) {
-                if (st.replying || busy) {
+            // 关键: 后台审批必须用 hasPendingApproval (全局多目录) 而非 st.pending (仅最新会话)，
+            // 否则子项目/非最新会话的待批会被判 idle → 3min 后放锁 → Doze 节流通知线程 → 漏弹
+            boolean hasPending = st.pending || hasPendingApproval;
+            if (hasPending) {
+                if (st.replying || busy || hasPendingApproval) {
                     stalledMinutes = 0;
                 } else {
                     stalledMinutes++;
                     // 连续 15 分钟既无进展也无 CPU: 基本可断定是断流孤儿,
                     // 调 abort 把消息落定 (之后正常进入空闲流程), 不杀整个 server
-                    if (stalledMinutes >= ORPHAN_ABORT_MINUTES && !st.sessionId.isEmpty()) {
+                    // 待批不算孤儿，避免误 abort 正在等用户点的请求
+                    if (!hasPendingApproval && stalledMinutes >= ORPHAN_ABORT_MINUTES && !st.sessionId.isEmpty()) {
                         Log.i(TAG, "orphan reply (no progress " + stalledMinutes
                                 + " min), aborting session " + st.sessionId);
                         server.abortSession(st.sessionId);
@@ -495,9 +505,9 @@ public class ServerService extends Service {
             }
         }
 
-        // 还有未完成消息时绝不参与失控强停: 息屏跑大型构建可能远超 FORCE_STOP_MINUTES。
-        // 高 CPU + 无未完成消息 + 息屏 + 无客户端活动才是真的失控空转
-        if (busyMinutes >= FORCE_STOP_MINUTES && !clientActive && !st.pending) {
+        // 还有未完成消息或待批时绝不参与失控强停: 息屏跑大型构建可能远超 FORCE_STOP_MINUTES。
+        // 高 CPU + 无未完成消息 + 无待批 + 息屏 + 无客户端活动才是真的失控空转
+        if (busyMinutes >= FORCE_STOP_MINUTES && !clientActive && !st.pending && !hasPendingApproval) {
             // 息屏 + 无客户端活动 + 非任务高 CPU → 失控进程, 强制停止防烧电
             Log.i(TAG, "runaway busy, forcing stop (busyMinutes=" + busyMinutes +
                     ", cpuDelta=" + delta + ")");
@@ -676,12 +686,19 @@ public class ServerService extends Service {
      *  每条待批准请求用独立通知 id (由请求 id 派生), 多个会话/目录同时待批时
      *  通知栏可并存多条, 每条都能单独批准/拒绝 — 避免只保留一条时新请求盖住旧请求 */
     private void postPermissionNotification(String reqId, String title, String text) {
-        postPermissionNotification(reqId, title, text, null);
+        postPermissionNotification(reqId, title, text, null, null);
     }
 
     private void postPermissionNotification(String reqId, String title, String text, String directory) {
+        postPermissionNotification(reqId, title, text, directory, null);
+    }
+
+    private void postPermissionNotification(String reqId, String title, String text, String directory, String sessionId) {
         Intent open = new Intent(this, MainActivity.class);
         open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        if (directory != null && !directory.isEmpty()) open.putExtra("opencode_directory", directory);
+        if (sessionId != null && !sessionId.isEmpty()) open.putExtra("opencode_session", sessionId);
+        if (reqId != null && !reqId.isEmpty()) open.putExtra("opencode_perm_id", reqId);
         PendingIntent pi = PendingIntent.getActivity(this, 3, open,
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         Notification.Builder b = Build.VERSION.SDK_INT >= 26
@@ -748,9 +765,12 @@ public class ServerService extends Service {
             ServerManager.PermissionNotice n = ServerManager.permissionNotice(req, lastSessionTitle);
             String dir = req.optString("__directory", "");
             if (dir.isEmpty()) dir = req.optString("directory", "");
-            postPermissionNotification(n.id, n.title, n.text, dir.isEmpty() ? null : dir);
+            String sess = req.optString("sessionID", "");
+            if (sess.isEmpty()) sess = req.optString("sessionId", "");
+            if (sess.isEmpty()) sess = req.optString("session_id", "");
+            postPermissionNotification(n.id, n.title, n.text, dir.isEmpty() ? null : dir, sess.isEmpty() ? null : sess);
             Log.i(TAG, "permission notice posted (detail=" + n.text + ", req=" + n.id
-                    + (dir.isEmpty() ? "" : " dir=" + dir) + ")");
+                    + (dir.isEmpty() ? "" : " dir=" + dir) + (sess.isEmpty() ? "" : " sess=" + sess) + ")");
         } catch (Exception e) {
             Log.w(TAG, "permission notify failed", e);
         }

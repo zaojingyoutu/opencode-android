@@ -10,6 +10,50 @@
 #   - 设 BUILD_OUTPUT=<路径> 时构建完成后把 APK 复制到该路径 (如 /workspace/app-debug.apk)
 set -e
 
+# ---- 持久化构建环境 (避免容器重启后重下载 800M+ Gradle 缓存和 450M SDK) ----
+# /root/.gradle 和 /opt/android-sdk 在 Alpine 容器里是 tmpfs，重启即丢；
+# 改为 /workspace 持久化，首次自动迁移已有缓存，后续构建秒级复用。
+PERSISTENT_ROOT="${PERSISTENT_ROOT:-/workspace}"
+export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$PERSISTENT_ROOT/.gradle}"
+export ANDROID_HOME="${ANDROID_HOME:-$PERSISTENT_ROOT/android-sdk}"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+# 确保持久化目录存在
+mkdir -p "$GRADLE_USER_HOME" "$ANDROID_HOME" 2>/dev/null || true
+# 首次迁移：容器内已有缓存但持久化目录为空时自动复制
+if [ -d "$HOME/.gradle/caches" ] && [ ! -d "$GRADLE_USER_HOME/caches" ]; then
+    echo "    迁移 Gradle 缓存到持久化目录: $GRADLE_USER_HOME"
+    cp -r "$HOME/.gradle"/* "$GRADLE_USER_HOME"/ 2>/dev/null || true
+fi
+if [ -d "/opt/android-sdk/platforms" ] && [ ! -d "$ANDROID_HOME/platforms" ]; then
+    echo "    迁移 Android SDK 到持久化目录: $ANDROID_HOME"
+    cp -r /opt/android-sdk/* "$ANDROID_HOME"/ 2>/dev/null || true
+fi
+# aarch64 aapt2 持久化恢复：/usr/local/bin 是 tmpfs，重启丢失；从 workspace 恢复
+PERSISTENT_AAPT2="$PERSISTENT_ROOT/opencode-android/.local/env/aapt2-arm64/aapt2.real"
+PERSISTENT_AAPT2_SHIM="$PERSISTENT_ROOT/opencode-android/.local/env/aapt2-arm64/aapt2shim.so"
+if [ ! -x "/usr/local/bin/aapt2" ] && [ -x "$PERSISTENT_AAPT2" ]; then
+    mkdir -p /usr/local/bin /usr/local/lib 2>/dev/null
+    cp "$PERSISTENT_AAPT2" /usr/local/bin/aapt2.real 2>/dev/null
+    cp "$PERSISTENT_AAPT2_SHIM" /usr/local/lib/aapt2shim.so 2>/dev/null
+    cat > /usr/local/bin/aapt2 <<'EOS_AAPT2'
+#!/bin/sh
+exec env LD_PRELOAD=/usr/local/lib/aapt2shim.so /usr/local/bin/aapt2.real "$@"
+EOS_AAPT2
+    chmod +x /usr/local/bin/aapt2 2>/dev/null
+    echo "    恢复 aapt2 aarch64: /usr/local/bin/aapt2"
+fi
+# JDK 持久化恢复：容器重启后 /usr 丢失，需重装（走本地 apkcache 秒装）
+if ! command -v java >/dev/null 2>&1; then
+    echo "    恢复 JDK (openjdk17)..."
+    apk add --cache-dir "$PERSISTENT_ROOT/apkcache" openjdk17 >/dev/null 2>&1 || apk add --cache-dir "$PERSISTENT_ROOT/apkcache" openjdk17 2>&1 | tail -n 3
+fi
+export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk}"
+# 确保持久化 SDK 的 licenses/cmdline-tools 完整（容器重启后 /opt 丢失，仅 /workspace 保留）
+if [ ! -f "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ] && [ -f "$PERSISTENT_ROOT/android-sdk/cmdline-tools/latest/bin/sdkmanager" ]; then
+    mkdir -p /opt/android-sdk 2>/dev/null
+    cp -r "$PERSISTENT_ROOT/android-sdk"/* /opt/android-sdk/ 2>/dev/null || true
+fi
+
 VERSION_NAME="${1:-}"
 VERSION_CODE="${2:-}"
 # 可选第3参数: 并存包后缀 (如 beta), 生成的 APK 包名带 .beta 后缀,
