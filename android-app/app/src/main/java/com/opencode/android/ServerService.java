@@ -251,17 +251,31 @@ public class ServerService extends Service {
                     Thread.sleep(3000);
                     continue;
                 }
-                conn = (java.net.HttpURLConnection) new java.net.URL(
-                        server.serverUrl() + "/event").openConnection();
+                // 优先订阅全局事件流 (/global/event): 包含所有目录的 permission.asked，
+                // 单目录的 /event 只返回默认 /workspace 的事件 → 子项目不弹横幅。
+                // 若全局订阅失败 (旧版 server 无此路由) 回退到 /event。
+                String url = server.serverUrl() + "/global/event";
+                conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
                 sseConn = conn;
                 conn.setRequestProperty("Authorization", server.basicAuth());
                 conn.setConnectTimeout(5000);
                 conn.setReadTimeout(15_000);
-                if (conn.getResponseCode() != 200) {
-                    Thread.sleep(5000);
-                    continue;
+                int code = conn.getResponseCode();
+                if (code != 200) {
+                    try { conn.disconnect(); } catch (Exception ignored) {}
+                    // 回退旧端点
+                    conn = (java.net.HttpURLConnection) new java.net.URL(
+                            server.serverUrl() + "/event").openConnection();
+                    sseConn = conn;
+                    conn.setRequestProperty("Authorization", server.basicAuth());
+                    conn.setConnectTimeout(5000);
+                    conn.setReadTimeout(15_000);
+                    if (conn.getResponseCode() != 200) {
+                        Thread.sleep(5000);
+                        continue;
+                    }
                 }
-                Log.i(TAG, "sse subscribed");
+                Log.i(TAG, "sse subscribed (" + url + ")");
                 java.io.BufferedReader reader = new java.io.BufferedReader(
                         new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
                 String line;
@@ -288,13 +302,34 @@ public class ServerService extends Service {
     }
 
     /** 处理 server 事件: permission.asked 直接触发通知 (负载自带请求字段, 零 HTTP);
-     *  message.updated 触发一次完成检测 (节流) */
+     *  message.updated 触发一次完成检测 (节流)。
+     *  兼容全局事件包装: /global/event 的 data 是 {directory, payload:{type,...}},
+     *  而 /event 的 data 直接就是 {type,...}。 */
     private void handleServerEvent(String json) {
         try {
-            String kind = ServerManager.sseEventKind(json);
+            String effectiveJson = json;
+            String eventDirectory = null;
+            try {
+                org.json.JSONObject wrapper = new org.json.JSONObject(json);
+                if (wrapper.has("payload")) {
+                    org.json.JSONObject payload = wrapper.optJSONObject("payload");
+                    if (payload != null) {
+                        eventDirectory = wrapper.optString("directory", null);
+                        if (eventDirectory != null && !eventDirectory.isEmpty()) {
+                            try { payload.put("__directory", eventDirectory); } catch (Exception ignored) {}
+                        }
+                        effectiveJson = payload.toString();
+                    }
+                }
+            } catch (Exception ignore) {}
+
+            String kind = ServerManager.sseEventKind(effectiveJson);
             if ("permission".equals(kind)) {
-                org.json.JSONObject p = ServerManager.ssePermissionPayload(json);
+                org.json.JSONObject p = ServerManager.ssePermissionPayload(effectiveJson);
                 if (p != null) {
+                    if (eventDirectory != null && !p.has("__directory")) {
+                        try { p.put("__directory", eventDirectory); } catch (Exception ignored) {}
+                    }
                     String id = p.optString("id", "");
                     if (!permissionNotifiedKey.contains(id + ",")) {
                         permissionNotifiedKey += id + ",";
@@ -343,17 +378,15 @@ public class ServerService extends Service {
         // 待批准提醒: agent 被权限请求卡住 (整个任务停摆), 比完成提醒更该被看见。
         // 以 GET /permission 为准: v1.18 里待批准的工具 part 状态是 running (不是 pending),
         // 只有 /permission 才返回真正的待批准请求 (含 id, 通知按钮直接回复用)。
-        // 同一批请求只提醒一次; 请求被批准/拒绝后 (列表变空/变化) 自动撤掉常驻提醒
+        // 逐条去重、逐个通知: /permission 同时返回所有会话的待批准请求, 之前只取第一条
+        // (perms[0]) + 整体 key 去重, 多个会话并存时 (如先挂着旧目录的请求再切新目录)
+        // 新请求会被旧请求盖住, 横幅永远显示第一条 → 表现为"新目录的审批没通知"。
+        // 现在按 id 逐条判断, 任何会话/目录的每个待批准请求都会弹横幅。
         org.json.JSONArray perms = server.listPendingPermissions();
         if (perms != null && perms.length() > 0) {
-            StringBuilder ids = new StringBuilder();
-            for (int i = 0; i < perms.length(); i++) {
-                ids.append(perms.optJSONObject(i).optString("id", "")).append(',');
-            }
-            String key = ids.toString();
-            if (!key.equals(permissionNotifiedKey)) {
-                permissionNotifiedKey = key;
-                notifyPermissionNeeded(perms, st);
+            for (org.json.JSONObject req : ServerManager.pendingNotifications(perms, permissionNotifiedKey)) {
+                permissionNotifiedKey += req.optString("id", "") + ",";
+                notifyPermissionFromEvent(req);
             }
         } else if (perms != null && st.sessionUpdated > 0) {
             // 只在确认无待批准请求时才撤提醒; perms==null 是拉取失败(server 忙/挂),
@@ -614,12 +647,18 @@ public class ServerService extends Service {
     private void handlePermissionReply(Intent intent) {
         final String id = intent.getStringExtra("perm_id");
         final String reply = intent.getStringExtra("perm_reply");
+        final String dir = intent.getStringExtra("perm_dir");
         if (id == null || reply == null) return;
         final String label = ServerManager.permReplyLabel(reply);
         new Thread(() -> {
             boolean ok;
             try {
-                ok = server.replyPermission(id, reply);
+                if (dir != null && !dir.isEmpty()) {
+                    ok = server.replyPermission(id, reply, dir);
+                    if (!ok) ok = server.replyPermission(id, reply);
+                } else {
+                    ok = server.replyPermission(id, reply);
+                }
             } catch (Exception e) {
                 Log.w(TAG, "perm reply threw: " + e);
                 ok = false;
@@ -628,34 +667,19 @@ public class ServerService extends Service {
             // Toast 必须在主线程 (后台线程调用在部分 ROM 会抛异常)
             main.post(() -> android.widget.Toast.makeText(this, toast,
                     android.widget.Toast.LENGTH_SHORT).show());
-            Log.i(TAG, "perm reply via notif: " + id + " " + reply + " ok=" + ok);
+            Log.i(TAG, "perm reply via notif: " + id + " " + reply
+                    + (dir != null ? " dir=" + dir : "") + " ok=" + ok);
         }, "opencode-perm-reply").start();
     }
 
-    /** 待批准提醒 (AI 等用户批准工具调用, 整个任务停摆): 高优先级顶部横幅 (微信/短信式) + 声音震动。
-     *  带"批准/拒绝"按钮, 直接从通知栏回复权限请求, 无需进 App。
-     *  @param perms GET /permission 的待批准请求列表 (非空) */
-    private void notifyPermissionNeeded(org.json.JSONArray perms, ServerManager.Status st) {
-        try {
-            if (Build.VERSION.SDK_INT >= 33 &&
-                    checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
-                            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                Log.i(TAG, "no notification permission, skip permission notice");
-                return;
-            }
-            // 取第一条待批准请求: id 供按钮直接回复, permission/metadata/patterns 做描述
-            org.json.JSONObject req = perms.optJSONObject(0);
-            ServerManager.PermissionNotice n = ServerManager.permissionNotice(req, st.sessionTitle);
-            postPermissionNotification(n.id, n.title, n.text);
-            Log.i(TAG, "permission notice posted (session=" + st.sessionTitle
-                    + ", detail=" + n.text + ", req=" + n.id + ")");
-        } catch (Exception e) {
-            Log.w(TAG, "permission notify failed", e);
-        }
+    /** 发"需要批准"通知 (带常驻批准/拒绝按钮的自定义布局), 轮询和 SSE 两条路共用。
+     *  每条待批准请求用独立通知 id (由请求 id 派生), 多个会话/目录同时待批时
+     *  通知栏可并存多条, 每条都能单独批准/拒绝 — 避免只保留一条时新请求盖住旧请求 */
+    private void postPermissionNotification(String reqId, String title, String text) {
+        postPermissionNotification(reqId, title, text, null);
     }
 
-    /** 发"需要批准"通知 (带常驻批准/拒绝按钮的自定义布局), 轮询和 SSE 两条路共用 */
-    private void postPermissionNotification(String reqId, String title, String text) {
+    private void postPermissionNotification(String reqId, String title, String text, String directory) {
         Intent open = new Intent(this, MainActivity.class);
         open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         PendingIntent pi = PendingIntent.getActivity(this, 3, open,
@@ -673,26 +697,47 @@ public class ServerService extends Service {
                 .setPriority(Notification.PRIORITY_HIGH)
                 .setLights(0xFFFF0000, 500, 2000);
         if (!reqId.isEmpty()) {
-            // 原生按钮: 系统默认样式, 展开通知可见
-            b.addAction(0, "批准", permReplyPi(reqId, "once", 5))
-             .addAction(0, "拒绝", permReplyPi(reqId, "reject", 6));
+            // 原生按钮: 系统默认样式, 展开通知可见。
+            // requestCode 按请求 id 派生: 多条待批准通知并存时, 固定 requestCode 会让
+            // FLAG_UPDATE_CURRENT 以最后一次创建的 extra 为准 → 点任意一条都回复最后一个
+            // 请求。派生后每条通知的按钮绑定各自的 perm_id, 各批各的。
+            // directory 一并传入 PendingIntent，供回复时带上正确目录 (per-directory 实例)
+            b.addAction(0, "批准", permReplyPi(reqId, "once", 5, reqId, directory))
+             .addAction(0, "拒绝", permReplyPi(reqId, "reject", 6, reqId, directory));
         }
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-        nm.notify(NOTIF_ID_PERMISSION, b.build());
+        nm.notify(permissionNotifId(reqId), b.build());
     }
 
-    /** 通知按钮的 PendingIntent: 转发到本服务 ACTION_PERM_REPLY 直接回复权限请求 */
-    private PendingIntent permReplyPi(String requestId, String reply, int reqCode) {
+    /** 请求 id → 通知栏 id: 基准 + 哈希, 保证同一请求稳定占位, 不同请求互不覆盖 */
+    private static int permissionNotifId(String reqId) {
+        return reqId == null || reqId.isEmpty()
+                ? NOTIF_ID_PERMISSION
+                : NOTIF_ID_PERMISSION + (reqId.hashCode() & 0x3ff);
+    }
+
+    /** 通知按钮的 PendingIntent: 转发到本服务 ACTION_PERM_REPLY 直接回复权限请求。
+     *  requestCode 由请求 id 派生, 保证不同请求的按钮 PendingIntent 互不冲突
+     *  (见 postPermissionNotification 的注释) */
+    private PendingIntent permReplyPi(String requestId, String reply, int baseCode, String reqId) {
+        return permReplyPi(requestId, reply, baseCode, reqId, null);
+    }
+
+    private PendingIntent permReplyPi(String requestId, String reply, int baseCode, String reqId, String directory) {
         Intent i = new Intent(this, ServerService.class)
                 .setAction(ACTION_PERM_REPLY)
                 .putExtra("perm_id", requestId)
                 .putExtra("perm_reply", reply);
-        return PendingIntent.getService(this, reqCode, i,
+        if (directory != null && !directory.isEmpty()) i.putExtra("perm_dir", directory);
+        int code = baseCode + (reqId == null ? 0 : (reqId.hashCode() & 0x3ff));
+        return PendingIntent.getService(this, code, i,
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
     }
 
-    /** SSE permission.asked 事件直达通知: 负载自带全部字段, 零 HTTP —
-     *  server 即将挂死也能发出去 (轮询模式赶不上的根本原因就是挂死快过轮询) */
+    /** 发"需要批准"横幅通知 (SSE permission.asked 事件 / 10s 轮询 GET /permission 共用入口)。
+     *  SSE 路径零 HTTP, server 即将挂死也能发出去 (轮询模式赶不上的根本原因就是挂死快过轮询);
+     *  轮询路径为 /permission 返回的完整请求对象, 结构一致。
+     *  去重在调用方按请求 id 逐条做 (permissionNotifiedKey), 这里只负责弹横幅 */
     private void notifyPermissionFromEvent(org.json.JSONObject req) {
         try {
             if (Build.VERSION.SDK_INT >= 33 &&
@@ -701,10 +746,13 @@ public class ServerService extends Service {
                 return;
             }
             ServerManager.PermissionNotice n = ServerManager.permissionNotice(req, lastSessionTitle);
-            postPermissionNotification(n.id, n.title, n.text);
-            Log.i(TAG, "permission notice via sse (detail=" + n.text + ", req=" + n.id + ")");
+            String dir = req.optString("__directory", "");
+            if (dir.isEmpty()) dir = req.optString("directory", "");
+            postPermissionNotification(n.id, n.title, n.text, dir.isEmpty() ? null : dir);
+            Log.i(TAG, "permission notice posted (detail=" + n.text + ", req=" + n.id
+                    + (dir.isEmpty() ? "" : " dir=" + dir) + ")");
         } catch (Exception e) {
-            Log.w(TAG, "sse permission notify failed", e);
+            Log.w(TAG, "permission notify failed", e);
         }
     }
 
@@ -714,7 +762,8 @@ public class ServerService extends Service {
         permissionNotifiedKey = "";
         try {
             NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-            nm.cancel(NOTIF_ID_PERMISSION);
+            // 待批准通知可能并存多条 (不同请求 id → 不同通知 id), 全清
+            for (int i = 0; i < 1024; i++) nm.cancel(NOTIF_ID_PERMISSION + i);
         } catch (Exception ignored) {
         }
     }

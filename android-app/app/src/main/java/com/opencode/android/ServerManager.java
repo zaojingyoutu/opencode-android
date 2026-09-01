@@ -213,8 +213,9 @@ public class ServerManager {
         org.json.JSONArray sessions;
         long updated;
         String sid;
+        String sidDirectory = "";
         try {
-            sessions = new org.json.JSONArray(httpGet(serverUrl() + "/session"));
+            sessions = listSessionsAll();
             int li = latestSessionIndex(sessions);
             updated = -1;
             sid = "";
@@ -223,6 +224,7 @@ public class ServerManager {
                 org.json.JSONObject t = latest.optJSONObject("time");
                 updated = t != null ? t.optLong("updated", -1) : -1;
                 sid = latest.optString("id", "");
+                sidDirectory = latest.optString("directory", "");
             }
         } catch (Exception e) {
             return new Status(-1, "", "", false, false, false, "", false, "");
@@ -237,9 +239,15 @@ public class ServerManager {
         }
         org.json.JSONArray msgs;
         try {
-            msgs = sid.isEmpty()
-                    ? new org.json.JSONArray()
-                    : new org.json.JSONArray(httpGet(serverUrl() + "/session/" + sid + "/message"));
+            if (sid.isEmpty()) {
+                msgs = new org.json.JSONArray();
+            } else {
+                String msgUrl = serverUrl() + "/session/" + sid + "/message";
+                if (!sidDirectory.isEmpty()) {
+                    msgUrl += "?directory=" + java.net.URLEncoder.encode(sidDirectory, "UTF-8");
+                }
+                msgs = new org.json.JSONArray(httpGet(msgUrl));
+            }
         } catch (Exception e) {
             return new Status(-1, "", "", false, false, false, "", false, "");
         }
@@ -251,6 +259,69 @@ public class ServerManager {
             cachedStatus = s;
         }
         return s;
+    }
+
+    /** 聚合所有已知工作区目录的会话列表。
+     *  背景: server 的 /session、/permission 等接口是 per-directory
+     *  (InstanceState 按 directory 隔离); 不带 directory 参数时默认
+     *  取 /workspace。这导致子项目 (如 /workspace/opencode-android)
+     *  的会话/权限对轮询不可见 → 审批横幅在子目录不弹。
+     *  这里枚举宿主 projectsDir 下的所有一级/二级子目录，对每个
+     *  directory 逐个请求并按 id 去重合并，保证任何子项目的待批
+     *  请求都能被轮询到。 */
+    private org.json.JSONArray listSessionsAll() {
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        org.json.JSONArray merged = new org.json.JSONArray();
+        for (String dir : workspaceDirectories()) {
+            try {
+                String url = serverUrl() + "/session?directory="
+                        + java.net.URLEncoder.encode(dir, "UTF-8");
+                org.json.JSONArray arr = new org.json.JSONArray(httpGet(url));
+                for (int i = 0; i < arr.length(); i++) {
+                    org.json.JSONObject obj = arr.optJSONObject(i);
+                    if (obj == null) continue;
+                    String id = obj.optString("id", "");
+                    if (id.isEmpty() || !seen.add(id)) continue;
+                    merged.put(obj);
+                }
+            } catch (Exception ignored) {}
+        }
+        // 兜底: 仅当聚合为空时尝试旧接口 (兼容不支持 directory 的旧版 server)，
+        // 避免对新版 server 每轮多发一次重复请求
+        if (merged.length() == 0) {
+            try {
+                org.json.JSONArray arr = new org.json.JSONArray(httpGet(serverUrl() + "/session"));
+                for (int i = 0; i < arr.length(); i++) {
+                    org.json.JSONObject obj = arr.optJSONObject(i);
+                    if (obj == null) continue;
+                    String id = obj.optString("id", "");
+                    if (id.isEmpty() || !seen.add(id)) continue;
+                    merged.put(obj);
+                }
+            } catch (Exception ignored) {}
+        }
+        return merged;
+    }
+
+    /** 枚举需要轮询的容器内工作区目录。
+     *  容器内 /workspace 映射自宿主 projectsDir() (通常是 /sdcard/opencode)，
+     *  子项目对应一级子目录。返回包含 "/workspace" 本体及每个子目录的
+     *  容器路径。按需一轮枚举约 5~10 个目录，对 10s 轮询开销可控。 */
+    private java.util.List<String> workspaceDirectories() {
+        java.util.List<String> dirs = new java.util.ArrayList<>();
+        dirs.add("/workspace");
+        File proj = projectsDir();
+        File[] children = proj.listFiles();
+        if (children != null) {
+            for (File c : children) {
+                if (!c.isDirectory()) continue;
+                String name = c.getName();
+                if (name.startsWith(".") || name.equals("README.md")) continue;
+                dirs.add("/workspace/" + name);
+                if (dirs.size() >= 30) break;
+            }
+        }
+        return dirs;
     }
 
     /** sessions 里 time.updated 最大的下标, 空数组/全无效返回 -1 */
@@ -394,6 +465,30 @@ public class ServerManager {
 
     /** 中止会话当前回复 (孤儿消息收尾用), <b>子线程调用</b>; 尽力而为, 失败只记日志 */
     public void abortSession(String sid) {
+        // per-directory 实例: 不带 directory 时仅在 /workspace 实例找，子项目会 404
+        // 依次尝试已知目录直到成功
+        for (String dir : workspaceDirectories()) {
+            try {
+                String url = serverUrl() + "/session/" + sid + "/abort?directory="
+                        + java.net.URLEncoder.encode(dir, "UTF-8");
+                HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+                try {
+                    conn.setRequestMethod("POST");
+                    conn.setConnectTimeout(3000);
+                    conn.setReadTimeout(3000);
+                    conn.setRequestProperty("Authorization", basicAuth());
+                    conn.setRequestProperty("x-opencode-directory", dir);
+                    int code = conn.getResponseCode();
+                    Log.i(TAG, "abort " + sid + " dir=" + dir + ": http " + code);
+                    if (code == 200) return;
+                } finally {
+                    conn.disconnect();
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "abort failed dir=" + dir + ": " + e);
+            }
+        }
+        // 兜底旧路径
         try {
             HttpURLConnection conn = (HttpURLConnection) new URL(
                     serverUrl() + "/session/" + sid + "/abort").openConnection();
@@ -464,6 +559,26 @@ public class ServerManager {
         return "{\"reply\":\"" + reply + "\"}";
     }
 
+    /** 从待批准请求列表里挑出"尚未通知过"的请求 (按 id 逐条去重)。
+     *  @param perms   GET /permission 返回的待批准请求列表 (可为 null)
+     *  @param notified 已通知过的请求 id, 逗号拼接 (与 ServerService.permissionNotifiedKey 同格式);
+     *                  null 视为空
+     *  @return 需要新发通知的请求列表 (保持原顺序)。调用方把每个 id + "," 追加回 notified */
+    public static java.util.List<org.json.JSONObject> pendingNotifications(
+            org.json.JSONArray perms, String notified) {
+        java.util.List<org.json.JSONObject> out = new java.util.ArrayList<>();
+        if (perms == null) return out;
+        String known = notified == null ? "" : notified;
+        for (int i = 0; i < perms.length(); i++) {
+            org.json.JSONObject req = perms.optJSONObject(i);
+            if (req == null) continue;
+            String id = req.optString("id", "");
+            if (id.isEmpty() || known.contains(id + ",")) continue;
+            out.add(req);
+        }
+        return out;
+    }
+
     /** SSE 事件分类: "permission" (permission.asked) / "message" (message 更新) / "" */
     public static String sseEventKind(String json) {
         if (json == null) return "";
@@ -482,34 +597,95 @@ public class ServerManager {
     }
 
     /** 查询待批准的权限请求 (GET /permission, 含 request id 供通知按钮直接回复),
-     *  <b>子线程调用</b>; 失败返回 null */
+     *  <b>子线程调用</b>; 失败返回 null。
+     *  聚合多目录: 见 listSessionsAll 注释，单目录轮询会漏子项目 */
     public org.json.JSONArray listPendingPermissions() {
-        try {
-            return new org.json.JSONArray(httpGet(serverUrl() + "/permission"));
-        } catch (Exception e) {
-            Log.w(TAG, "list pending permissions failed: " + e);
-            return null;
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        org.json.JSONArray merged = new org.json.JSONArray();
+        boolean anySuccess = false;
+        for (String dir : workspaceDirectories()) {
+            try {
+                String url = serverUrl() + "/permission?directory="
+                        + java.net.URLEncoder.encode(dir, "UTF-8");
+                org.json.JSONArray arr = new org.json.JSONArray(httpGet(url));
+                anySuccess = true;
+                for (int i = 0; i < arr.length(); i++) {
+                    org.json.JSONObject obj = arr.optJSONObject(i);
+                    if (obj == null) continue;
+                    String id = obj.optString("id", "");
+                    if (id.isEmpty() || !seen.add(id)) continue;
+                    // 记下该请求归属的目录，供后续 reply 时带上 directory 参数
+                    try { obj.put("__directory", dir); } catch (Exception ignored) {}
+                    merged.put(obj);
+                }
+            } catch (Exception ignored) {}
         }
+        // 兜底旧接口: 仅当聚合为空时尝试，减少新版 server 的重复请求
+        if (merged.length() == 0) {
+            try {
+                org.json.JSONArray arr = new org.json.JSONArray(httpGet(serverUrl() + "/permission"));
+                anySuccess = true;
+                for (int i = 0; i < arr.length(); i++) {
+                    org.json.JSONObject obj = arr.optJSONObject(i);
+                    if (obj == null) continue;
+                    String id = obj.optString("id", "");
+                    if (id.isEmpty() || !seen.add(id)) continue;
+                    if (!obj.has("__directory")) try { obj.put("__directory", "/workspace"); } catch (Exception ignored) {}
+                    merged.put(obj);
+                }
+            } catch (Exception e) {
+                if (!anySuccess) {
+                    Log.w(TAG, "list pending permissions failed: " + e);
+                    return null;
+                }
+            }
+        } else {
+            anySuccess = true;
+        }
+        return merged;
     }
 
     /** 回复权限请求: reply = "once"(批准一次) / "reject"(拒绝), <b>子线程调用</b>;
-     *  成功返回 true */
+     *  成功返回 true。兼容旧调用: 依次尝试已知的目录直到成功 */
     public boolean replyPermission(String requestId, String reply) {
+        // 先尝试不带目录 (旧 server 兼容)
+        if (replyPermissionWithDirectory(requestId, reply, null)) return true;
+        // 再按已知目录逐个尝试
+        for (String dir : workspaceDirectories()) {
+            if (replyPermissionWithDirectory(requestId, reply, dir)) return true;
+        }
+        Log.w(TAG, "permission reply failed for all directories: " + requestId);
+        return false;
+    }
+
+    /** 带 directory 的回复 (权限实际归属的目录) */
+    public boolean replyPermission(String requestId, String reply, String directory) {
+        return replyPermissionWithDirectory(requestId, reply, directory);
+    }
+
+    private boolean replyPermissionWithDirectory(String requestId, String reply, String directory) {
         try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(
-                    permissionReplyUrl(serverUrl(), requestId)).openConnection();
+            String url = permissionReplyUrl(serverUrl(), requestId);
+            if (directory != null && !directory.isEmpty()) {
+                url += "?directory=" + java.net.URLEncoder.encode(directory, "UTF-8");
+            }
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
             try {
                 conn.setRequestMethod("POST");
                 conn.setConnectTimeout(3000);
                 conn.setReadTimeout(3000);
                 conn.setRequestProperty("Authorization", basicAuth());
+                if (directory != null && !directory.isEmpty()) {
+                    conn.setRequestProperty("x-opencode-directory", directory);
+                }
                 conn.setRequestProperty("Content-Type", "application/json");
                 conn.setDoOutput(true);
                 byte[] body = permissionReplyBody(reply).getBytes(StandardCharsets.UTF_8);
                 conn.setFixedLengthStreamingMode(body.length);
                 conn.getOutputStream().write(body);
                 int code = conn.getResponseCode();
-                Log.i(TAG, "permission reply " + requestId + " " + reply + ": http " + code);
+                Log.i(TAG, "permission reply " + requestId + " " + reply
+                        + (directory != null ? " dir=" + directory : "") + ": http " + code);
                 return code == 200;
             } finally {
                 conn.disconnect();

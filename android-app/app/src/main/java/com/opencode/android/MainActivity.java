@@ -193,12 +193,13 @@ public class MainActivity extends Activity {
                 // 仅对本机 server 回应凭证，外部站点 401 不泄露密码
                 String url = embedded.serverUrl();
                 boolean localHost = "127.0.0.1".equals(host) || "localhost".equals(host);
-                // serverUrl 形如 http://127.0.0.1:18888，端口也需匹配
+                // serverUrl 形如 http://127.0.0.1:18888，端口也需匹配。
+                // 并存包 (beta) 端口是 18889, 不能硬编码 — 直接从 serverUrl 解析实际端口
                 boolean portOk = true;
                 try {
                     int port = Uri.parse(url).getPort();
-                    // handler 未暴露端口，host 已校验为本地则直接放行
-                    portOk = port == 18888 || port == -1;
+                    int serverPort = Uri.parse(embedded.serverUrl()).getPort();
+                    portOk = port == -1 || port == serverPort;
                 } catch (Exception ignored) {}
                 if (localHost && portOk) {
                     handler.proceed(ServerManager.lanUsername(), embedded.lanPassword());

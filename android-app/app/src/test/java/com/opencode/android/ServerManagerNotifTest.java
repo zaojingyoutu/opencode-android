@@ -2,7 +2,9 @@ package com.opencode.android;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
 
@@ -169,5 +171,49 @@ public class ServerManagerNotifTest {
         JSONObject p = ServerManager.ssePermissionPayload(
                 "{\"type\":\"permission.asked\",\"id\":\"r3\",\"properties\":{\"permission\":\"bash\"}}");
         assertEquals("r3", p.optString("id"));
+    }
+
+    // ---- 待批准请求逐条去重 (多会话/多目录并存时, 每个请求都要弹横幅) ----
+
+    @Test
+    public void pendingNotifications_emptyPerms_returnsEmpty() {
+        assertTrue(ServerManager.pendingNotifications(new org.json.JSONArray(), "").isEmpty());
+    }
+
+    @Test
+    public void pendingNotifications_nullPerms_returnsEmpty() {
+        assertTrue(ServerManager.pendingNotifications(null, "").isEmpty());
+    }
+
+    @Test
+    public void pendingNotifications_returnsAllUnnotified() throws Exception {
+        JSONArray perms = new org.json.JSONArray()
+                .put(new JSONObject().put("id", "req_a").put("permission", "bash"))
+                .put(new JSONObject().put("id", "req_b").put("permission", "edit"));
+        java.util.List<JSONObject> out = ServerManager.pendingNotifications(perms, "");
+        assertEquals(2, out.size());
+        assertEquals("req_a", out.get(0).optString("id"));
+        assertEquals("req_b", out.get(1).optString("id"));
+    }
+
+    @Test
+    public void pendingNotifications_skipsAlreadyNotified() throws Exception {
+        // 第二个会话/目录的请求 (req_b) 未通知过, 即使列表里第一个 (req_a) 已通知也要返回它 —
+        // 回归: 之前只取 perms[0], 新目录请求被旧目录请求盖住, 横幅永远显示第一条
+        JSONArray perms = new org.json.JSONArray()
+                .put(new JSONObject().put("id", "req_a"))
+                .put(new JSONObject().put("id", "req_b"));
+        java.util.List<JSONObject> out = ServerManager.pendingNotifications(perms, "req_a,");
+        assertEquals(1, out.size());
+        assertEquals("req_b", out.get(0).optString("id"));
+    }
+
+    @Test
+    public void pendingNotifications_skipsEmptyAndNoId() throws Exception {
+        JSONArray perms = new org.json.JSONArray()
+                .put(new JSONObject().put("id", "req_a"))
+                .put(new JSONObject());
+        java.util.List<JSONObject> out = ServerManager.pendingNotifications(perms, "req_a,");
+        assertTrue(out.isEmpty());
     }
 }
