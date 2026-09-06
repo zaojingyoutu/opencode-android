@@ -1247,6 +1247,68 @@ public class ServerManager {
         return new File(new File(ctx.getFilesDir(), "home"), ".config/opencode/opencode.jsonc");
     }
 
+    /** 写设备桥接入文件 (供容器内 agent curl 使用):
+     *   - /root/.device-bridge.auth  :  Basic 凭证 "user:pass" (0600), agent 读取拼到 curl
+     *   - /root/.config/opencode/AGENTS.md : 全局规则, 告诉 agent 有哪些设备能力可用 */
+    private void writeBridgeHints(File home) {
+        try {
+            // 认证文件: 与 opencode server 同一随机密码, 只写本机
+            File auth = new File(home, ".device-bridge.auth");
+            String cred = LAN_USER + ":" + lanPassword();
+            if (!auth.exists() || !cred.equals(readSmall(auth))) {
+                try (OutputStream out = new FileOutputStream(auth)) {
+                    out.write(cred.getBytes(StandardCharsets.UTF_8));
+                }
+            }
+            String bridgeUrl = "http://127.0.0.1:" + (BuildConfig.SERVER_PORT + 2);
+
+            // 全局 agent 说明 (opencode 读 ~/.config/opencode/AGENTS.md 作为全局规则)
+            File cfgDir = new File(new File(home, ".config"), "opencode");
+            File rules = new File(cfgDir, "AGENTS.md");
+            if (!rules.exists()) {
+                cfgDir.mkdirs();
+                String text =
+                        "# 手机设备能力 (Device Bridge)\n\n"
+                        + "你可以通过 curl 调用本机设备桥驱动 Android 真机:\n\n"
+                        + "- 地址: " + bridgeUrl + "\n"
+                        + "- 认证: 读取 /root/.device-bridge.auth (格式 user:pass), 用 `curl -u \"$(cat /root/.device-bridge.auth)\"` 访问\n"
+                        + "- 所有接口返回 JSON: {\"ok\":true,...} 或 {\"ok\":false,\"error\":...}\n\n"
+                        + "可用接口:\n"
+                        + "- GET " + bridgeUrl + "/device        设备信息 (型号/电量/网络/屏幕)\n"
+                        + "- POST " + bridgeUrl + "/toast       弹一条短暂提示  body {\"text\":\"...\"}\n"
+                        + "- POST " + bridgeUrl + "/notify      发一条系统通知  body {\"title\":\"..\",\"text\":\"..\"}\n"
+                        + "- POST " + bridgeUrl + "/open        打开链接     body {\"url\":\"https://...\"} (仅 http/https)\n"
+                        + "- POST " + bridgeUrl + "/share       拉起系统分享  body {\"title\":\"..\",\"text\":\"..\"}\n"
+                        + "- POST " + bridgeUrl + "/clipboard   剪贴板       body {\"action\":\"read\"|\"write\",\"text\":\"..\"}\n"
+                        + "- POST " + bridgeUrl + "/speak       文字转语音朗读 body {\"text\":\"...\"}\n\n"
+                        + "示例:\n"
+                        + "```sh\n"
+                        + "curl -u \"$(cat /root/.device-bridge.auth)\" " + bridgeUrl + "/device\n"
+                        + "curl -u \"$(cat /root/.device-bridge.auth)\" -X POST -H 'Content-Type: application/json' \\\n"
+                        + "     -d '{\"text\":\"任务已完成\"}' " + bridgeUrl + "/notify\n"
+                        + "```\n\n"
+                        + "约束: 这是本机 Android 能力, 仅在你需要弹通知/打开链接/分享/读设备时用, 不要滥用;\n"
+                        + "剪贴板读取在 Android 10+ 需 App 前台, 后台读不到是系统限制。\n";
+                try (OutputStream out = new FileOutputStream(rules)) {
+                    out.write(text.getBytes(StandardCharsets.UTF_8));
+                }
+                Log.i(TAG, "bridge hints written: " + auth + " / " + rules);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "writeBridgeHints failed: " + e);
+        }
+    }
+
+    private static String readSmall(File f) {
+        try (FileInputStream in = new FileInputStream(f)) {
+            byte[] buf = new byte[(int) Math.min(512, f.length())];
+            int n = in.read(buf);
+            return n > 0 ? new String(buf, 0, n, StandardCharsets.UTF_8) : "";
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
     /** 查询 server 可用模型列表 (GET /provider), 返回 model id 集合 (provider/model 形式);
      *  失败返回 null */
     public java.util.Set<String> listAvailableModels() {
@@ -1498,6 +1560,9 @@ public class ServerManager {
 
         // 写入默认 opencode 配置 (容器内 XDG_CONFIG_HOME=/root/.config)
         writeDefaultConfig(new File(home, ".config"));
+
+        // 设备桥认证 + agent 使用说明 (见 startProcess 上方注释; 容器内 /root 可见)
+        writeBridgeHints(home);
 
         // 清理上次残留的 proot 进程 (APP 被系统杀时子进程会成孤儿继续占端口)
         killStaleServer(root);

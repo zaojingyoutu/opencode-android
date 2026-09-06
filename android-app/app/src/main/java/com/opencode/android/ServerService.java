@@ -62,6 +62,7 @@ public class ServerService extends Service {
     private PowerManager.WakeLock wakeLock;
     private PowerManager pm;
     private ServerManager server;
+    private DeviceBridge deviceBridge;
     private final Handler main = new Handler(Looper.getMainLooper());
 
     private Thread watchdog;
@@ -163,8 +164,23 @@ public class ServerService extends Service {
             Log.i(TAG, "starting server");
             server.start((ok, msg) -> Log.i(TAG, "start result: ok=" + ok + " " + msg), null);
         }
+        startDeviceBridge();
         startWatchdog();
         return START_STICKY;
+    }
+
+    /** 设备桥 (agent 主动调 Android 能力) 随前台服务生命周期启停 */
+    private void startDeviceBridge() {
+        if (deviceBridge != null) return;
+        deviceBridge = new DeviceBridge(this, server);
+        deviceBridge.start();
+    }
+
+    private void stopDeviceBridge() {
+        if (deviceBridge != null) {
+            deviceBridge.stop();
+            deviceBridge = null;
+        }
     }
 
     private void startWatchdog() {
@@ -534,6 +550,7 @@ public class ServerService extends Service {
 
     private void stopAll() {
         stopWatchdog();
+        stopDeviceBridge();
         server.stop();
         releaseWakeLock();
         stopForeground(true);
@@ -545,6 +562,7 @@ public class ServerService extends Service {
     public void onDestroy() {
         Log.i(TAG, "onDestroy");
         stopWatchdog();
+        stopDeviceBridge();
         releaseWakeLock();
         super.onDestroy();
     }

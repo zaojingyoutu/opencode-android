@@ -187,6 +187,13 @@ public class MainActivity extends Activity {
                     view.evaluateJavascript(
                             lanJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
                 }
+                // 聊天图片渲染: opencode 前端不渲染 tool 附件图, 这里轮询会话 API
+                // 把 image/* 附件以 <img> 插到对应 tool 消息下 (按 data-timeline-part-id 定位)
+                String imgJs = chatImagesJs();
+                if (imgJs != null) {
+                    view.evaluateJavascript(
+                            imgJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
+                }
                 // 深链：审批横幅点进来的目录/会话，切到对应项目并打开会话
                 if (pendingDirectory != null || pendingSessionId != null) {
                     String deepJs = pendingDeepLinkJs();
@@ -705,6 +712,7 @@ public class MainActivity extends Activity {
     }
 
     private String lanInjectJsCache;
+    private String chatImagesJsCache;
 
     /** 读取注入脚本 (assets/inject/lan.js), 缺失时返回 null 静默跳过 */
     private String lanInjectJs() {
@@ -719,6 +727,21 @@ public class MainActivity extends Activity {
             lanInjectJsCache = "";
         }
         return lanInjectJsCache.isEmpty() ? null : lanInjectJsCache;
+    }
+
+    /** 读取注入脚本 (assets/inject/chat-images.js): 把 tool 附件图片渲染进聊天 DOM */
+    private String chatImagesJs() {
+        if (chatImagesJsCache != null) return chatImagesJsCache.isEmpty() ? null : chatImagesJsCache;
+        try (InputStream in = getAssets().open("inject/chat-images.js")) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(16384);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            chatImagesJsCache = bos.toString("UTF-8");
+        } catch (Exception e) {
+            chatImagesJsCache = "";
+        }
+        return chatImagesJsCache.isEmpty() ? null : chatImagesJsCache;
     }
 
     /** 改动 LAN 配置后重启 server, 就绪后自动重载页面 */
