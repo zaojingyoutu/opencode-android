@@ -117,15 +117,19 @@ public class MainActivity extends Activity {
         if (pendingDirectory == null && pendingSessionId == null) return "null";
         String dir = pendingDirectory != null ? pendingDirectory.replace("'", "\\'") : "";
         String sess = pendingSessionId != null ? pendingSessionId.replace("'", "\\'") : "";
-        // 多策略深链：1) localStorage 常见键 2) hash 路由 3) 兜底 reload 带 ?directory=
+        // 深链: 新版 Web UI 用 path 路由 (/server/<b64>/session/<id>), 无 hash。
+        // 用 legacy 格式 /<urlsafe-b64-dir>/session/<id> 跳转 (opencode 仍兼容,
+        // sessionHref/legacySessionHref 并存; b64 规则见 core/util/encode.base64Encode)。
+        // 无会话只有目录时不动当前页 (避免正常启动被误跳空白), 目录靠请求头透传。
         return "(function(){try{"
                 + "var d='" + dir + "';var s='" + sess + "';"
-                + "if(d){try{localStorage.setItem('opencode-directory',d);}catch(e){}"
-                + "try{localStorage.setItem('opencode:directory',d);}catch(e){}"
-                + "try{localStorage.setItem('directory',d);}catch(e){}"
-                + "try{sessionStorage.setItem('opencode-directory',d);}catch(e){}}"
-                + "if(s){location.hash='#/session/'+s;}"
-                + "if(d&&!s){var u=new URL(location.href);u.searchParams.set('directory',d);location.href=u.toString();}"
+                + "if(!s)return;"
+                + "if(d){"
+                + "var b=btoa(unescape(encodeURIComponent(d)))"
+                + ".replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=/g,'');"
+                + "var target='/'+b+'/session/'+encodeURIComponent(s);"
+                + "if(location.pathname!==target)location.href=target;"
+                + "}"
                 + "}catch(e){}})()";
     }
 

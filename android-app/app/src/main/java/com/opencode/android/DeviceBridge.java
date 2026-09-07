@@ -279,7 +279,9 @@ public class DeviceBridge {
                     .setAutoCancel(true)
                     .setPriority(Notification.PRIORITY_HIGH);
             NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
-            nm.notify(NOTIF_ID, b.build());
+            Notification n = b.build();
+            n.flags |= Notification.FLAG_ONLY_ALERT_ONCE;
+            nm.notify(NOTIF_ID, n);
         } catch (Exception e) {
             Log.w(TAG, "bridge notify failed", e);
         }

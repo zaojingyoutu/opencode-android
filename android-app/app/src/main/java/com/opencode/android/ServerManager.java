@@ -579,10 +579,11 @@ public class ServerManager {
         return out;
     }
 
-    /** SSE 事件分类: "permission" (permission.asked) / "message" (message 更新) / "" */
+    /** SSE 事件分类: "permission" / "question" / "message" / "" */
     public static String sseEventKind(String json) {
         if (json == null) return "";
         if (json.contains("permission.asked")) return "permission";
+        if (json.contains("question.asked")) return "question";
         if (json.contains("message.updated") || json.contains("message.part.updated")) return "message";
         return "";
     }
@@ -594,6 +595,40 @@ public class ServerManager {
         org.json.JSONObject p = req.optJSONObject("properties");
         if (p == null || !p.has("id")) p = req;
         return p.optString("id", "").isEmpty() ? null : p;
+    }
+
+    /** SSE question 事件 → 请求对象 (结构与 permission 同形); 无 id 返回 null */
+    public static org.json.JSONObject sseQuestionPayload(String json)
+            throws org.json.JSONException {
+        return ssePermissionPayload(json);
+    }
+
+    /** 待回答问题 → 通知文案; 取首个问题的 header/question, 选项数附注 */
+    public static PermissionNotice questionNotice(org.json.JSONObject req, String sessionTitle) {
+        if (req == null) return new PermissionNotice("", "OpenCode", "AI 请你做个选择");
+        String reqId = req.optString("id", "");
+        String title = (sessionTitle == null || sessionTitle.isEmpty()) ? "OpenCode" : sessionTitle;
+        String header = "";
+        String question = "";
+        int optCount = 0;
+        try {
+            org.json.JSONArray qs = req.optJSONArray("questions");
+            if (qs != null && qs.length() > 0) {
+                org.json.JSONObject q0 = qs.optJSONObject(0);
+                if (q0 != null) {
+                    header = q0.optString("header", "");
+                    question = q0.optString("question", "");
+                    org.json.JSONArray opts = q0.optJSONArray("options");
+                    if (opts != null) optCount = opts.length();
+                    if (qs.length() > 1) header = header + " (等" + qs.length() + "问)";
+                }
+            }
+        } catch (Exception ignored) {}
+        String detail = !header.isEmpty() ? header : question;
+        if (detail.length() > 60) detail = detail.substring(0, 60) + "…";
+        String text = detail.isEmpty() ? "AI 请你做个选择"
+                : "AI 提问: " + detail + (optCount > 0 ? " (" + optCount + "选)" : "");
+        return new PermissionNotice(reqId, title, text);
     }
 
     /** 查询待批准的权限请求 (GET /permission, 含 request id 供通知按钮直接回复),
@@ -636,6 +671,53 @@ public class ServerManager {
             } catch (Exception e) {
                 if (!anySuccess) {
                     Log.w(TAG, "list pending permissions failed: " + e);
+                    return null;
+                }
+            }
+        } else {
+            anySuccess = true;
+        }
+        return merged;
+    }
+
+    /** 查询待回答的问题 (GET /question), 多目录聚合; 失败返回 null。
+     *  <b>子线程调用</b>。question 与 permission 同为"等用户才继续"的阻塞点,
+     *  后台必须同样弹系统通知, 否则任务静默卡死 */
+    public org.json.JSONArray listPendingQuestions() {
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        org.json.JSONArray merged = new org.json.JSONArray();
+        boolean anySuccess = false;
+        for (String dir : workspaceDirectories()) {
+            try {
+                String url = serverUrl() + "/question?directory="
+                        + java.net.URLEncoder.encode(dir, "UTF-8");
+                org.json.JSONArray arr = new org.json.JSONArray(httpGet(url));
+                anySuccess = true;
+                for (int i = 0; i < arr.length(); i++) {
+                    org.json.JSONObject obj = arr.optJSONObject(i);
+                    if (obj == null) continue;
+                    String id = obj.optString("id", "");
+                    if (id.isEmpty() || !seen.add(id)) continue;
+                    try { obj.put("__directory", dir); } catch (Exception ignored) {}
+                    merged.put(obj);
+                }
+            } catch (Exception ignored) {}
+        }
+        if (merged.length() == 0) {
+            try {
+                org.json.JSONArray arr = new org.json.JSONArray(httpGet(serverUrl() + "/question"));
+                anySuccess = true;
+                for (int i = 0; i < arr.length(); i++) {
+                    org.json.JSONObject obj = arr.optJSONObject(i);
+                    if (obj == null) continue;
+                    String id = obj.optString("id", "");
+                    if (id.isEmpty() || !seen.add(id)) continue;
+                    if (!obj.has("__directory")) try { obj.put("__directory", "/workspace"); } catch (Exception ignored) {}
+                    merged.put(obj);
+                }
+            } catch (Exception e) {
+                if (!anySuccess) {
+                    Log.w(TAG, "list pending questions failed: " + e);
                     return null;
                 }
             }

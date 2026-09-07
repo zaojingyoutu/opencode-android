@@ -84,6 +84,10 @@ public class ServerService extends Service {
     private ServerManager.Status lastStatus;
     /** 已提醒过的待批准请求 (会话id+工具摘要), 同一请求只弹一次横幅, 避免每轮看护重复轰炸 */
     private String permissionNotifiedKey = "";
+    /** 已提醒过的待回答问题 id, 同一问题只弹一次 */
+    private String questionNotifiedKey = "";
+    /** 提问通知 id 基准 (与审批 1003+hash 错开, 避免互盖) */
+    private static final int NOTIF_ID_QUESTION = 3000;
     /** 连续探测 server 不响应的次数: opencode 这版权限待批会卡死事件循环, 超阈值自动重启自愈 */
     private int serverDownTicks = 0;
     /** 最近一次轮询是否发现待批请求，供 watchdog 在后台持锁用（避免仅凭 st.pending 漏判多目录/非最新会话的待批） */
@@ -208,6 +212,7 @@ public class ServerService extends Service {
         notifyWatcherRunning = true;
         lastStatus = null;
         permissionNotifiedKey = "";
+        questionNotifiedKey = "";
         hasPendingApproval = false;
         notifyWatcher = new Thread(this::notifyWatcherLoop, "opencode-notify");
         notifyWatcher.setDaemon(true);
@@ -355,6 +360,19 @@ public class ServerService extends Service {
                         notifyPermissionFromEvent(p);
                     }
                 }
+            } else if ("question".equals(kind)) {
+                // AI 提问等用户选选项: 同审批一样阻塞, 必须弹系统通知 (后台靠它唤醒用户)
+                org.json.JSONObject q = ServerManager.sseQuestionPayload(effectiveJson);
+                if (q != null) {
+                    if (eventDirectory != null && !q.has("__directory")) {
+                        try { q.put("__directory", eventDirectory); } catch (Exception ignored) {}
+                    }
+                    String id = q.optString("id", "");
+                    if (!questionNotifiedKey.contains(id + ",")) {
+                        questionNotifiedKey += id + ",";
+                        notifyQuestionNeeded(q);
+                    }
+                }
             } else if ("message".equals(kind)) {
                 long now = android.os.SystemClock.elapsedRealtime();
                 if (now - lastSseCheckMs > 2000) {
@@ -384,6 +402,10 @@ public class ServerService extends Service {
             if (++serverDownTicks >= 6) {
                 Log.w(TAG, "server unresponsive " + serverDownTicks + " ticks, restarting");
                 serverDownTicks = 0;
+                // 重启会清空 server 内存里的待批/待问, 旧横幅已无对应请求:
+                // 立即全撤, 否则"已处理还挂着" (且点按钮必回"可能已处理")
+                clearPermissionReminder();
+                clearQuestionReminder();
                 server.stop();
                 if (!server.isRunning() && !server.isStarting()) {
                     server.start((ok, msg) -> Log.i(TAG, "server restarted ok=" + ok), null);
@@ -402,17 +424,32 @@ public class ServerService extends Service {
         // 新请求会被旧请求盖住, 横幅永远显示第一条 → 表现为"新目录的审批没通知"。
         // 现在按 id 逐条判断, 任何会话/目录的每个待批准请求都会弹横幅。
         org.json.JSONArray perms = server.listPendingPermissions();
-        if (perms != null) {
-            hasPendingApproval = perms.length() > 0;
-            if (hasPendingApproval) {
+        org.json.JSONArray quests = server.listPendingQuestions();
+        if (perms != null || quests != null) {
+            // 审批与提问同为"等用户才继续"的阻塞点, 任一存在都持锁 (防 Doze 漏通知)
+            hasPendingApproval = (perms != null && perms.length() > 0)
+                    || (quests != null && quests.length() > 0);
+            if (perms != null && perms.length() > 0) {
                 for (org.json.JSONObject req : ServerManager.pendingNotifications(perms, permissionNotifiedKey)) {
                     permissionNotifiedKey += req.optString("id", "") + ",";
                     notifyPermissionFromEvent(req);
                 }
-            } else if (st.sessionUpdated > 0) {
-                // 只在确认无待批准请求时才撤提醒; perms==null 是拉取失败(server 忙/挂),
-                // 不能撤 — 否则通知会闪一下就被清掉
+            } else if (perms != null
+                    && (quests == null || quests.length() == 0)) {
+                // perms==[] 即 server 亲口确认无待批, 直接撤横幅, 不再被 status() 成败卡住
+                // (之前要求 sessionUpdated>0, status 拉取失败时横幅永久残留);
+                // perms==null 才是拉取失败 (server 忙/挂), 不能撤 — 否则通知会闪一下就被清掉
                 clearPermissionReminder();
+            }
+            if (quests != null) {
+                if (quests.length() > 0) {
+                    for (org.json.JSONObject req : ServerManager.pendingNotifications(quests, questionNotifiedKey)) {
+                        questionNotifiedKey += req.optString("id", "") + ",";
+                        notifyQuestionNeeded(req);
+                    }
+                } else {
+                    clearQuestionReminder();
+                }
             }
         }
 
@@ -664,7 +701,9 @@ public class ServerService extends Service {
                     .setTicker(text)
                     .setPriority(Notification.PRIORITY_HIGH);
             NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-            nm.notify(NOTIF_ID_TASK, b.build());
+            Notification done = b.build();
+            done.flags |= Notification.FLAG_ONLY_ALERT_ONCE;
+            nm.notify(NOTIF_ID_TASK, done);
             Log.i(TAG, "finish notice posted (error=" + st.error + ", session=" + st.sessionTitle + ")");
         } catch (Exception e) {
             Log.w(TAG, "notify failed", e);
@@ -691,7 +730,23 @@ public class ServerService extends Service {
                 Log.w(TAG, "perm reply threw: " + e);
                 ok = false;
             }
-            final String toast = ok ? label + "该操作" : "操作失败 (可能已处理)";
+            // server 挂死时回包必然超时, 此时说"可能已处理"是误导:
+            // 区分"服务无响应 (稍后重试, 横幅保留)"和"请求已不在 (已处理, 横幅由轮询清理)"
+            boolean down = false;
+            try {
+                down = !server.isHealthy();
+            } catch (Exception ignored) {}
+            final String toast = ok ? label + "该操作"
+                    : (down ? "服务无响应, 稍后重试" : "操作失败 (可能已处理)");
+            // 成功立即撤掉本条横幅 (不等 10s 轮询的 clear, 否则"已处理还挂着");
+            // 失败则保留横幅 (key 未动, 下轮不会重弹打扰, 用户仍可重试)
+            if (ok) {
+                try {
+                    NotificationManager nm2 =
+                            (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                    nm2.cancel(permissionNotifId(id));
+                } catch (Exception ignored) {}
+            }
             // Toast 必须在主线程 (后台线程调用在部分 ROM 会抛异常)
             main.post(() -> android.widget.Toast.makeText(this, toast,
                     android.widget.Toast.LENGTH_SHORT).show());
@@ -741,7 +796,11 @@ public class ServerService extends Service {
              .addAction(0, "拒绝", permReplyPi(reqId, "reject", 6, reqId, directory));
         }
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-        nm.notify(permissionNotifId(reqId), b.build());
+        // 同一请求重复 post 只静默更新, 不再响铃/震动/弹横幅:
+        // 去重 key 在极端路径 (看护重启等) 被重置时, 兜底不打扰用户
+        Notification n = b.build();
+        n.flags |= Notification.FLAG_ONLY_ALERT_ONCE;
+        nm.notify(permissionNotifId(reqId), n);
     }
 
     /** 请求 id → 通知栏 id: 基准 + 哈希, 保证同一请求稳定占位, 不同请求互不覆盖 */
@@ -758,13 +817,20 @@ public class ServerService extends Service {
         return permReplyPi(requestId, reply, baseCode, reqId, null);
     }
 
+    /** 按钮 PendingIntent 的 requestCode 分配器: 全局单调唯一。
+     *  之前用 baseCode+(hash&0x3ff) 只有 1024 个桶, 不同请求撞车后 FLAG_UPDATE_CURRENT
+     *  会互相覆盖 extras → 点 A 的批准实际批了 B。改唯一码后彻底杜绝串号
+     *  (PendingIntent 会累积几个, 量极小无妨; 同一请求重发本就该独立占位) */
+    private static final java.util.concurrent.atomic.AtomicInteger permPiSeq =
+            new java.util.concurrent.atomic.AtomicInteger(100000);
+
     private PendingIntent permReplyPi(String requestId, String reply, int baseCode, String reqId, String directory) {
         Intent i = new Intent(this, ServerService.class)
                 .setAction(ACTION_PERM_REPLY)
                 .putExtra("perm_id", requestId)
                 .putExtra("perm_reply", reply);
         if (directory != null && !directory.isEmpty()) i.putExtra("perm_dir", directory);
-        int code = baseCode + (reqId == null ? 0 : (reqId.hashCode() & 0x3ff));
+        int code = permPiSeq.getAndIncrement();
         return PendingIntent.getService(this, code, i,
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
     }
@@ -802,6 +868,70 @@ public class ServerService extends Service {
             NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
             // 待批准通知可能并存多条 (不同请求 id → 不同通知 id), 全清
             for (int i = 0; i < 1024; i++) nm.cancel(NOTIF_ID_PERMISSION + i);
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** 发"AI 提问等你选"横幅通知 (SSE question.asked / 10s 轮询 GET /question 共用入口)。
+     *  提问是多选项, 通知栏按钮答不了 → 点横幅直达对应目录/会话, 进 App 里选。
+     *  去重在调用方按请求 id 逐条做 (questionNotifiedKey) */
+    private void notifyQuestionNeeded(org.json.JSONObject req) {
+        try {
+            if (Build.VERSION.SDK_INT >= 33 &&
+                    checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                return;
+            }
+            ServerManager.PermissionNotice n = ServerManager.questionNotice(req, lastSessionTitle);
+            String dir = req.optString("__directory", "");
+            if (dir.isEmpty()) dir = req.optString("directory", "");
+            String sess = req.optString("sessionID", "");
+            if (sess.isEmpty()) sess = req.optString("sessionId", "");
+            Intent open = new Intent(this, MainActivity.class);
+            open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            if (!dir.isEmpty()) open.putExtra("opencode_directory", dir);
+            if (!sess.isEmpty()) open.putExtra("opencode_session", sess);
+            if (!n.id.isEmpty()) open.putExtra("opencode_perm_id", n.id);
+            PendingIntent pi = PendingIntent.getActivity(this,
+                    7 + (n.id.isEmpty() ? 0 : (n.id.hashCode() & 0x3ff)), open,
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                    ? new Notification.Builder(this, PERMISSION_CHANNEL_ID)
+                    : new Notification.Builder(this);
+            b.setSmallIcon(R.mipmap.ic_launcher)
+                    .setContentTitle("等你选择 · " + n.title)
+                    .setContentText(n.text)
+                    .setStyle(new Notification.BigTextStyle().bigText(n.text + "\n点开进 App 选择"))
+                    .setContentIntent(pi)
+                    .setAutoCancel(true)
+                    .setTicker(n.text)
+                    .setPriority(Notification.PRIORITY_HIGH)
+                    .setLights(0xFFFF0000, 500, 2000);
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            Notification n2 = b.build();
+            n2.flags |= Notification.FLAG_ONLY_ALERT_ONCE;
+            nm.notify(questionNotifId(n.id), n2);
+            Log.i(TAG, "question notice posted (detail=" + n.text + ", req=" + n.id
+                    + (dir.isEmpty() ? "" : " dir=" + dir) + ")");
+        } catch (Exception e) {
+            Log.w(TAG, "question notify failed", e);
+        }
+    }
+
+    /** 请求 id → 提问通知栏 id (与审批 1003+hash 错开) */
+    private static int questionNotifId(String reqId) {
+        return reqId == null || reqId.isEmpty()
+                ? NOTIF_ID_QUESTION
+                : NOTIF_ID_QUESTION + (reqId.hashCode() & 0x3ff);
+    }
+
+    /** 待回答问题已处理: 撤掉提醒 */
+    private void clearQuestionReminder() {
+        if (questionNotifiedKey.isEmpty()) return;
+        questionNotifiedKey = "";
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            for (int i = 0; i < 1024; i++) nm.cancel(NOTIF_ID_QUESTION + i);
         } catch (Exception ignored) {
         }
     }

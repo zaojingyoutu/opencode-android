@@ -7,7 +7,8 @@
   var dirCache = {};   // sessionId -> directory
 
   function sessionIdFromUrl() {
-    var m = (location.hash || '').match(/#\/session\/([A-Za-z0-9_-]+)/);
+    // 新版 Web UI 用 path 路由 (/server/<b64>/session/<id> 或 /<b64dir>/session/<id>), 无 hash
+    var m = (location.pathname || '').match(/\/session\/([A-Za-z0-9_]+)/);
     return m ? m[1] : null;
   }
 
