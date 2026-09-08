@@ -3,15 +3,6 @@
   window.__ocChatImages = 1;
   if (location.origin !== '__SERVER_URL__') return;
 
-  var rendered = {};   // partId -> true, 已插过图的不再重复
-  var dirCache = {};   // sessionId -> directory
-
-  function sessionIdFromUrl() {
-    // 新版 Web UI 用 path 路由 (/server/<b64>/session/<id> 或 /<b64dir>/session/<id>), 无 hash
-    var m = (location.pathname || '').match(/\/session\/([A-Za-z0-9_]+)/);
-    return m ? m[1] : null;
-  }
-
   function api(path) {
     // 同源 fetch, 走 WebView 的 onReceivedHttpAuthRequest 自动带 Basic 认证
     return fetch(path, { credentials: 'same-origin' }).then(function (r) {
@@ -20,77 +11,255 @@
     });
   }
 
-  function sessionDir(sid) {
-    if (dirCache[sid]) return Promise.resolve(dirCache[sid]);
-    return api('/session').then(function (list) {
-      for (var i = 0; i < list.length; i++) {
-        if (list[i].id === sid && list[i].directory) {
-          dirCache[sid] = list[i].directory;
-          return list[i].directory;
-        }
-      }
-      return '';
-    });
+  // ---- 文件类型判定 ----
+  var IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'];
+  var AUDIO_EXT = ['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac'];
+  var VIDEO_EXT = ['mp4', 'webm', 'mov'];
+  var TEXT_EXT = ['txt', 'md', 'markdown', 'json', 'js', 'ts', 'tsx', 'jsx',
+    'py', 'sh', 'log', 'yaml', 'yml', 'xml', 'html', 'css', 'java', 'kt',
+    'c', 'h', 'cpp', 'go', 'rs', 'toml', 'ini', 'cfg', 'conf', 'gradle',
+    'sql', 'lua', 'r', 'properties', 'env'];
+  var ALL_EXT = IMG_EXT.concat(AUDIO_EXT, VIDEO_EXT, TEXT_EXT).join('|');
+
+  function extOf(path) {
+    return (path.split('.').pop() || '').toLowerCase();
   }
 
-  function insertImage(partId, url, label) {
-    if (rendered[partId]) return;
-    var anchor = document.querySelector('[data-timeline-part-id="' + partId + '"]');
-    if (!anchor) return;
-    // 已有图则跳过 (防止重复插入)
-    if (anchor.querySelector('img[data-oc-shot="1"]')) {
-      rendered[partId] = true;
+  function kindOf(path) {
+    var e = extOf(path);
+    if (IMG_EXT.indexOf(e) >= 0) return 'image';
+    if (AUDIO_EXT.indexOf(e) >= 0) return 'audio';
+    if (VIDEO_EXT.indexOf(e) >= 0) return 'video';
+    if (TEXT_EXT.indexOf(e) >= 0) return 'text';
+    return 'other';
+  }
+
+  function mimeOf(path) {
+    var e = extOf(path);
+    if (e === 'png') return 'image/png';
+    if (e === 'jpg' || e === 'jpeg') return 'image/jpeg';
+    if (e === 'gif') return 'image/gif';
+    if (e === 'webp') return 'image/webp';
+    if (e === 'bmp') return 'image/bmp';
+    if (e === 'svg') return 'image/svg+xml';
+    if (e === 'mp3') return 'audio/mpeg';
+    if (e === 'wav') return 'audio/wav';
+    if (e === 'ogg') return 'audio/ogg';
+    if (e === 'm4a') return 'audio/mp4';
+    if (e === 'flac') return 'audio/flac';
+    if (e === 'aac') return 'audio/aac';
+    if (e === 'mp4') return 'video/mp4';
+    if (e === 'webm') return 'video/webm';
+    if (e === 'mov') return 'video/quicktime';
+    return 'application/octet-stream';
+  }
+
+  function baseName(path) {
+    var i = path.lastIndexOf('/');
+    return i >= 0 ? path.slice(i + 1) : path;
+  }
+
+  // ---- 天窗: 点聊天里的文件路径, 按格式渲染弹层 ----
+  var skylight = null;
+
+  function findFilePath(el) {
+    try {
+      // 自己家的浮层不拦截
+      if (el.closest && el.closest('[data-oc-skylight]')) return null;
+      var re = new RegExp('(\\/workspace\\/[^\\s"\'`<\\]>\\]\\)]+?\\.(' + ALL_EXT + '))', 'i');
+      var node = el;
+      for (var d = 0; d < 6 && node && node !== document.body; d++) {
+        if (node.tagName === 'A' && node.getAttribute) {
+          var h = node.getAttribute('href') || '';
+          var m2 = h.match(re);
+          if (m2) return { path: m2[1], kind: kindOf(m2[1]) };
+        }
+        var t = node.textContent || '';
+        // 元素自身文本短才算 (整段消息不算, 只认链接/行内短块)
+        if (t.length < 300) {
+          var m = t.match(re);
+          if (m) return { path: m[1], kind: kindOf(m[1]) };
+        }
+        node = node.parentNode;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function closeSkylight() {
+    try {
+      if (skylight && skylight.parentNode) skylight.parentNode.removeChild(skylight);
+    } catch (e) {}
+    skylight = null;
+  }
+
+  // 项目 UI 风格: 用 --v2-* 主题变量 (深浅色自动跟随), 拿不到时回退浅色值
+  function themeCss() {
+    return 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:100001;'
+      + 'background:rgba(0,0,0,.55);overflow-y:auto;padding:16px 12px;';
+  }
+
+  function openSkylight(path, kind) {
+    try {
+      closeSkylight();
+      skylight = document.createElement('div');
+      skylight.setAttribute('data-oc-skylight', '1');
+      skylight.style.cssText = themeCss();
+      // 卡片
+      var card = document.createElement('div');
+      card.style.cssText = 'max-width:640px;margin:24px auto;overflow:hidden;'
+        + 'background:var(--v2-background-bg-base,#ffffff);'
+        + 'border:1px solid var(--v2-border-border-weak,#e4e4e4);'
+        + 'border-radius:var(--radius-lg,12px);'
+        + 'box-shadow:0 8px 32px rgba(0,0,0,.25);';
+      // 头部: 文件名 + 关闭
+      var bar = document.createElement('div');
+      bar.style.cssText = 'display:flex;justify-content:space-between;align-items:center;'
+        + 'padding:10px 12px;gap:8px;'
+        + 'border-bottom:1px solid var(--v2-border-border-weak,#ececec);';
+      var t = document.createElement('span');
+      var name = baseName(path);
+      t.textContent = name.length > 32 ? '…' + name.slice(-31) : name;
+      t.style.cssText = 'font-size:13px;font-weight:600;'
+        + 'color:var(--v2-text-text-base,#1a1a1a);'
+        + 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      var x = document.createElement('span');
+      x.textContent = '✕';
+      x.style.cssText = 'flex:none;font-size:13px;padding:5px 14px;border-radius:8px;cursor:pointer;'
+        + 'color:var(--v2-text-text-base,#1a1a1a);'
+        + 'background:var(--v2-background-bg-button-neutral,#f0f0f0);';
+      x.addEventListener('click', function (ev) { ev.stopPropagation(); closeSkylight(); });
+      bar.appendChild(t);
+      bar.appendChild(x);
+      card.appendChild(bar);
+      // 内容区
+      var body = document.createElement('div');
+      body.style.cssText = 'padding:12px;min-height:120px;';
+      var loading = document.createElement('div');
+      loading.style.cssText = 'text-align:center;padding:36px 0;'
+        + 'color:var(--v2-text-text-muted,#888);font-size:13px;';
+      loading.textContent = '加载中…';
+      body.appendChild(loading);
+      card.appendChild(body);
+      skylight.appendChild(card);
+      skylight.addEventListener('click', function (ev) {
+        if (ev.target === skylight) closeSkylight();
+      });
+      document.body.appendChild(skylight);
+
+      api('/file/content?path=' + encodeURIComponent(path)).then(function (data) {
+        if (!skylight) return;
+        try { body.removeChild(loading); } catch (e) {}
+        if (!skylight) return;
+        renderBody(body, path, kind, data);
+      }).catch(function () {
+        if (!skylight) return;
+        try { loading.textContent = '加载失败, 请重试'; } catch (e) {}
+      });
+    } catch (e) {}
+  }
+
+  function failBody(body, msg) {
+    var err = document.createElement('div');
+    err.style.cssText = 'text-align:center;padding:36px 12px;font-size:13px;color:#e5484d;';
+    err.textContent = msg;
+    body.appendChild(err);
+  }
+
+  function renderBody(body, path, kind, data) {
+    // 图片: data URL 直显
+    if (kind === 'image') {
+      if (!data || data.type !== 'binary' || !data.content) {
+        failBody(body, '图片加载失败 (文件可能不存在)');
+        return;
+      }
+      if (data.content.length * 0.75 > 5 * 1024 * 1024) {
+        failBody(body, '图片过大 (超过 5MB), 请用看图工具打开');
+        return;
+      }
+      var im = document.createElement('img');
+      im.src = 'data:' + mimeOf(path) + ';base64,' + data.content;
+      im.alt = baseName(path);
+      im.style.cssText = 'width:100%;border-radius:8px;background:#fff;display:block;';
+      body.appendChild(im);
       return;
     }
-    var wrap = document.createElement('div');
-    wrap.setAttribute('data-oc-shot-wrap', '1');
-    wrap.style.cssText = 'margin:8px 0;max-width:100%;';
-    var img = document.createElement('img');
-    img.setAttribute('data-oc-shot', '1');
-    img.src = url;
-    img.alt = label || 'screenshot';
-    img.style.cssText = 'max-width:100%;border-radius:8px;border:1px solid rgba(128,128,128,.35);cursor:zoom-in;';
-    img.addEventListener('click', function () {
-      window.open(url, '_blank');
-    });
-    wrap.appendChild(img);
-    anchor.appendChild(wrap);
-    rendered[partId] = true;
-  }
-
-  function scanOnce() {
-    var sid = sessionIdFromUrl();
-    if (!sid) return Promise.resolve();
-    return sessionDir(sid).then(function (dir) {
-      var url = '/session/' + encodeURIComponent(sid) + '/message';
-      if (dir) url += '?directory=' + encodeURIComponent(dir);
-      return api(url);
-    }).then(function (msgs) {
-      if (!msgs || !msgs.length) return;
-      for (var i = 0; i < msgs.length; i++) {
-        var parts = msgs[i].parts || [];
-        for (var j = 0; j < parts.length; j++) {
-          var p = parts[j];
-          if (!p || p.type !== 'tool' || !p.id) continue;
-          var atts = (p.state && p.state.attachments) || [];
-          for (var k = 0; k < atts.length; k++) {
-            var a = atts[k];
-            if (!a || !a.mime || a.mime.indexOf('image/') !== 0 || !a.url) continue;
-            // data URL 或 http(s) 才允许, 防 file:// 等危险 scheme
-            if (a.url.indexOf('data:image/') !== 0 && a.url.indexOf('http://') !== 0 && a.url.indexOf('https://') !== 0) continue;
-            insertImage(p.id, a.url, a.filename || 'screenshot');
-          }
+    // 文本/代码: 等宽 + 自动换行 + 截断保护
+    if (kind === 'text') {
+      var text = (data && data.type === 'text' && typeof data.content === 'string') ? data.content : null;
+      if (text === null) {
+        // 有些文本被当成 binary 回的, 尝试 base64 解
+        if (data && data.type === 'binary' && data.content) {
+          try {
+            var bin = atob(data.content);
+            var bytes = new Uint8Array(bin.length);
+            for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+          } catch (e) { text = null; }
         }
       }
-    }).catch(function () { /* 静默: 会话切换/网络抖动时下轮重试 */ });
+      if (text === null) {
+        failBody(body, '文本读取失败');
+        return;
+      }
+      var MAX = 120 * 1024;
+      var cut = false;
+      if (text.length > MAX) {
+        text = text.slice(0, MAX);
+        cut = true;
+      }
+      var pre = document.createElement('pre');
+      pre.style.cssText = 'margin:0;padding:10px;border-radius:8px;font-size:12px;line-height:1.6;'
+        + 'white-space:pre-wrap;word-break:break-word;max-height:60vh;overflow:auto;'
+        + 'font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;'
+        + 'color:var(--v2-text-text-base,#1a1a1a);'
+        + 'background:var(--v2-background-bg-deep,#f5f5f5);';
+      pre.textContent = text + (cut ? '\n\n… (过长已截断, 共 ' + text.length + ' 字内)' : '');
+      body.appendChild(pre);
+      return;
+    }
+    // 音频 / 视频: data URL 直播 (限 8MB)
+    if (kind === 'audio' || kind === 'video') {
+      if (!data || data.type !== 'binary' || !data.content) {
+        failBody(body, '媒体加载失败 (文件可能不存在)');
+        return;
+      }
+      if (data.content.length * 0.75 > 8 * 1024 * 1024) {
+        failBody(body, '文件过大 (超过 8MB), 请用系统播放器打开');
+        return;
+      }
+      var src = 'data:' + mimeOf(path) + ';base64,' + data.content;
+      var el = document.createElement(kind);
+      el.src = src;
+      el.controls = true;
+      el.preload = 'metadata';
+      el.style.cssText = kind === 'video'
+        ? 'width:100%;border-radius:8px;background:#000;'
+        : 'width:100%;margin-top:12px;';
+      body.appendChild(el);
+      return;
+    }
+    failBody(body, '暂不支持预览此格式 (' + extOf(path) + ')');
+  }
+
+  function armSkylight() {
+    try {
+      if (window.__ocSkylight) return;
+      window.__ocSkylight = 1;
+      document.addEventListener('click', function (ev) {
+        try {
+          var f = findFilePath(ev.target);
+          if (!f) return;
+          ev.preventDefault();
+          if (ev.stopPropagation) ev.stopPropagation();
+          openSkylight(f.path, f.kind);
+        } catch (e) {}
+      }, true);
+    } catch (e) {}
   }
 
   function start() {
-    scanOnce();
-    setInterval(scanOnce, 2500);
-    // hash 变化 (切会话) 即扫一次, 不必等轮询
-    window.addEventListener('hashchange', function () { scanOnce(); });
-    window.__ocChatImagesScan = scanOnce;
+    armSkylight();
   }
 
   if (document.body) start();
