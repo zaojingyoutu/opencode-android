@@ -11,14 +11,13 @@
     });
   }
 
-  // ---- 文件类型判定 ----
-  var IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'];
-  var AUDIO_EXT = ['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac'];
-  var VIDEO_EXT = ['mp4', 'webm', 'mov'];
-  var TEXT_EXT = ['txt', 'md', 'markdown', 'json', 'js', 'ts', 'tsx', 'jsx',
-    'py', 'sh', 'log', 'yaml', 'yml', 'xml', 'html', 'css', 'java', 'kt',
-    'c', 'h', 'cpp', 'go', 'rs', 'toml', 'ini', 'cfg', 'conf', 'gradle',
-    'sql', 'lua', 'r', 'properties', 'env'];
+  // ---- 文件类型判定 (只收录常见格式, 非常见格式不拦截点击) ----
+  var IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
+  var AUDIO_EXT = ['mp3', 'wav', 'ogg', 'm4a'];
+  var VIDEO_EXT = ['mp4', 'webm'];
+  var TEXT_EXT = ['txt', 'md', 'json', 'js', 'ts', 'jsx', 'tsx',
+    'py', 'sh', 'log', 'yaml', 'yml', 'xml', 'html', 'css', 'java',
+    'c', 'h', 'cpp', 'go', 'sql'];
   var ALL_EXT = IMG_EXT.concat(AUDIO_EXT, VIDEO_EXT, TEXT_EXT).join('|');
 
   function extOf(path) {
@@ -40,17 +39,12 @@
     if (e === 'jpg' || e === 'jpeg') return 'image/jpeg';
     if (e === 'gif') return 'image/gif';
     if (e === 'webp') return 'image/webp';
-    if (e === 'bmp') return 'image/bmp';
-    if (e === 'svg') return 'image/svg+xml';
     if (e === 'mp3') return 'audio/mpeg';
     if (e === 'wav') return 'audio/wav';
     if (e === 'ogg') return 'audio/ogg';
     if (e === 'm4a') return 'audio/mp4';
-    if (e === 'flac') return 'audio/flac';
-    if (e === 'aac') return 'audio/aac';
     if (e === 'mp4') return 'video/mp4';
     if (e === 'webm') return 'video/webm';
-    if (e === 'mov') return 'video/quicktime';
     return 'application/octet-stream';
   }
 
@@ -64,17 +58,24 @@
 
   function findFilePath(el) {
     try {
+      if (!el || !el.closest) return null;
       // 自己家的浮层不拦截
-      if (el.closest && el.closest('[data-oc-skylight]')) return null;
+      if (el.closest('[data-oc-skylight]')) return null;
+      // 交互控件一律放行: 审批按钮/开关/输入框等 (之前误拦导致审批点不了)
+      if (el.closest('button,input,select,textarea,[role="button"],[role="switch"],'
+          + '[role="checkbox"],[role="radio"],[role="combobox"],[contenteditable="true"]')) return null;
       // 任意绝对路径 (不限 /workspace): /file/content 配合 directory=/ 可读全盘,
       // 本 WebView 只加载本机 opencode, 点的又是 agent 刚输出的路径, 无越权问题
       var re = new RegExp('(\\/[^\\s"\'`<\\]>\\]\\)]+?\\.(' + ALL_EXT + '))', 'i');
       var node = el;
-      for (var d = 0; d < 6 && node && node !== document.body; d++) {
+      // 只往上找 3 层 (之前 6 层会误伤祖先消息块里的路径文本)
+      for (var d = 0; d < 3 && node && node !== document.body; d++) {
         if (node.tagName === 'A' && node.getAttribute) {
           var h = node.getAttribute('href') || '';
           var m2 = h.match(re);
           if (m2) return { path: m2[1], kind: kindOf(m2[1]) };
+          // 占位链接 (空/#) 继续往上找; 真链接交还给页面自己处理
+          if (h && h !== '#' && h.indexOf('javascript:') !== 0) return null;
         }
         var t = node.textContent || '';
         // 元素自身文本短才算 (整段消息不算, 只认链接/行内短块)
@@ -154,7 +155,11 @@
         if (!skylight) return;
         try { body.removeChild(loading); } catch (e) {}
         if (!skylight) return;
-        renderBody(body, path, kind, data);
+        try {
+          renderBody(body, path, kind, data);
+        } catch (e) {
+          failBody(body, '渲染失败: ' + ((e && e.message) || e));
+        }
       }).catch(function () {
         if (!skylight) return;
         try { loading.textContent = '加载失败, 请重试'; } catch (e) {}
@@ -203,6 +208,15 @@
       }
       if (text === null) {
         failBody(body, '文本读取失败');
+        return;
+      }
+      if (!text.length) {
+        // 空文件: 明确提示, 否则空白 <pre> 看起来像加载失败
+        var eb = document.createElement('div');
+        eb.style.cssText = 'text-align:center;padding:36px 12px;font-size:13px;'
+          + 'color:var(--v2-text-text-muted,#888);';
+        eb.textContent = '文件为空 (0 字节): ' + baseName(path);
+        body.appendChild(eb);
         return;
       }
       var MAX = 120 * 1024;
