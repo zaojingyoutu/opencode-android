@@ -66,7 +66,9 @@
     try {
       // 自己家的浮层不拦截
       if (el.closest && el.closest('[data-oc-skylight]')) return null;
-      var re = new RegExp('(\\/workspace\\/[^\\s"\'`<\\]>\\]\\)]+?\\.(' + ALL_EXT + '))', 'i');
+      // 任意绝对路径 (不限 /workspace): /file/content 配合 directory=/ 可读全盘,
+      // 本 WebView 只加载本机 opencode, 点的又是 agent 刚输出的路径, 无越权问题
+      var re = new RegExp('(\\/[^\\s"\'`<\\]>\\]\\)]+?\\.(' + ALL_EXT + '))', 'i');
       var node = el;
       for (var d = 0; d < 6 && node && node !== document.body; d++) {
         if (node.tagName === 'A' && node.getAttribute) {
@@ -147,7 +149,8 @@
       });
       document.body.appendChild(skylight);
 
-      api('/file/content?path=' + encodeURIComponent(path)).then(function (data) {
+      // directory=/ : workspace 内外文件都能读 (默认只认项目目录, /etc 等会 500)
+      api('/file/content?path=' + encodeURIComponent(path) + '&directory=' + encodeURIComponent('/')).then(function (data) {
         if (!skylight) return;
         try { body.removeChild(loading); } catch (e) {}
         if (!skylight) return;
