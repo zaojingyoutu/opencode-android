@@ -61,9 +61,12 @@
       if (!el || !el.closest) return null;
       // 自己家的浮层不拦截
       if (el.closest('[data-oc-skylight]')) return null;
-      // 交互控件一律放行: 审批按钮/开关/输入框等 (之前误拦导致审批点不了)
-      if (el.closest('button,input,select,textarea,[role="button"],[role="switch"],'
-          + '[role="checkbox"],[role="radio"],[role="combobox"],[contenteditable="true"]')) return null;
+      // 交互控件一律放行: 审批按钮/开关/输入框/菜单项等 (之前误拦导致审批点不了;
+      // 上下文菜单多为 portaled 的 div/li, 不在此列会被误伤)
+      if (el.closest('button,input,select,textarea,li,[role="button"],[role="switch"],'
+          + '[role="checkbox"],[role="radio"],[role="combobox"],[role="menu"],'
+          + '[role="menuitem"],[role="menuitemradio"],[role="option"],[role="dialog"],'
+          + '[contenteditable="true"]')) return null;
       // 任意绝对路径 (不限 /workspace): /file/content 配合 directory=/ 可读全盘,
       // 本 WebView 只加载本机 opencode, 点的又是 agent 刚输出的路径, 无越权问题
       var re = new RegExp('(\\/[^\\s"\'`<\\]>\\]\\)]+?\\.(' + ALL_EXT + '))', 'i');

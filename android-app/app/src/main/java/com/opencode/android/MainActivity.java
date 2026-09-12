@@ -301,6 +301,51 @@ public class MainActivity extends Activity {
                     progressBar.setVisibility(View.VISIBLE);
                 }
             }
+            // WebView 默认不实现 JS 对话框: alert 直接丢弃, confirm/prompt 恒返回取消值。
+            // 上游任何依赖原生弹窗的流程 (删除确认等) 在此之前都是"点了没反应"。
+            @Override
+            public boolean onJsAlert(WebView view, String url, String message,
+                    final android.webkit.JsResult result) {
+                new AlertDialog.Builder(MainActivity.this)
+                        .setMessage(message)
+                        .setPositiveButton(android.R.string.ok,
+                                (d, w) -> result.confirm())
+                        .setOnCancelListener(d -> result.confirm())
+                        .setCancelable(true)
+                        .show();
+                return true;
+            }
+            @Override
+            public boolean onJsConfirm(WebView view, String url, String message,
+                    final android.webkit.JsResult result) {
+                new AlertDialog.Builder(MainActivity.this)
+                        .setMessage(message)
+                        .setPositiveButton(android.R.string.ok,
+                                (d, w) -> result.confirm())
+                        .setNegativeButton(android.R.string.cancel,
+                                (d, w) -> result.cancel())
+                        .setOnCancelListener(d -> result.cancel())
+                        .setCancelable(true)
+                        .show();
+                return true;
+            }
+            @Override
+            public boolean onJsPrompt(WebView view, String url, String message, String defaultValue,
+                    final android.webkit.JsPromptResult result) {
+                final android.widget.EditText input = new android.widget.EditText(MainActivity.this);
+                input.setText(defaultValue == null ? "" : defaultValue);
+                new AlertDialog.Builder(MainActivity.this)
+                        .setMessage(message)
+                        .setView(input)
+                        .setPositiveButton(android.R.string.ok,
+                                (d, w) -> result.confirm(input.getText().toString()))
+                        .setNegativeButton(android.R.string.cancel,
+                                (d, w) -> result.cancel())
+                        .setOnCancelListener(d -> result.cancel())
+                        .setCancelable(true)
+                        .show();
+                return true;
+            }
             @Override
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> cb,
                     FileChooserParams params) {
@@ -858,33 +903,47 @@ public class MainActivity extends Activity {
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed() || webView == null) return;
                 if (!st.pending) {
-                    // 没有未完成消息: 离开期间有已完成的新结果才需要刷新, 否则页面本来就是最新的
+                    // 没有未完成消息: 离开期间有新结果时先轻唤醒 (visibility/focus 让页面
+                    // 自己重连拉取), 5s 后页面仍无变化才整页 reload。
+                    // 直接 reload 会整页重建 SPA, 会话 tab 状态重建时已关闭的 tab 可能被恢复,
+                    // 表现为"后台回来已关闭的 tab 又打开了"。
                     if (st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall) {
-                        webView.reload();
+                        nudgePageAndCheckIfFrozen(() -> {
+                            if (isFinishing() || isDestroyed() || webView == null) return;
+                            webView.reload();
+                        });
                     }
                     return;
                 }
                 // 有未完成消息: 先唤醒页面自身的重连逻辑
-                webView.evaluateJavascript(
-                        "(function(){try{" +
-                        "window.__ocBodyLen=document.body?document.body.innerText.length:-1;" +
-                        "document.dispatchEvent(new Event('visibilitychange'));" +
-                        "window.dispatchEvent(new Event('focus'));" +
-                        "}catch(e){}})()", null);
-                new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                    if (isFinishing() || isDestroyed() || webView == null) return;
-                    webView.evaluateJavascript(
-                            "(function(){try{" +
-                            "return window.__ocBodyLen===document.body.innerText.length" +
-                            "}catch(e){return false}})()",
-                            v -> {
-                                if (isFinishing() || isDestroyed() || webView == null) return;
-                                if (!"true".equals(v)) return; // 页面在自己恢复/流式输出中, 不打扰
-                                resolveStalledPending(st);
-                            });
-                }, 5000);
+                nudgePageAndCheckIfFrozen(() -> resolveStalledPending(st));
             });
         }, "opencode-resync").start();
+    }
+
+    /** 轻唤醒页面 (派发 visibilitychange/focus 让页面自己重连 SSE/拉取),
+     *  5s 后检查 body 是否有变化; 无变化视为冻结, 回调 onFrozen (通常整页 reload)。
+     *  比直接 reload 温和: 不重建 SPA, 不会触发 tab 状态重建。 */
+    private void nudgePageAndCheckIfFrozen(final Runnable onFrozen) {
+        if (webView == null) return;
+        webView.evaluateJavascript(
+                "(function(){try{" +
+                "window.__ocBodyLen=document.body?document.body.innerText.length:-1;" +
+                "document.dispatchEvent(new Event('visibilitychange'));" +
+                "window.dispatchEvent(new Event('focus'));" +
+                "}catch(e){}})()", null);
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (isFinishing() || isDestroyed() || webView == null) return;
+            webView.evaluateJavascript(
+                    "(function(){try{" +
+                    "return window.__ocBodyLen===document.body.innerText.length" +
+                    "}catch(e){return false}})()",
+                    v -> {
+                        if (isFinishing() || isDestroyed() || webView == null) return;
+                        if (!"true".equals(v)) return; // 页面在自己恢复/流式输出中, 不打扰
+                        onFrozen.run();
+                    });
+        }, 5000);
     }
 
     /** 页面卡死在有未完成消息的状态: 按 server 侧状态决定 reload 还是 abort+reload */
