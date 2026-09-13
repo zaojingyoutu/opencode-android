@@ -53,6 +53,34 @@
     return i >= 0 ? path.slice(i + 1) : path;
   }
 
+  // blob URL 管理: data URL 要求整个 base64 串常驻 JS 堆 + DOM 属性 + 媒体解码,
+  // 大文件吃两三倍内存; blob 只留一份二进制, 音视频照样能 seek。关浮层时统一 revoke。
+  var blobUrls = [];
+  function trackBlobUrl(u) { blobUrls.push(u); return u; }
+  function revokeBlobUrls() {
+    try {
+      for (var i = 0; i < blobUrls.length; i++) {
+        try { URL.revokeObjectURL(blobUrls[i]); } catch (e) {}
+      }
+    } catch (e) {}
+    blobUrls = [];
+  }
+  function base64ToBlob(b64, mime) {
+    // 分块解码 (8192 能被 4 整除, base64 边界安全), 避免超长串一次性压爆调用栈
+    var CH = 8192, out = [], i, j;
+    for (i = 0; i < b64.length; i += CH) {
+      var bin = atob(b64.slice(i, i + CH)), n = bin.length;
+      var arr = new Uint8Array(n);
+      for (j = 0; j < n; j++) arr[j] = bin.charCodeAt(j);
+      out.push(arr);
+    }
+    return new Blob(out, { type: mime });
+  }
+  function blobUrlFor(mime, b64) {
+    try { return trackBlobUrl(URL.createObjectURL(base64ToBlob(b64, mime))); }
+    catch (e) { return null; }
+  }
+
   // ---- 天窗: 点聊天里的文件路径, 按格式渲染弹层 ----
   var skylight = null;
 
@@ -97,6 +125,7 @@
       if (skylight && skylight.parentNode) skylight.parentNode.removeChild(skylight);
     } catch (e) {}
     skylight = null;
+    revokeBlobUrls();
   }
 
   // 项目 UI 风格: 用 --v2-* 主题变量 (深浅色自动跟随), 拿不到时回退浅色值
@@ -178,7 +207,7 @@
   }
 
   function renderBody(body, path, kind, data) {
-    // 图片: data URL 直显
+    // 图片: blob URL 直显 (同 data URL 效果, 少一份巨型字符串常驻内存)
     if (kind === 'image') {
       if (!data || data.type !== 'binary' || !data.content) {
         failBody(body, '图片加载失败 (文件可能不存在)');
@@ -188,8 +217,13 @@
         failBody(body, '图片过大 (超过 5MB), 请用看图工具打开');
         return;
       }
+      var imSrc = blobUrlFor(mimeOf(path), data.content);
+      if (!imSrc) {
+        failBody(body, '图片解码失败, 请重试');
+        return;
+      }
       var im = document.createElement('img');
-      im.src = 'data:' + mimeOf(path) + ';base64,' + data.content;
+      im.src = imSrc;
       im.alt = baseName(path);
       im.style.cssText = 'width:100%;border-radius:8px;background:#fff;display:block;';
       body.appendChild(im);
@@ -238,17 +272,21 @@
       body.appendChild(pre);
       return;
     }
-    // 音频 / 视频: data URL 直播 (限 8MB)
+    // 音频 / 视频: blob URL 播放 (缓冲在内存, 可 seek; 上限 100MB 纯防 OOM)
     if (kind === 'audio' || kind === 'video') {
       if (!data || data.type !== 'binary' || !data.content) {
         failBody(body, '媒体加载失败 (文件可能不存在)');
         return;
       }
-      if (data.content.length * 0.75 > 8 * 1024 * 1024) {
-        failBody(body, '文件过大 (超过 8MB), 请用系统播放器打开');
+      if (data.content.length * 0.75 > 100 * 1024 * 1024) {
+        failBody(body, '文件过大 (超过 100MB), 请用系统播放器打开');
         return;
       }
-      var src = 'data:' + mimeOf(path) + ';base64,' + data.content;
+      var src = blobUrlFor(mimeOf(path), data.content);
+      if (!src) {
+        failBody(body, '媒体解码失败, 请重试');
+        return;
+      }
       var el = document.createElement(kind);
       el.src = src;
       el.controls = true;
