@@ -89,9 +89,10 @@
       if (!el || !el.closest) return null;
       // 自己家的浮层不拦截
       if (el.closest('[data-oc-skylight]')) return null;
-      // 交互控件一律放行: 审批按钮/开关/输入框/菜单项等 (之前误拦导致审批点不了;
-      // 上下文菜单多为 portaled 的 div/li, 不在此列会被误伤)
-      if (el.closest('button,input,select,textarea,li,[role="button"],[role="switch"],'
+      // 交互控件一律放行: 审批按钮/开关/输入框/菜单项等 (之前误拦导致审批点不了)
+      // 注意: 聊天 markdown 列表就是 <ul><li>, 路径常在 <li> 里, 不能按标签排除 li,
+      // 菜单靠下面的 role 判断即可
+      if (el.closest('button,input,select,textarea,[role="button"],[role="switch"],'
           + '[role="checkbox"],[role="radio"],[role="combobox"],[role="menu"],'
           + '[role="menuitem"],[role="menuitemradio"],[role="option"],[role="dialog"],'
           + '[contenteditable="true"]')) return null;
@@ -291,6 +292,11 @@
       el.src = src;
       el.controls = true;
       el.preload = 'metadata';
+      // 解码失败 (如编码不支持) 给一句明确提示, 否则就是黑盒播不了
+      el.addEventListener('error', function () {
+        failBody(body, '此' + (kind === 'video' ? '视频' : '音频')
+          + '无法解码 (可能是编码不支持), 可下载后用系统播放器打开');
+      });
       el.style.cssText = kind === 'video'
         ? 'width:100%;border-radius:8px;background:#000;'
         : 'width:100%;margin-top:12px;';
