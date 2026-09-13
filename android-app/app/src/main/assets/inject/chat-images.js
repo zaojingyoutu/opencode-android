@@ -65,16 +65,33 @@
     } catch (e) {}
     blobUrls = [];
   }
-  function base64ToBlob(b64, mime) {
+  function base64ToBytes(b64) {
     // 分块解码 (8192 能被 4 整除, base64 边界安全), 避免超长串一次性压爆调用栈
-    var CH = 8192, out = [], i, j;
+    var CH = 8192, out = [], total = 0, i, j;
     for (i = 0; i < b64.length; i += CH) {
       var bin = atob(b64.slice(i, i + CH)), n = bin.length;
       var arr = new Uint8Array(n);
       for (j = 0; j < n; j++) arr[j] = bin.charCodeAt(j);
       out.push(arr);
+      total += n;
     }
-    return new Blob(out, { type: mime });
+    var merged = new Uint8Array(total), o = 0;
+    for (i = 0; i < out.length; i++) { merged.set(out[i], o); o += out[i].length; }
+    return merged;
+  }
+  function base64ToBlob(b64, mime) {
+    return new Blob([base64ToBytes(b64)], { type: mime });
+  }
+  function shaShort(bytes, cb) {
+    // 诊断用: 页面里算出哈希, 和 server 侧比对可定位传输损坏 (如 VPN 篡改)
+    try {
+      if (!window.crypto || !crypto.subtle || !crypto.subtle.digest) { cb(''); return; }
+      crypto.subtle.digest('SHA-256', bytes).then(function (h) {
+        var s = '', v = new Uint8Array(h);
+        for (var i = 0; i < 6; i++) s += ('0' + v[i].toString(16)).slice(-2);
+        cb(s + '…' + ('0' + v[v.length - 1].toString(16)).slice(-2));
+      }).catch(function () { cb(''); });
+    } catch (e) { cb(''); }
   }
   function blobUrlFor(mime, b64) {
     try { return trackBlobUrl(URL.createObjectURL(base64ToBlob(b64, mime))); }
@@ -283,19 +300,54 @@
         failBody(body, '文件过大 (超过 100MB), 请用系统播放器打开');
         return;
       }
-      var src = blobUrlFor(mimeOf(path), data.content);
+      var bytes = null;
+      try { bytes = base64ToBytes(data.content); }
+      catch (e) { bytes = null; }
+      if (!bytes || !bytes.length) {
+        failBody(body, '媒体解码失败, 请重试');
+        return;
+      }
+      var src = null;
+      try { src = trackBlobUrl(URL.createObjectURL(new Blob([bytes], { type: mimeOf(path) }))); }
+      catch (e) { src = null; }
       if (!src) {
         failBody(body, '媒体解码失败, 请重试');
         return;
       }
       var el = document.createElement(kind);
+      var triedDataUrl = false;
+      var mediaName = kind === 'video' ? '视频' : '音频';
+      // 诊断脚注: 大小 + 页内哈希 (和 server 侧比对可定位传输损坏, 如 VPN 篡改)
+      var foot = document.createElement('div');
+      foot.style.cssText = 'text-align:center;padding:8px 12px 0;font-size:11px;'
+        + 'color:var(--v2-text-text-muted,#999);';
+      foot.textContent = (bytes.length / 1048576).toFixed(1) + 'MB · sha256 计算中… · blob';
+      body.appendChild(foot);
+      shaShort(bytes, function (h) {
+        try {
+          foot.textContent = (bytes.length / 1048576).toFixed(1) + 'MB'
+            + (h ? ' · sha256 ' + h : '') + (triedDataUrl ? ' · 已切换直连' : ' · blob');
+        } catch (e) {}
+      });
       el.src = src;
       el.controls = true;
       el.preload = 'metadata';
-      // 解码失败 (如编码不支持) 给一句明确提示, 否则就是黑盒播不了
       el.addEventListener('error', function () {
-        failBody(body, '此' + (kind === 'video' ? '视频' : '音频')
-          + '无法解码 (可能是编码不支持), 可下载后用系统播放器打开');
+        var code = el.error && el.error.code;
+        // blob 播不动时回退 data URL 直连 (之前 8MB 内就是这么播的);
+        // 超大文件不回退 (字符串太重), 直接报错误码
+        if (!triedDataUrl && bytes.length <= 25 * 1024 * 1024) {
+          triedDataUrl = true;
+          try {
+            el.src = 'data:' + mimeOf(path) + ';base64,' + data.content;
+            foot.textContent = (bytes.length / 1048576).toFixed(1) + 'MB · blob 失败'
+              + (code ? '(code ' + code + ')' : '') + ', 已切换直连…';
+            return;
+          } catch (e) {}
+        }
+        failBody(body, '此' + mediaName + '无法播放'
+          + (code ? ' (错误码 ' + code + ': 2=网络 3=解码 4=格式不支持)' : '')
+          + ', 可下载后用系统播放器打开');
       });
       el.style.cssText = kind === 'video'
         ? 'width:100%;border-radius:8px;background:#000;'
