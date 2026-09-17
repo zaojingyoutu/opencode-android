@@ -115,13 +115,24 @@
           + '[contenteditable="true"]')) return null;
       // 任意绝对路径 (不限 /workspace): /file/content 配合 directory=/ 可读全盘,
       // 本 WebView 只加载本机 opencode, 点的又是 agent 刚输出的路径, 无越权问题
-      var re = new RegExp('(\\/[^\\s"\'`<\\]>\\]\\)]+?\\.(' + ALL_EXT + '))', 'i');
+      var anchor = el.closest('a[href]');
+      if (anchor) {
+        var href = (anchor.getAttribute('href') || '').trim();
+        if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(href)) return null;
+      }
+      var re = new RegExp('(?:^|[\\s"\'`(\\[])' +
+        '(/(?!/)[^\\s"\'`<>\\]\\)]+?\\.(' + ALL_EXT + '))' +
+        '(?=$|[\\s"\'`<>\\]\\),;:!?])', 'i');
+      var matchPath = function (s) {
+        if (!s) return null;
+        return s.match(re);
+      };
       var node = el;
       // 只往上找 3 层 (之前 6 层会误伤祖先消息块里的路径文本)
       for (var d = 0; d < 3 && node && node !== document.body; d++) {
         if (node.tagName === 'A' && node.getAttribute) {
           var h = node.getAttribute('href') || '';
-          var m2 = h.match(re);
+          var m2 = matchPath(h);
           if (m2) return { path: m2[1], kind: kindOf(m2[1]) };
           // 占位链接 (空/#) 继续往上找; 真链接交还给页面自己处理
           if (h && h !== '#' && h.indexOf('javascript:') !== 0) return null;
