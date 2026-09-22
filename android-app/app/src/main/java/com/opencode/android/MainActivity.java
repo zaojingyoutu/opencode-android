@@ -50,6 +50,8 @@ public class MainActivity extends Activity {
     private boolean hadAllFilesAccess;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean polling = new AtomicBoolean(false);
+    /** ping 在途标志: 弱网下 ping 超时可达 5s, 防止慢 ping 在单线程池里排队堆积 */
+    private final AtomicBoolean pingInFlight = new AtomicBoolean(false);
     /** 健康检查专用单线程: 避免每秒新建线程 */
     private final java.util.concurrent.ExecutorService pingExecutor =
             java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
@@ -498,7 +500,8 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 每 1s ping 一次内置 server, 最多 seconds 秒 (首次启动含解压+加载 192MB 二进制, 放宽到 2 分钟) */
+    /** 每 0.5s ping 一次内置 server (500ms 粒度比 1s 平均早发现就绪约 0.25s)。
+     *  最多 seconds 秒 (首次启动含解压+加载 192MB 二进制, 放宽到 2 分钟) */
     private void pollHealth(final int seconds) {
         if (!polling.compareAndSet(false, true)) return;
         busy("OpenCode 服务启动中...\n\n正在等待就绪, 请稍候");
@@ -507,8 +510,19 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 if (!polling.get()) return;
+                final Runnable self = this;
                 safeExecute(() -> {
-                    boolean ok = ping(embedded.serverUrl());
+                    // 上一轮 ping 还没回来就跳过本轮 (弱网超时堆积防护)
+                    if (!pingInFlight.compareAndSet(false, true)) {
+                        handler.postDelayed(self, 500);
+                        return;
+                    }
+                    boolean ok;
+                    try {
+                        ok = ping(embedded.serverUrl());
+                    } finally {
+                        pingInFlight.set(false);
+                    }
                     runOnUiThread(() -> {
                         if (ok) {
                             polling.set(false);
@@ -527,13 +541,13 @@ public class MainActivity extends Activity {
                                     }
                                 });
                             });
-                        } else if (waited[0] >= seconds) {
+                        } else if (waited[0] >= seconds * 2) {
                             polling.set(false);
                             error("内置服务器启动超时\n\n日志:\n" +
                                     embedded.getLogTail(2000) + "\n\n点击重试");
                         } else {
                             waited[0]++;
-                            handler.postDelayed(this, 1000);
+                            handler.postDelayed(this, 500);
                         }
                     });
                 });

@@ -192,14 +192,21 @@ public class ServerManager {
     // ---- status() 增量拉取缓存 ----
     // 大会话全量消息实测 ~1MB, 看护线程每 60s 拉一次太浪费。session.time.updated
     // 在回复完成/新消息落定时才会变 (实测推进中不变), 所以 updated+sessionId 都没变
-    // 时直接复用上次结果; pending 期间最多隔 5 轮强制全量一次兜底。
+    // 时直接复用上次结果; pending 期间隔若干轮强制全量一次兜底 (轮数 service 按亮熄屏动态调)。
     private final Object statusLock = new Object();
     private long cachedUpdated = Long.MIN_VALUE;
     private String cachedSid = null;
     private Status cachedStatus;
     private int pendingTicks;
-    /** pending 期间每隔几轮强制全量拉取一次 (防缓存与真实状态长期背离) */
+    /** pending 期间每隔几轮强制全量拉取一次 (防缓存与真实状态长期背离), 默认 5 轮 */
     private static final int PENDING_FULL_PULL_TICKS = 5;
+    /** 实际生效间隔 (service 动态设置: 亮屏 5 / 息屏 30, 完成靠 updated 边沿捕获不丢) */
+    private volatile int pendingFullPullTicks = PENDING_FULL_PULL_TICKS;
+
+    /** service 按亮熄屏动态调整 pending 全量间隔 (前台 5 轮, 息屏 30 轮) */
+    public void setPendingFullPullTicks(int n) {
+        if (n > 0) pendingFullPullTicks = n;
+    }
 
     /** 查询 server 侧状态, <b>必须在子线程调用</b> (主线程会抛 NetworkOnMainThreadException)。 */
     public Status status() {
@@ -233,7 +240,7 @@ public class ServerManager {
         synchronized (statusLock) {
             if (!forceFull && cachedStatus != null && updated == cachedUpdated
                     && sid.equals(cachedSid)
-                    && (!cachedStatus.pending || ++pendingTicks < PENDING_FULL_PULL_TICKS)) {
+                    && (!cachedStatus.pending || ++pendingTicks < pendingFullPullTicks)) {
                 return cachedStatus;
             }
         }

@@ -24,7 +24,7 @@ import android.util.Log;
  * 空闲看护 (省电核心): 后台守护线程每 60s 采样一次容器 CPU 用量,
  *   - 忙碌/亮屏/近期有客户端活动 → 保持唤醒锁, server 继续跑 (长任务不中断);
  *   - 连续空闲 RELEASE_MINUTES 分钟 → 释放唤醒锁 (息屏后 CPU 可休眠);
- *   - 连续空闲 STOP_MINUTES 分钟 → 自动停止 server + 前台服务 (彻底省电);
+ *   - 连续空闲 120 分钟 (默认, prefs 可调) → 自动停止 server + 前台服务 (彻底省电);
  *   - 屏幕熄灭且无客户端活动时容器仍持续高 CPU 超过 FORCE_STOP_MINUTES →
  *     视为失控进程, 强制停止 (防止后台空转烧电); AI 回复推进期间除外。
  */
@@ -55,7 +55,14 @@ public class ServerService extends Service {
     private static final long SELF_HEAL_WINDOW_MS = 30 * 60_000L; // 进程被杀后自愈窗口
     private static final int BUSY_TICKS = 500;   // 60s 内 CPU ≥5s(≈8% 平均) 视为忙碌
     private static final int RELEASE_MINUTES = 3;   // 连续空闲 3 分钟 → 释放唤醒锁
-    private static final int STOP_MINUTES = 30;     // 连续空闲 30 分钟 → 自动停止
+    private static final int STOP_MINUTES_DEFAULT = 120; // 连续空闲默认 120 分钟 → 自动停止
+    /** 空闲自动停止阈值 (分钟): prefs idle_stop_minutes 可调 (30/120/360),
+     *  ≤0 表示从不自动停止 (失控强停与唤醒锁逻辑不受影响, 仍保底)。
+     *  默认从 30 放宽到 120: 唤醒锁 3 分钟即释放,  idle server 几乎零耗电,
+     *  代价只是常驻内存, 换一天内多次打开免冷启动 (proot+opencode 启动数十秒)。 */
+    private int stopMinutes() {
+        return prefs().getInt("idle_stop_minutes", STOP_MINUTES_DEFAULT);
+    }
     private static final int FORCE_STOP_MINUTES = 90; // 息屏无客户端仍持续高 CPU → 强制停止
     private static final int ORPHAN_ABORT_MINUTES = 15; // 持续无进展无 CPU → 判定孤儿并 abort 收尾
 
@@ -76,8 +83,18 @@ public class ServerService extends Service {
 
     // ---- 通知快看护 ----
     /** 通知快看护周期: 60s 空闲看护采样太粗, 快回复 (几秒~1 分钟) 会在两次采样之间完成,
-     *  pending→completed 边沿永远看不到 → 完成通知漏发。10s 一轮快照, 延迟可接受 */
+     *  pending→completed 边沿永远看不到 → 完成通知漏发。活跃 10s 一轮, 完全空闲退避到 60s */
     private static final long NOTIFY_WATCH_PERIOD_MS = 10_000;
+    /** 完全空闲 (息屏/无 pending/无待批) 或停服时的轮询间隔: 待机省电核心 */
+    private static final long NOTIFY_IDLE_PERIOD_MS = 60_000;
+    /** 本轮实际间隔 (notifyTick 按活跃度动态调整) */
+    private volatile long notifyIntervalMs = NOTIFY_WATCH_PERIOD_MS;
+    /** SSE 存活证明时间: 订阅成功/收到数据即更新; 90s 内有效才算事件流健康 */
+    private volatile long sseFreshMs = 0;
+    private static final long SSE_FRESH_MS = 90_000;
+    /** SSE 健康时跳过 HTTP 轮询的节流: 每 6 轮仍做一次全量心跳, 防静默背离 */
+    private int sseSkipTicks = 0;
+    private static final int SSE_HEARTBEAT_EVERY = 6;
     private Thread notifyWatcher;
     private volatile boolean notifyWatcherRunning;
     /** 上一轮快照状态, 用于检测"回复结束"边沿 (发完成通知) */
@@ -239,7 +256,7 @@ public class ServerService extends Service {
     private void notifyWatcherLoop() {
         while (notifyWatcherRunning) {
             try {
-                Thread.sleep(NOTIFY_WATCH_PERIOD_MS);
+                Thread.sleep(notifyIntervalMs);
             } catch (InterruptedException e) {
                 break;
             }
@@ -281,7 +298,8 @@ public class ServerService extends Service {
             java.net.HttpURLConnection conn = null;
             try {
                 if (!server.isRunning()) {
-                    Thread.sleep(3000);
+                    // 停服期间线程挂起: 60s 心跳一次即可, 3s 空转纯属浪费电
+                    Thread.sleep(60_000);
                     continue;
                 }
                 // 优先订阅全局事件流 (/global/event): 包含所有目录的 permission.asked，
@@ -292,7 +310,9 @@ public class ServerService extends Service {
                 sseConn = conn;
                 conn.setRequestProperty("Authorization", server.basicAuth());
                 conn.setConnectTimeout(5000);
-                conn.setReadTimeout(15_000);
+                // 读超时 60s: 静默 server 不必每 15s 断开重连一次 (重连风暴省 4 倍);
+                // 挂死检测不靠它 (isHealthy 独立 10s 探测), 半开连接靠 sseFreshMs 过期兜底
+                conn.setReadTimeout(60_000);
                 int code = conn.getResponseCode();
                 if (code != 200) {
                     try { conn.disconnect(); } catch (Exception ignored) {}
@@ -302,17 +322,20 @@ public class ServerService extends Service {
                     sseConn = conn;
                     conn.setRequestProperty("Authorization", server.basicAuth());
                     conn.setConnectTimeout(5000);
-                    conn.setReadTimeout(15_000);
+                    conn.setReadTimeout(60_000);
                     if (conn.getResponseCode() != 200) {
                         Thread.sleep(5000);
                         continue;
                     }
                 }
                 Log.i(TAG, "sse subscribed (" + url + ")");
+                sseFreshMs = android.os.SystemClock.elapsedRealtime();
                 java.io.BufferedReader reader = new java.io.BufferedReader(
                         new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
                 String line;
                 while (sseRunning && (line = reader.readLine()) != null) {
+                    // 任何行 (含保活注释) 都是存活证明: 供 notifyTick 短路 HTTP 轮询用
+                    sseFreshMs = android.os.SystemClock.elapsedRealtime();
                     if (line.startsWith("data:")) {
                         handleServerEvent(line.substring(5).trim());
                     }
@@ -366,6 +389,9 @@ public class ServerService extends Service {
                     String id = p.optString("id", "");
                     if (!permissionNotifiedKey.contains(id + ",")) {
                         permissionNotifiedKey += id + ",";
+                        // 同步置待批标志: SSE 健康时 HTTP 轮询会被短路跳过,
+                        // 不在这里置位会导致 watchdog 误判空闲而放锁
+                        hasPendingApproval = true;
                         notifyPermissionFromEvent(p);
                     }
                 }
@@ -379,6 +405,7 @@ public class ServerService extends Service {
                     String id = q.optString("id", "");
                     if (!questionNotifiedKey.contains(id + ",")) {
                         questionNotifiedKey += id + ",";
+                        hasPendingApproval = true;
                         notifyQuestionNeeded(q);
                     }
                 }
@@ -386,8 +413,9 @@ public class ServerService extends Service {
                 long now = android.os.SystemClock.elapsedRealtime();
                 if (now - lastSseCheckMs > 2000) {
                     lastSseCheckMs = now;
-                    // 立刻跑一次检测 (完成边沿); server 刚发完事件必然活着, 查询很快
-                    notifyTick();
+                    // 立刻跑一次检测 (完成边沿); server 刚发完事件必然活着, 查询很快.
+                    // 注意必须 force: 此时 sseFresh 刚更新, 非 force 会被短路跳过
+                    notifyTick(true);
                 }
             }
         } catch (Exception e) {
@@ -395,17 +423,33 @@ public class ServerService extends Service {
         }
     }
 
-    /** 通知快看护: 10s 一轮, 只做"回复结束"和"待批准"两个提醒, 与 60s 空闲看护解耦。
-     *  分开后快回复 (几秒~1 分钟) 也不会漏完成通知; status() 内部有缓存, 会话无变化时
-     *  每轮只拉一次小体积 /session 列表, 不重复下载大会话消息。
+    /** 通知快看护: 活跃 10s 一轮, 完全空闲退避到 60s, 只做"回复结束"和"待批准"两个提醒,
+     *  与 60s 空闲看护解耦。分开后快回复 (几秒~1 分钟) 也不会漏完成通知。
+     *  SSE 健康时周期轮询会被短路 (HTTP 全免, 边沿由事件直接驱动), 每 6 轮一次心跳兜底。
      *  注意: 不做前台抑制 — 应用内触发的审批/完成也要弹 (用户明确要求), 去重靠边沿+key */
     private void notifyTick() {
+        notifyTick(false);
+    }
+
+    /**
+     * @param force true 跳过 SSE 健康短路做完整 HTTP 检测
+     *   (SSE 的 message.updated 事件触发完成边沿时用; 周期轮询用 false)
+     */
+    private void notifyTick(boolean force) {
         if (!server.isRunning()) {
             lastStatus = null;
             serverDownTicks = 0;
             prefs().edit().remove(KEY_NOTIF_PENDING_SID).remove(KEY_NOTIF_PENDING_TIME).apply();
+            notifyIntervalMs = NOTIFY_IDLE_PERIOD_MS;
             return;
         }
+        sseSkipTicks++;
+        long sseAge = android.os.SystemClock.elapsedRealtime() - sseFreshMs;
+        boolean sseOk = sseRunning && sseFreshMs > 0 && sseAge < SSE_FRESH_MS;
+        if (!force && sseOk && sseSkipTicks < SSE_HEARTBEAT_EVERY) {
+            return; // 事件流健康: 本轮 HTTP 全免 (health/status/permission/question)
+        }
+        sseSkipTicks = 0;
         // 挂死自愈: 连续 6 轮 (约 1 分钟) 探测不到 server 响应 → 事件循环卡死,
         // 重启 server 恢复 (opencode 这版权限待批会 ServeError 卡死)
         if (!server.isHealthy()) {
@@ -506,6 +550,12 @@ public class ServerService extends Service {
                         .putLong(KEY_NOTIF_PENDING_TIME, System.currentTimeMillis()).apply();
             }
         }
+        // 动态间隔 + pending 稀疏拉取: 活跃 (亮屏/有 pending/有待批) 10s,
+        // 息屏空闲 60s。pending 全量间隔同步放宽 (亮屏 5 轮/息屏 30 轮):
+        // 完成必 bump sessions 列表 updated → 缓存必 miss → 边沿不丢, 稀疏只降兜底频率
+        boolean active = pm.isInteractive() || hasPendingApproval || (statusOk && st.pending);
+        notifyIntervalMs = active ? NOTIFY_WATCH_PERIOD_MS : NOTIFY_IDLE_PERIOD_MS;
+        server.setPendingFullPullTicks(pm.isInteractive() ? 5 : 30);
     }
 
     private void watchdogLoop() {
@@ -608,7 +658,7 @@ public class ServerService extends Service {
             Log.i(TAG, "runaway busy, forcing stop (busyMinutes=" + busyMinutes +
                     ", cpuDelta=" + delta + ")");
             main.post(this::stopAll);
-        } else if (idleMinutes >= STOP_MINUTES) {
+        } else if (stopMinutes() > 0 && idleMinutes >= stopMinutes()) {
             Log.i(TAG, "idle, stopping server (idleMinutes=" + idleMinutes + ")");
             main.post(this::stopAll);
         }
