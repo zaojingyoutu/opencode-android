@@ -29,10 +29,18 @@ jobs:
           # ubuntu runner 自带 SDK, 不再用 android-actions/setup-android@v3:
           # 它会让 sdkmanager 装早已下架的 tools 包, 新版 cmdline-tools 直接 exit 1
           # (#88/#89 连挂两次都是死在这一步, 与代码无关)
-          echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=/usr/local/lib/android/sdk" >> $GITHUB_ENV
-          echo "/usr/local/lib/android/sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "/usr/local/lib/android/sdk/platform-tools" >> $GITHUB_PATH
+          SDK=/usr/local/lib/android/sdk
+          echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
+          # GITHUB_PATH 只对后续步骤生效, 本步骤内需 export 才能直接调 sdkmanager
+          CT=""
+          for d in "$SDK"/cmdline-tools/latest "$SDK"/cmdline-tools/*; do
+            [ -x "$d/bin/sdkmanager" ] && { CT="$d/bin"; break; }
+          done
+          [ -n "$CT" ] || { echo "no cmdline-tools found"; ls "$SDK/cmdline-tools"; exit 1; }
+          echo "$CT" >> $GITHUB_PATH
+          echo "$SDK/platform-tools" >> $GITHUB_PATH
+          export PATH="$CT:$PATH"
           yes | sdkmanager --licenses > /dev/null
           # compileSdk 34 (build.gradle.kts), runner 一般预装, 没有则现场装 (幂等)
           sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null
