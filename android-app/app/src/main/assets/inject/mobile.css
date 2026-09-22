@@ -1,0 +1,20 @@
+/* OpenCode Android 移动端适配 (仅 App 内 WebView 注入, 不影响桌面浏览器) */
+
+/* 长文本折行: 排除代码区, 避免 token 中间被断开 */
+body :not(pre):not(code):not(textarea) { overflow-wrap: break-word; }
+
+/* 代码块横向滚动而非撑破布局 */
+pre { overflow-x: auto !important; max-width: 100% !important; }
+pre code { word-break: normal !important; overflow-wrap: normal !important; white-space: pre !important; }
+
+/* 媒体不超宽 */
+img, video, canvas, svg { max-width: 100% !important; }
+
+/* 弹窗/菜单在窄屏内收敛 */
+[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"] { max-width: 94vw !important; }
+
+/* 主页会话列表强制最小高归零: 内容少时设置/帮助贴底可见, 会话多时照常滚动 */
+[class*="min-h-[calc(100cqh-72px)"] { min-height: 0 !important; }
+
+/* 输入区字号兜底: 部分 ROM 的 WebView 对小字号输入框聚焦时整页缩放 */
+input, textarea { font-size: 16px; }

@@ -90,6 +90,15 @@ public class ServerService extends Service {
     private static final int NOTIF_ID_QUESTION = 3000;
     /** 连续探测 server 不响应的次数: opencode 这版权限待批会卡死事件循环, 超阈值自动重启自愈 */
     private int serverDownTicks = 0;
+    /** 跨重启的完成边沿: lastStatus 是内存态, 服务/自愈重启会丢, pending 会话 id 存 prefs 补发 */
+    private static final String KEY_NOTIF_PENDING_SID = "notif_pending_sid";
+    private static final String KEY_NOTIF_PENDING_TIME = "notif_pending_time";
+    /** 持久化边沿有效期: 太久远的完成再弹只会困扰用户, 到期清掉 */
+    private static final long NOTIF_EDGE_TTL_MS = 2 * 60 * 60_000L;
+
+    private android.content.SharedPreferences prefs() {
+        return getSharedPreferences("opencode_prefs", MODE_PRIVATE);
+    }
     /** 最近一次轮询是否发现待批请求，供 watchdog 在后台持锁用（避免仅凭 st.pending 漏判多目录/非最新会话的待批） */
     private volatile boolean hasPendingApproval = false;
 
@@ -394,6 +403,7 @@ public class ServerService extends Service {
         if (!server.isRunning()) {
             lastStatus = null;
             serverDownTicks = 0;
+            prefs().edit().remove(KEY_NOTIF_PENDING_SID).remove(KEY_NOTIF_PENDING_TIME).apply();
             return;
         }
         // 挂死自愈: 连续 6 轮 (约 1 分钟) 探测不到 server 响应 → 事件循环卡死,
@@ -415,6 +425,10 @@ public class ServerService extends Service {
         }
         serverDownTicks = 0;
         ServerManager.Status st = server.status();
+        // status() 拉取失败返回哨兵 sessionUpdated=-1: perms/quests 照常用 (独立请求),
+        // 但绝不能拿失败快照更新 lastStatus — 否则 pending 会被冲成 false,
+        // pending→completed 边沿永久丢失 (完成通知漏发主因之一)
+        final boolean statusOk = st.sessionUpdated >= 0;
 
         // 待批准提醒: agent 被权限请求卡住 (整个任务停摆), 比完成提醒更该被看见。
         // 以 GET /permission 为准: v1.18 里待批准的工具 part 状态是 running (不是 pending),
@@ -455,13 +469,42 @@ public class ServerService extends Service {
 
         // 回复结束边沿: 上一轮还有未完成消息, 这一轮没有了 → 用户不在看就发通知。
         // 用 pending 而非 replying: 静默长任务 (大下载/长测试超 20 分钟无输出) 的
-        // replying 会因新鲜度窗口过期变 false, 用它做边沿会漏发完成通知
-        if (lastStatus != null && lastStatus.pending && !st.pending && st.sessionUpdated > 0) {
-            notifyReplyFinished(st);
+        // replying 会因新鲜度窗口过期变 false, 用它做边沿会漏发完成通知。
+        // 必须同会话才算: status() 永远取"最新更新"的会话, 切会话/后台标题生成
+        // 会让 latest 切到别的已完成会话, 否则会误报 (通知说完成了, 进页面原会话还在跑)
+        boolean memEdge = statusOk && lastStatus != null && lastStatus.pending && !st.pending
+                && st.sessionUpdated > 0
+                && !lastStatus.sessionId.isEmpty()
+                && lastStatus.sessionId.equals(st.sessionId);
+        // 持久化边沿: 服务/自愈重启会清空 lastStatus, 跨重启的完成靠 prefs 补发。
+        // 内存边沿已触发时不再重复; 切会话/过期则清掉旧值防误报
+        boolean savedEdge = false;
+        if (statusOk && !memEdge && !st.pending && st.sessionUpdated > 0) {
+            String savedSid = prefs().getString(KEY_NOTIF_PENDING_SID, "");
+            long savedAt = prefs().getLong(KEY_NOTIF_PENDING_TIME, 0);
+            if (!savedSid.isEmpty() && savedSid.equals(st.sessionId)
+                    && System.currentTimeMillis() - savedAt < NOTIF_EDGE_TTL_MS) {
+                savedEdge = true;
+            } else if (!savedSid.isEmpty()
+                    && (!savedSid.equals(st.sessionId)
+                        || System.currentTimeMillis() - savedAt >= NOTIF_EDGE_TTL_MS)) {
+                prefs().edit().remove(KEY_NOTIF_PENDING_SID).remove(KEY_NOTIF_PENDING_TIME).apply();
+            }
         }
-        lastStatus = st;
-        if (st.sessionTitle != null && !st.sessionTitle.isEmpty()) {
-            lastSessionTitle = st.sessionTitle;
+        if (memEdge || savedEdge) {
+            notifyReplyFinished(st);
+            prefs().edit().remove(KEY_NOTIF_PENDING_SID).remove(KEY_NOTIF_PENDING_TIME).apply();
+        }
+        if (statusOk) {
+            lastStatus = st;
+            if (st.sessionTitle != null && !st.sessionTitle.isEmpty()) {
+                lastSessionTitle = st.sessionTitle;
+            }
+            if (st.pending && !st.sessionId.isEmpty()
+                    && !st.sessionId.equals(prefs().getString(KEY_NOTIF_PENDING_SID, ""))) {
+                prefs().edit().putString(KEY_NOTIF_PENDING_SID, st.sessionId)
+                        .putLong(KEY_NOTIF_PENDING_TIME, System.currentTimeMillis()).apply();
+            }
         }
     }
 

@@ -144,10 +144,13 @@ public class MainActivity extends Activity {
         ws.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         ws.setBuiltInZoomControls(true);
         ws.setDisplayZoomControls(false);
-        ws.setLoadWithOverviewMode(true);
+        // 响应式页面按 viewport meta 排版, 不再整体缩小适配 (字小/布局挤的主因之一)
+        ws.setLoadWithOverviewMode(false);
         ws.setUseWideViewPort(true);
         ws.setCacheMode(WebSettings.LOAD_DEFAULT);
         ws.setMediaPlaybackRequiresUserGesture(false);
+        // 白屏前底色与启动覆盖层一致, 避免 WebView 默认白色闪屏
+        webView.setBackgroundColor(0xFF0E1116);
 
         // JS 桥: Web UI 里的悬浮 "LAN" 按钮点击后唤起原生设置对话框。
         // 桥只暴露 openSettings() 一个信号方法, 密码等敏感数据不经 JS 传递
@@ -172,17 +175,10 @@ public class MainActivity extends Activity {
                 progressBar.setVisibility(View.GONE);
                 embedded.noteClientActivity();
                 if (pageFailed) return;
-                // 页面加载完成: 隐藏加载覆盖层 (避免空白闪烁, 首次打开/后台恢复统一走这里)
-                startupOverlay.setVisibility(View.GONE);
-                // opencode 网页的错误信息在窄屏不换行, 注入 CSS 强制长文本折行;
-                // 主页会话列表区块带 min-h-[calc(100cqh-72px)] (移动端强制最小高约一屏),
-                // 加上项目区和设置/帮助行后总高必超一屏, 设置/帮助按钮被挤出屏外,
-                // 这里将该最小高归零: 内容少时设置/帮助贴底可见, 会话多时照常滚动
-                view.evaluateJavascript(
-                        "var s=document.createElement('style');" +
-                        "s.innerHTML='*{overflow-wrap:break-word!important;word-break:break-word!important;max-width:100%!important}" +
-                        "[class*=\"min-h-[calc(100cqh-72px)\"]{min-height:0!important}';" +
-                        "document.head.appendChild(s);", null);
+                // 页面框架载入完成, 但 SPA 还在 hydration: 覆盖层等首屏有实质内容再撤,
+                // 否则出现"覆盖层消失→白屏→UI 突然出现"的闪烁 (白屏投诉主因之一)
+                view.evaluateJavascript(mobileCssJs(), null);
+                waitForSpaReady();
                 // 注入 "局域网访问" 设置节: 脚本在 assets/inject/lan.js (node --check 验证过语法),
                 // MutationObserver 检测设置面板打开 (role=tab 文本 General) 后在 tabpanel
                 // 底部追加一节, 样式贴近其暗色主题; 走 OcLan JS 桥操作
@@ -219,40 +215,22 @@ public class MainActivity extends Activity {
             public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view,
                     android.webkit.WebResourceRequest request) {
                 Uri u = request.getUrl();
+                // 主文档: opencode Web UI 缺 viewport meta, 窄屏按桌面宽度排版导致
+                // 布局错乱/字小。提交前把 meta 拼进 <head>; 任何失败返回 null 走原生加载
+                if (request.isForMainFrame() && isLocalUrl(u)) {
+                    android.webkit.WebResourceResponse doc = injectViewport(u);
+                    if (doc != null) return doc;
+                }
                 String path = u.getPath();
-                if (path != null && path.startsWith("/assets/ghostty-web-") && path.endsWith(".js")) {
-                    HttpURLConnection conn = null;
-                    try {
-                        conn = (HttpURLConnection) new URL(u.toString()).openConnection();
-                        conn.setConnectTimeout(2500);
-                        conn.setReadTimeout(2500);
-                        if (conn.getResponseCode() == 200) {
-                            // 限 2MB 防异常大文件 OOM
-                            try (InputStream rawIn = conn.getInputStream();
-                                 ByteArrayOutputStream bos = new ByteArrayOutputStream(64 * 1024)) {
-                                byte[] buf = new byte[8192];
-                                int n;
-                                int total = 0;
-                                while ((n = rawIn.read(buf)) != -1) {
-                                    total += n;
-                                    if (total > 2 * 1024 * 1024) break;
-                                    bos.write(buf, 0, n);
-                                }
-                                String js = bos.toString("ISO-8859-1");
-                                final String anchor =
-                                        "const k=D.x!==this.lastCursorPosition.x||D.y!==this.lastCursorPosition.y;";
-                                if (js.contains(anchor)) {
-                                    js = js.replace(anchor, anchor + "k&&(g=!0);");
-                                }
-                                return new android.webkit.WebResourceResponse(
-                                        "text/javascript", "UTF-8",
-                                        new ByteArrayInputStream(js.getBytes("ISO-8859-1")));
-                            }
-                        }
-                    } catch (Exception e) {
-                        Log.w("MainActivity", "ghostty-web patch skipped: " + e);
-                    } finally {
-                        if (conn != null) conn.disconnect();
+                // 只补 ghostty 光标; 不要代理全部 /assets/*
+                // (主包 index-*.js 远超 2MB, 截断返回会让 SPA 白屏)
+                if (path != null && path.startsWith("/assets/ghostty-web-")
+                        && path.endsWith(".js") && isLocalUrl(u)) {
+                    byte[] body = fetchAsset(u);
+                    if (body != null) {
+                        return new android.webkit.WebResourceResponse(
+                                "text/javascript", "UTF-8",
+                                new ByteArrayInputStream(body));
                     }
                 }
                 return null;
@@ -762,6 +740,7 @@ public class MainActivity extends Activity {
 
     private String lanInjectJsCache;
     private String chatImagesJsCache;
+    private String mobileCssCache;
 
     /** 读取注入脚本 (assets/inject/lan.js), 缺失时返回 null 静默跳过 */
     private String lanInjectJs() {
@@ -791,6 +770,150 @@ public class MainActivity extends Activity {
             chatImagesJsCache = "";
         }
         return chatImagesJsCache.isEmpty() ? null : chatImagesJsCache;
+    }
+
+    /** 读取移动端适配 CSS (assets/inject/mobile.css), 缺失返回 null 静默跳过 */
+    private String mobileCss() {
+        if (mobileCssCache != null) return mobileCssCache.isEmpty() ? null : mobileCssCache;
+        try (InputStream in = getAssets().open("inject/mobile.css")) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(4096);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            mobileCssCache = bos.toString("UTF-8");
+        } catch (Exception e) {
+            mobileCssCache = "";
+        }
+        return mobileCssCache.isEmpty() ? null : mobileCssCache;
+    }
+
+    /** 移动端 CSS 注入语句 (去掉了旧的 *{max-width:100%} 全局大锤, 它会压扁弹窗/弹性布局) */
+    private String mobileCssJs() {
+        String css = mobileCss();
+        if (css == null) return "(function(){})()";
+        return "(function(){try{var s=document.createElement('style');"
+                + "s.setAttribute('data-oc-mobile','1');"
+                + "s.innerHTML=" + org.json.JSONObject.quote(css) + ";"
+                + "document.head.appendChild(s);}catch(e){}})()";
+    }
+
+    /** 等 SPA 首屏有实质内容再撤覆盖层, 20s 兜底 (hydration 慢也不至于一直盖住) */
+    private void waitForSpaReady() {
+        final long deadline = SystemClock.elapsedRealtime() + 20_000;
+        final Handler h = new Handler(Looper.getMainLooper());
+        final Runnable[] check = new Runnable[1];
+        check[0] = () -> {
+            if (isFinishing() || isDestroyed() || webView == null) return;
+            webView.evaluateJavascript(
+                    "(function(){try{var t=document.body?document.body.innerText.replace(/\\s+/g,' ').trim():'';return t.length}catch(e){return -1}})()",
+                    v -> {
+                        if (isFinishing() || isDestroyed() || webView == null) return;
+                        boolean ready = false;
+                        try {
+                            ready = Integer.parseInt(v) > 120;
+                        } catch (Exception ignored) {
+                        }
+                        if (ready || SystemClock.elapsedRealtime() >= deadline) {
+                            startupOverlay.setVisibility(View.GONE);
+                        } else {
+                            h.postDelayed(check[0], 500);
+                        }
+                    });
+        };
+        h.postDelayed(check[0], 500);
+    }
+
+    /** 是否本机 server 地址 (拦截/注头只对它做, 防凭证外泄) */
+    private boolean isLocalUrl(Uri u) {
+        if (u == null) return false;
+        String h = u.getHost();
+        if (!"127.0.0.1".equals(h) && !"localhost".equals(h)) return false;
+        try {
+            return u.getPort() == Uri.parse(embedded.serverUrl()).getPort();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 主文档拼 viewport meta (缺失时窄屏按桌面宽度排版)。失败返回 null 走原生加载 */
+    private android.webkit.WebResourceResponse injectViewport(Uri u) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(u.toString()).openConnection();
+            conn.setConnectTimeout(3000);
+            conn.setReadTimeout(5000);
+            conn.setRequestProperty("Authorization", embedded.basicAuth());
+            if (conn.getResponseCode() != 200) return null;
+            String ct = conn.getContentType();
+            if (ct == null || !ct.contains("text/html")) return null;
+            String charset = "UTF-8";
+            java.util.regex.Matcher m =
+                    java.util.regex.Pattern.compile("charset=([^;\\s]+)").matcher(ct);
+            if (m.find()) charset = m.group(1);
+            byte[] raw;
+            try (InputStream in = conn.getInputStream();
+                 ByteArrayOutputStream bos = new ByteArrayOutputStream(64 * 1024)) {
+                byte[] buf = new byte[8192];
+                int n;
+                int total = 0;
+                while ((n = in.read(buf)) != -1) {
+                    total += n;
+                    if (total > 2 * 1024 * 1024) return null;
+                    bos.write(buf, 0, n);
+                }
+                raw = bos.toByteArray();
+            }
+            String html = new String(raw, charset);
+            if (html.contains("name=\"viewport\"") || html.contains("name='viewport'")) return null;
+            String patched = html.replaceFirst("(?i)<head([^>]*)>",
+                    "<head$1><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">");
+            if (patched.equals(html)) return null;
+            return new android.webkit.WebResourceResponse("text/html", charset,
+                    new ByteArrayInputStream(patched.getBytes(charset)));
+        } catch (Exception e) {
+            Log.d("MainActivity", "viewport inject skipped: " + e);
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    /** 只拉 ghostty-web 做光标补丁; 超 2MB 或失败返回 null, 走 WebView 原生完整加载 */
+    private byte[] fetchAsset(Uri u) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(u.toString()).openConnection();
+            conn.setConnectTimeout(2500);
+            conn.setReadTimeout(2500);
+            conn.setRequestProperty("Authorization", embedded.basicAuth());
+            if (conn.getResponseCode() != 200) return null;
+            try (InputStream rawIn = conn.getInputStream();
+                 ByteArrayOutputStream bos = new ByteArrayOutputStream(64 * 1024)) {
+                byte[] buf = new byte[8192];
+                int n;
+                int total = 0;
+                while ((n = rawIn.read(buf)) != -1) {
+                    total += n;
+                    if (total > 2 * 1024 * 1024) return null;
+                    bos.write(buf, 0, n);
+                }
+                byte[] body = bos.toByteArray();
+                // ISO-8859-1 按字节原样往返, 不破坏 UTF-8 多字节字符
+                String js = new String(body, "ISO-8859-1");
+                final String anchor =
+                        "const k=D.x!==this.lastCursorPosition.x||D.y!==this.lastCursorPosition.y;";
+                if (js.contains(anchor)) {
+                    js = js.replace(anchor, anchor + "k&&(g=!0);");
+                    body = js.getBytes("ISO-8859-1");
+                }
+                return body;
+            }
+        } catch (Exception e) {
+            Log.w("MainActivity", "asset fetch skipped: " + e);
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
     }
 
     /** 改动 LAN 配置后重启 server, 就绪后自动重载页面 */
@@ -882,15 +1005,12 @@ public class MainActivity extends Activity {
      * replying=false 而会话也没有新完成的消息 → 旧版两个分支都不命中, 什么都不做,
      * 页面就停在断掉的 SSE 订阅上永远显示"思考中"。
      *
-     * 对齐动作:
-     *   - 无未完成消息但离开期间有新完成的结果 → 直接 reload 拉取;
-     *   - 有未完成消息 → 先唤醒页面自身重连 (visibilitychange/focus), 5s 后页面仍
-     *     无任何变化视为卡死, 再区分处理:
-     *       · 回复仍活跃 (replying) → reload 重新订阅 SSE (不打断 server 端回复);
-     *       · 疑似孤儿 (未完成但已无进展) → 先做 2s CPU 快检:
-     *           CPU 在烧 = 活着的慢任务, 只 reload;
-     *           CPU 为零 = 冻结的孤儿, 调 abort 把消息落定为已中止再 reload
-     *           (否则重载后页面照样把它渲染成"思考中", 永远卡住)。
+     * 对齐动作 (全部以 server 最新状态为准, 拒绝用 body 长度猜):
+     *   - 无未完成且离开期间无新结果 → 不动;
+     *   - 否则轻唤醒页面, 5s 后重拉 server 状态, 用最新回复文本做内容探针:
+     *       · 页面已有该文本 → 已同步, 零 reload (局部刷新的等价效果);
+     *       · 页面缺失 → 掉队: 已完成则 reload 拉结果; 未完成且活跃则 reload 重订阅;
+     *         未完成无进展则 CPU 双检区分慢任务 (reload) 与孤儿 (abort+reload)。
      *
      * HTTP 探测必须放子线程: 主线程上 HttpURLConnection 会抛 NetworkOnMainThreadException,
      * 之前直接在 onResume 里调用, 异常被 catch 吞掉后恒等于"没在回复", 于是每次回来都整页
@@ -902,23 +1022,64 @@ public class MainActivity extends Activity {
             ServerManager.Status st = embedded.status(true); // 恢复对齐要求最新值, 跳过缓存
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed() || webView == null) return;
-                if (!st.pending) {
-                    // 没有未完成消息: 离开期间有新结果时先轻唤醒 (visibility/focus 让页面
-                    // 自己重连拉取), 5s 后页面仍无变化才整页 reload。
-                    // 直接 reload 会整页重建 SPA, 会话 tab 状态重建时已关闭的 tab 可能被恢复,
-                    // 表现为"后台回来已关闭的 tab 又打开了"。
-                    if (st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall) {
-                        nudgePageAndCheckIfFrozen(() -> {
-                            if (isFinishing() || isDestroyed() || webView == null) return;
-                            webView.reload();
-                        });
-                    }
-                    return;
+                if (!st.pending && !(st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall)) {
+                    return; // 无未完成且离开期间无新结果: 页面即最新, 不打扰
                 }
-                // 有未完成消息: 先唤醒页面自身的重连逻辑
-                nudgePageAndCheckIfFrozen(() -> resolveStalledPending(st));
+                // 先轻唤醒页面自身重连, 5s 后以 server 最新状态为准判定页面是否掉队
+                nudgePage();
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    if (isFinishing() || isDestroyed() || webView == null) return;
+                    alignPageWithServer();
+                }, 5000);
             });
         }, "opencode-resync").start();
+    }
+
+    /** 轻唤醒页面 (派发 visibilitychange/focus 让页面自己重连 SSE/拉取), 只唤醒不判断 */
+    private void nudgePage() {
+        if (webView == null) return;
+        webView.evaluateJavascript(
+                "(function(){try{" +
+                "document.dispatchEvent(new Event('visibilitychange'));" +
+                "window.dispatchEvent(new Event('focus'));" +
+                "}catch(e){}})()", null);
+    }
+
+    /**
+     * 以 server 最新状态为基准对齐页面 (后台回来更新不即时的根治)。
+     * 用 server 侧最新回复文本做"内容探针": 页面里找得到 = 已同步, 全程零 reload;
+     * 找不到 = 页面掉队, 再按 server 状态决定 reload / abort+reload。
+     * 这就是"局部刷新"的等价实现: 只在真正掉队时才整页重载。
+     * (真 DOM 补丁不可行: SPA 内部渲染状态对不上, 硬插会导致消息双条/错乱)
+     */
+    private void alignPageWithServer() {
+        new Thread(() -> {
+            // 判定必须用等窗后的最新值: 5s 内回复可能已完成, 拿旧快照会误判
+            final ServerManager.Status fresh = embedded.status(true);
+            final String snippet = fresh.lastText != null ? fresh.lastText : "";
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed() || webView == null) return;
+                if (snippet.isEmpty()) {
+                    // 纯工具进度无文本可比对: 退化为 body 变化检测
+                    nudgePageAndCheckIfFrozen(() -> decideStalledFresh(fresh));
+                    return;
+                }
+                webView.evaluateJavascript(
+                        "(function(){try{var t=document.body?document.body.innerText.replace(/\\s+/g,' '):'';"
+                        + "return t.indexOf(" + org.json.JSONObject.quote(snippet) + ")>=0"
+                        + "}catch(e){return false}})()",
+                        v -> {
+                            if (isFinishing() || isDestroyed() || webView == null) return;
+                            if ("true".equals(v)) return; // 页面已有最新内容, 不打扰
+                            if (!fresh.pending) {
+                                // 已完成但页面没渲染出结果: reload 一次把结果拉下来
+                                webView.reload();
+                                return;
+                            }
+                            decideStalledFresh(fresh);
+                        });
+            });
+        }, "opencode-align").start();
     }
 
     /** 轻唤醒页面 (派发 visibilitychange/focus 让页面自己重连 SSE/拉取),
@@ -946,9 +1107,12 @@ public class MainActivity extends Activity {
         }, 5000);
     }
 
-    /** 页面卡死在有未完成消息的状态: 按 server 侧状态决定 reload 还是 abort+reload */
-    private void resolveStalledPending(ServerManager.Status st) {
-        if (st.replying) {
+    /** 页面卡死在有未完成消息的状态: 按 server 侧最新状态决定 reload 还是 abort+reload。
+     *  注意入参必须是等窗后的新鲜快照 (alignPageWithServer 里重拉的), 不能拿 5s 前的旧值:
+     *  旧值 pending 而实际已完成时, 按旧逻辑会走 CPU 空检甚至 abort,  reload 闪白不说,
+     *  abort 打到已落定会话虽无害, 但纯属多余扰动 */
+    private void decideStalledFresh(ServerManager.Status fresh) {
+        if (fresh.replying) {
             // 回复活跃: 重订阅 SSE 即可, 绝不能 abort (会杀掉正在跑的任务)
             webView.reload();
             return;
@@ -975,7 +1139,7 @@ public class MainActivity extends Activity {
                 return;
             }
             Log.i("MainActivity", "resume: orphan reply detected, abort + reload");
-            if (!st.sessionId.isEmpty()) embedded.abortSession(st.sessionId);
+            if (!fresh.sessionId.isEmpty()) embedded.abortSession(fresh.sessionId);
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed() || webView == null) return;
                 webView.reload();

@@ -227,6 +227,9 @@ tasks.register("downloadRootfs") {
                 !file("$outputDir/base.tar").exists() || !file("$outputDir/opencode-bin").exists()
     }
     doLast {
+        // 旧整包方案残留: rootfs.tar 已无人读取, 留在 assets 目录会被 AGP 自动打包
+        // (218MB raw / APK 内 ~80MB), 每次构建顺手清掉防体积回弹
+        File(outputDir.asFile, "rootfs.tar").takeIf { it.exists() }?.delete()
         val build = layout.buildDirectory
         val work = build.dir("rootfs-work").get().asFile
         work.mkdirs()
