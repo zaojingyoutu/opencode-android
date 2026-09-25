@@ -249,11 +249,7 @@ public class ServerManager {
             if (sid.isEmpty()) {
                 msgs = new org.json.JSONArray();
             } else {
-                String msgUrl = serverUrl() + "/session/" + sid + "/message";
-                if (!sidDirectory.isEmpty()) {
-                    msgUrl += "?directory=" + java.net.URLEncoder.encode(sidDirectory, "UTF-8");
-                }
-                msgs = new org.json.JSONArray(httpGet(msgUrl));
+                msgs = new org.json.JSONArray(httpGet(messageUrl(serverUrl(), sid, sidDirectory)));
             }
         } catch (Exception e) {
             return new Status(-1, "", "", false, false, false, "", false, "");
@@ -266,6 +262,23 @@ public class ServerManager {
             cachedStatus = s;
         }
         return s;
+    }
+
+    /** 最新会话尾部消息条数。parseStatus 只消费最后一条, 全量历史 (含截图 base64,
+     *  动辄几十 MB) 会在 readText 里 OOM 闪退。server 的 limit=N 返回最新的 N 条
+     *  (顺序与全量一致, 已实测), 取 5 条留余量, 体积从几十 MB 降到几百 KB。 */
+    static final int MESSAGE_TAIL_LIMIT = 5;
+
+    /** 最新会话尾部消息 URL (纯函数, 可单元测试)。 */
+    static String messageUrl(String base, String sid, String directory)
+            throws java.io.UnsupportedEncodingException {
+        String url = base + "/session/" + sid + "/message";
+        String sep = "?";
+        if (directory != null && !directory.isEmpty()) {
+            url += "?directory=" + java.net.URLEncoder.encode(directory, "UTF-8");
+            sep = "&";
+        }
+        return url + sep + "limit=" + MESSAGE_TAIL_LIMIT;
     }
 
     /** 聚合所有已知工作区目录的会话列表。
@@ -1728,11 +1741,20 @@ public class ServerManager {
         logThread.start();
     }
 
+    /** 单次响应体上限。第二道锁: 任何端点 (含旧版 server 无视 limit 的全量 /message)
+     *  都不许无界读内存, 超限抛 IOException 走各调用方的降级分支, 绝不 OOM 闪退。 */
+    static final int MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
     private static String readText(InputStream in) throws IOException {
         try (InputStream is = in; ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            byte[] buf = new byte[1024];
+            byte[] buf = new byte[8192];
             int n;
-            while ((n = is.read(buf)) > 0) out.write(buf, 0, n);
+            int total = 0;
+            while ((n = is.read(buf)) > 0) {
+                total += n;
+                if (total > MAX_RESPONSE_BYTES) throw new IOException("response too large");
+                out.write(buf, 0, n);
+            }
             return new String(out.toByteArray(), StandardCharsets.UTF_8);
         }
     }

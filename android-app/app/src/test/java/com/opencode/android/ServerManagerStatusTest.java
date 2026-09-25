@@ -219,4 +219,29 @@ public class ServerManagerStatusTest {
         assertFalse(s.pending);
         assertEquals("", s.lastText);
     }
+
+    // ---- 消息拉取裁剪 (OOM 闪退回归) ----
+    // status() 曾拉全量 /message (含截图 base64, 几十 MB), 在 readText 里 OOM。
+    // parseStatus 只读最后一条, 必须带 limit 只取尾部。
+
+    @Test
+    public void messageUrl_takesTailWithLimit() throws Exception {
+        String url = ServerManager.messageUrl("http://127.0.0.1:18888", "ses_1", "/workspace");
+        assertTrue(url.contains("/session/ses_1/message"));
+        assertTrue(url.contains("directory="));
+        assertTrue(url.contains("limit=" + ServerManager.MESSAGE_TAIL_LIMIT));
+    }
+
+    @Test
+    public void messageUrl_noDirectory() throws Exception {
+        assertEquals("http://127.0.0.1:18888/session/ses_1/message?limit="
+                + ServerManager.MESSAGE_TAIL_LIMIT,
+                ServerManager.messageUrl("http://127.0.0.1:18888", "ses_1", ""));
+    }
+
+    @Test
+    public void messageUrl_tailLimitPositive() {
+        assertTrue(ServerManager.MESSAGE_TAIL_LIMIT >= 1);
+        assertTrue(ServerManager.MAX_RESPONSE_BYTES >= 1024 * 1024);
+    }
 }
