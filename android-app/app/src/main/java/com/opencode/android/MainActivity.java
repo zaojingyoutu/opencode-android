@@ -196,6 +196,14 @@ public class MainActivity extends Activity {
                     view.evaluateJavascript(
                             imgJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
                 }
+                // 僵尸审批卡自愈: server 重启会清空待批请求, 页面里的审批卡因收不到
+                // permission.replied 而永久残留。脚本检测到卡 + 原生确认无待批后浮 pill,
+                // 用户点一下 reload (同步 store 是内存态, 僵尸必消失)
+                String healJs = permHealJs();
+                if (healJs != null) {
+                    view.evaluateJavascript(
+                            healJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
+                }
                 // 深链：审批横幅点进来的目录/会话，切到对应项目并打开会话
                 if (pendingDirectory != null || pendingSessionId != null) {
                     String deepJs = pendingDeepLinkJs();
@@ -736,6 +744,18 @@ public class MainActivity extends Activity {
             });
         }
 
+        /** 待批请求三态 (-1 未知 / 0 确认无待批 / 1 有待批), 供页面内僵尸审批卡自愈:
+         *  server 确认空但页面还挂着审批卡 = 请求已随 server 重启消失, 卡是僵尸。 */
+        @android.webkit.JavascriptInterface
+        public int pendingPermissionState() {
+            if (!guard()) return -1;
+            try {
+                return ServerService.lastPermState;
+            } catch (Exception e) {
+                return -1;
+            }
+        }
+
         @android.webkit.JavascriptInterface
         public void copy() {
             if (!guard()) return;
@@ -755,6 +775,7 @@ public class MainActivity extends Activity {
     private String lanInjectJsCache;
     private String chatImagesJsCache;
     private String mobileCssCache;
+    private String permHealJsCache;
 
     /** 读取注入脚本 (assets/inject/lan.js), 缺失时返回 null 静默跳过 */
     private String lanInjectJs() {
@@ -784,6 +805,21 @@ public class MainActivity extends Activity {
             chatImagesJsCache = "";
         }
         return chatImagesJsCache.isEmpty() ? null : chatImagesJsCache;
+    }
+
+    /** 读取注入脚本 (assets/inject/permission-heal.js): 僵尸审批卡检测 + 刷新 pill */
+    private String permHealJs() {
+        if (permHealJsCache != null) return permHealJsCache.isEmpty() ? null : permHealJsCache;
+        try (InputStream in = getAssets().open("inject/permission-heal.js")) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(4096);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            permHealJsCache = bos.toString("UTF-8");
+        } catch (Exception e) {
+            permHealJsCache = "";
+        }
+        return permHealJsCache.isEmpty() ? null : permHealJsCache;
     }
 
     /** 读取移动端适配 CSS (assets/inject/mobile.css), 缺失返回 null 静默跳过 */

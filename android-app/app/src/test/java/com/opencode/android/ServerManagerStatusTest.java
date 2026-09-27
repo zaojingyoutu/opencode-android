@@ -244,4 +244,34 @@ public class ServerManagerStatusTest {
         assertTrue(ServerManager.MESSAGE_TAIL_LIMIT >= 1);
         assertTrue(ServerManager.MAX_RESPONSE_BYTES >= 1024 * 1024);
     }
+
+    // ---- 审批横幅动作决策 (僵尸审批回归) ----
+    // server 重启会清空内存里的待批请求, 旧横幅的按钮点什么都 404。
+    // 必须撤横幅 (DISMISS_GONE), 否则"点了没反应、一直挡着"。
+
+    @Test
+    public void permReplyAction_successDismisses() {
+        assertEquals(ServerManager.PermReplyAction.DISMISS_DONE,
+                ServerManager.permReplyAction(200, true));
+        assertEquals(ServerManager.PermReplyAction.DISMISS_DONE,
+                ServerManager.permReplyAction(200, false));
+    }
+
+    @Test
+    public void permReplyAction_goneDismissesEvenWhenHealthy() {
+        assertEquals(ServerManager.PermReplyAction.DISMISS_GONE,
+                ServerManager.permReplyAction(404, true));
+        assertEquals(ServerManager.PermReplyAction.DISMISS_GONE,
+                ServerManager.permReplyAction(404, false));
+    }
+
+    @Test
+    public void permReplyAction_unknownKeepsBanner() {
+        assertEquals(ServerManager.PermReplyAction.KEEP_RETRY_MAYBE,
+                ServerManager.permReplyAction(-1, true));
+        assertEquals(ServerManager.PermReplyAction.KEEP_RETRY_DOWN,
+                ServerManager.permReplyAction(-1, false));
+        assertEquals(ServerManager.PermReplyAction.KEEP_RETRY_MAYBE,
+                ServerManager.permReplyAction(500, true));
+    }
 }

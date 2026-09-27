@@ -118,6 +118,20 @@ public class ServerService extends Service {
     }
     /** 最近一次轮询是否发现待批请求，供 watchdog 在后台持锁用（避免仅凭 st.pending 漏判多目录/非最新会话的待批） */
     private volatile boolean hasPendingApproval = false;
+    /** 待批请求三态快照 (供页面内僵尸审批卡自愈用):
+     *  UNKNOWN=拉取失败未知; EMPTY=server 确认无待批; NONEMPTY=有待批。
+     *  static 使 WebView JS 桥无需 bind service 即可读取 (读 volatile, 微秒级)。 */
+    static final int PERM_UNKNOWN = -1;
+    static final int PERM_EMPTY = 0;
+    static final int PERM_NONEMPTY = 1;
+    static volatile int lastPermState = PERM_UNKNOWN;
+
+    /** perms 聚合结果 → 三态 (纯函数, 可单元测试): null=拉取失败未知数;
+     *  空=server 确认无待批 (此时页面里还挂着审批卡就是僵尸)。 */
+    static int permStateOf(org.json.JSONArray perms) {
+        if (perms == null) return PERM_UNKNOWN;
+        return perms.length() > 0 ? PERM_NONEMPTY : PERM_EMPTY;
+    }
 
     @Override
     public void onCreate() {
@@ -392,6 +406,7 @@ public class ServerService extends Service {
                         // 同步置待批标志: SSE 健康时 HTTP 轮询会被短路跳过,
                         // 不在这里置位会导致 watchdog 误判空闲而放锁
                         hasPendingApproval = true;
+                        lastPermState = PERM_NONEMPTY;
                         notifyPermissionFromEvent(p);
                     }
                 }
@@ -483,6 +498,8 @@ public class ServerService extends Service {
         // 现在按 id 逐条判断, 任何会话/目录的每个待批准请求都会弹横幅。
         org.json.JSONArray perms = server.listPendingPermissions();
         org.json.JSONArray quests = server.listPendingQuestions();
+        // 三态快照供页面内僵尸审批卡自愈: server 确认空但页面还挂着卡 = 僵尸
+        lastPermState = permStateOf(perms);
         if (perms != null || quests != null) {
             // 审批与提问同为"等用户才继续"的阻塞点, 任一存在都持锁 (防 Doze 漏通知)
             hasPendingApproval = (perms != null && perms.length() > 0)
@@ -811,29 +828,53 @@ public class ServerService extends Service {
         if (id == null || reply == null) return;
         final String label = ServerManager.permReplyLabel(reply);
         new Thread(() -> {
-            boolean ok;
+            int code;
             try {
                 if (dir != null && !dir.isEmpty()) {
-                    ok = server.replyPermission(id, reply, dir);
-                    if (!ok) ok = server.replyPermission(id, reply);
+                    code = server.replyPermissionDetailed(id, reply, dir);
+                    // 指定目录 404 可能是归属目录不对, 回落全目录重试一次
+                    if (code == ServerManager.REPLY_GONE) {
+                        code = server.replyPermissionDetailed(id, reply, null);
+                    }
                 } else {
-                    ok = server.replyPermission(id, reply);
+                    code = server.replyPermissionDetailed(id, reply, null);
                 }
             } catch (Exception e) {
                 Log.w(TAG, "perm reply threw: " + e);
-                ok = false;
+                code = ServerManager.REPLY_UNKNOWN;
             }
             // server 挂死时回包必然超时, 此时说"可能已处理"是误导:
-            // 区分"服务无响应 (稍后重试, 横幅保留)"和"请求已不在 (已处理, 横幅由轮询清理)"
+            // 区分"服务无响应 (稍后重试, 横幅保留)"、"请求已失效 (server 重启导致,
+            // 点了也白点, 必须撤横幅否则僵尸常驻)"和"未知失败 (保留横幅可重试)"
             boolean down = false;
             try {
                 down = !server.isHealthy();
             } catch (Exception ignored) {}
-            final String toast = ok ? label + "该操作"
-                    : (down ? "服务无响应, 稍后重试" : "操作失败 (可能已处理)");
-            // 成功立即撤掉本条横幅 (不等 10s 轮询的 clear, 否则"已处理还挂着");
-            // 失败则保留横幅 (key 未动, 下轮不会重弹打扰, 用户仍可重试)
-            if (ok) {
+            final ServerManager.PermReplyAction action =
+                    ServerManager.permReplyAction(code, !down);
+            final String toast;
+            final boolean dismiss;
+            switch (action) {
+                case DISMISS_DONE:
+                    toast = label + "该操作";
+                    dismiss = true;
+                    break;
+                case DISMISS_GONE:
+                    toast = "该审批已失效 (服务重启导致), 请重发消息继续";
+                    dismiss = true;
+                    break;
+                case KEEP_RETRY_DOWN:
+                    toast = "服务无响应, 稍后重试";
+                    dismiss = false;
+                    break;
+                default:
+                    toast = "操作失败 (可能已处理)";
+                    dismiss = false;
+                    break;
+            }
+            // 成功/失效立即撤掉本条横幅 (不等 10s 轮询的 clear, 否则"已处理还挂着");
+            // 未知失败保留横幅 (key 未动, 下轮不会重弹打扰, 用户仍可重试)
+            if (dismiss) {
                 try {
                     NotificationManager nm2 =
                             (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
@@ -844,7 +885,8 @@ public class ServerService extends Service {
             main.post(() -> android.widget.Toast.makeText(this, toast,
                     android.widget.Toast.LENGTH_SHORT).show());
             Log.i(TAG, "perm reply via notif: " + id + " " + reply
-                    + (dir != null ? " dir=" + dir : "") + " ok=" + ok);
+                    + (dir != null ? " dir=" + dir : "") + " code=" + code
+                    + " action=" + action);
         }, "opencode-perm-reply").start();
     }
 

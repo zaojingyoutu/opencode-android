@@ -747,25 +747,57 @@ public class ServerManager {
         return merged;
     }
 
+    /** 回复结果: 成功 / 请求已不在 (server 重启等导致僵尸审批) / 未知失败 (服务挂/超时) */
+    static final int REPLY_OK = 200;
+    static final int REPLY_GONE = 404;
+    static final int REPLY_UNKNOWN = -1;
+
     /** 回复权限请求: reply = "once"(批准一次) / "reject"(拒绝), <b>子线程调用</b>;
      *  成功返回 true。兼容旧调用: 依次尝试已知的目录直到成功 */
     public boolean replyPermission(String requestId, String reply) {
+        return replyPermissionDetailed(requestId, reply, null) == REPLY_OK;
+    }
+
+    /** 带 directory 的回复 (只试该目录; 调用方自行决定是否回落全目录) */
+    public boolean replyPermission(String requestId, String reply, String directory) {
+        return replyPermissionWithDirectory(requestId, reply, directory) == REPLY_OK;
+    }
+
+    /** 带 HTTP 码的回复: 200 成功; 全部尝试 404=请求已失效;
+     *  全部抛异常=未知失败。directory!=null 时只试该目录 (供调用方逐个回落)。 */
+    public int replyPermissionDetailed(String requestId, String reply, String directory) {
+        if (directory != null && !directory.isEmpty()) {
+            return replyPermissionWithDirectory(requestId, reply, directory);
+        }
         // 先尝试不带目录 (旧 server 兼容)
-        if (replyPermissionWithDirectory(requestId, reply, null)) return true;
+        int code = replyPermissionWithDirectory(requestId, reply, null);
+        if (code == REPLY_OK) return REPLY_OK;
+        int last = code;
         // 再按已知目录逐个尝试
         for (String dir : workspaceDirectories()) {
-            if (replyPermissionWithDirectory(requestId, reply, dir)) return true;
+            code = replyPermissionWithDirectory(requestId, reply, dir);
+            if (code == REPLY_OK) return REPLY_OK;
+            last = code;
         }
-        Log.w(TAG, "permission reply failed for all directories: " + requestId);
-        return false;
+        if (last != REPLY_UNKNOWN) {
+            Log.w(TAG, "permission reply failed for all directories: " + requestId
+                    + " last=" + last);
+        }
+        return last;
     }
 
-    /** 带 directory 的回复 (权限实际归属的目录) */
-    public boolean replyPermission(String requestId, String reply, String directory) {
-        return replyPermissionWithDirectory(requestId, reply, directory);
+    /** 审批横幅动作决策 (纯函数, 可单元测试):
+     *  OK=撤横幅+成功提示; GONE=请求已失效, 撤横幅+失效提示 (僵尸审批不许久留);
+     *  UNKNOWN=服务可能挂了, 保留横幅 (稍后重试), 提示按 server 健康度区分。 */
+    enum PermReplyAction { DISMISS_DONE, DISMISS_GONE, KEEP_RETRY_DOWN, KEEP_RETRY_MAYBE }
+
+    static PermReplyAction permReplyAction(int code, boolean serverHealthy) {
+        if (code == REPLY_OK) return PermReplyAction.DISMISS_DONE;
+        if (code == REPLY_GONE) return PermReplyAction.DISMISS_GONE;
+        return serverHealthy ? PermReplyAction.KEEP_RETRY_MAYBE : PermReplyAction.KEEP_RETRY_DOWN;
     }
 
-    private boolean replyPermissionWithDirectory(String requestId, String reply, String directory) {
+    private int replyPermissionWithDirectory(String requestId, String reply, String directory) {
         try {
             String url = permissionReplyUrl(serverUrl(), requestId);
             if (directory != null && !directory.isEmpty()) {
@@ -788,13 +820,13 @@ public class ServerManager {
                 int code = conn.getResponseCode();
                 Log.i(TAG, "permission reply " + requestId + " " + reply
                         + (directory != null ? " dir=" + directory : "") + ": http " + code);
-                return code == 200;
+                return code;
             } finally {
                 conn.disconnect();
             }
         } catch (Exception e) {
             Log.w(TAG, "permission reply failed: " + e);
-            return false;
+            return REPLY_UNKNOWN;
         }
     }
 
