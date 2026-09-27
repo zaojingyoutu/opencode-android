@@ -1057,10 +1057,12 @@ public class MainActivity extends Activity {
      *
      * 对齐动作 (全部以 server 最新状态为准, 拒绝用 body 长度猜):
      *   - 无未完成且离开期间无新结果 → 不动;
-     *   - 否则轻唤醒页面, 5s 后重拉 server 状态, 用最新回复文本做内容探针:
-     *       · 页面已有该文本 → 已同步, 零 reload (局部刷新的等价效果);
-     *       · 页面缺失 → 掉队: 已完成则 reload 拉结果; 未完成且活跃则 reload 重订阅;
-     *         未完成无进展则 CPU 双检区分慢任务 (reload) 与孤儿 (abort+reload)。
+     *   - 否则立刻轻唤醒页面 (不等 status 拉完, 让页面 SSE 重连与 server 查询并行),
+     *     再用 server 文本做内容探针, 1s 一次、命中即停:
+     *       · 页面已有该文本 → 已同步, 零 reload、零 abort (局部刷新的等价效果);
+     *       · 5s 还没追上 → 走原有对齐判定 (重拉新鲜状态决定 reload/abort)。
+     *   固定等 5s 再判是"每次回来都等很久"的主因之一; 另一个是误判孤儿后 abort
+     *   杀掉正在跑的回复 (任务重做, 等得更久)。探针命中即停同时消除这两项。
      *
      * HTTP 探测必须放子线程: 主线程上 HttpURLConnection 会抛 NetworkOnMainThreadException,
      * 之前直接在 onResume 里调用, 异常被 catch 吞掉后恒等于"没在回复", 于是每次回来都整页
@@ -1068,6 +1070,8 @@ public class MainActivity extends Activity {
      */
     private void resyncAfterBackground() {
         final long pausedAtWall = lastPauseWall;
+        // 先唤醒不等查: 页面 SSE 重连与下面 status 查询并行, 省 ~1s
+        nudgePage();
         new Thread(() -> {
             ServerManager.Status st = embedded.status(true); // 恢复对齐要求最新值, 跳过缓存
             runOnUiThread(() -> {
@@ -1075,14 +1079,38 @@ public class MainActivity extends Activity {
                 if (!st.pending && !(st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall)) {
                     return; // 无未完成且离开期间无新结果: 页面即最新, 不打扰
                 }
-                // 先轻唤醒页面自身重连, 5s 后以 server 最新状态为准判定页面是否掉队
-                nudgePage();
-                new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                    if (isFinishing() || isDestroyed() || webView == null) return;
-                    alignPageWithServer();
-                }, 5000);
+                final String snippet = st.lastText != null ? st.lastText : "";
+                if (snippet.isEmpty()) {
+                    // 纯工具进度无文本可比对: 沿用 body 变化检测, 冻结才走对齐
+                    nudgePageAndCheckIfFrozen(() -> alignPageWithServer());
+                    return;
+                }
+                // 快速探针: 页面追上即停, 5s 未追上才走重对齐 (reload/abort 判定)
+                probeSnippetLoop(snippet, 0);
             });
         }, "opencode-resync").start();
+    }
+
+    /** 内容探针循环: 页面出现目标文本即停 (已同步, 不打扰);
+     *  1s 一次、最多约 5s, 仍未出现则判定掉队走 alignPageWithServer。
+     *  用 status 快照里的文本做探针: 流式回复只会追加, 页面活着必在几秒内追上;
+     *  追不上 = 事件流真死了, reload 才有意义。 */
+    private void probeSnippetLoop(final String snippet, final int attempt) {
+        if (isFinishing() || isDestroyed() || webView == null) return;
+        webView.evaluateJavascript(
+                "(function(){try{var t=document.body?document.body.innerText.replace(/\\s+/g,' '):'';"
+                        + "return t.indexOf(" + org.json.JSONObject.quote(snippet) + ")>=0"
+                        + "}catch(e){return false}})()",
+                v -> {
+                    if (isFinishing() || isDestroyed() || webView == null) return;
+                    if ("true".equals(v)) return; // 追上了, 不打扰
+                    if (attempt >= 4) {
+                        alignPageWithServer();
+                        return;
+                    }
+                    new Handler(Looper.getMainLooper()).postDelayed(
+                            () -> probeSnippetLoop(snippet, attempt + 1), 1000);
+                });
     }
 
     /** 轻唤醒页面 (派发 visibilitychange/focus 让页面自己重连 SSE/拉取), 只唤醒不判断 */
