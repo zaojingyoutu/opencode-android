@@ -240,6 +240,30 @@ public class ServerManagerStatusTest {
     }
 
     @Test
+    public void focusDirectories_addsWorkspaceBesideCached() {
+        java.util.List<String> dirs = ServerManager.focusDirectories("/workspace/app");
+        assertEquals(2, dirs.size());
+        assertEquals("/workspace/app", dirs.get(0));
+        assertEquals("/workspace", dirs.get(1));
+    }
+
+    @Test
+    public void focusDirectories_workspaceOnlyOnce() {
+        java.util.List<String> dirs = ServerManager.focusDirectories("/workspace");
+        assertEquals(1, dirs.size());
+        assertEquals("/workspace", dirs.get(0));
+        assertEquals(java.util.Collections.singletonList("/workspace"),
+                ServerManager.focusDirectories(""));
+    }
+
+    @Test
+    public void probeText_stripsNotificationEllipsis() {
+        assertEquals("hello", ServerManager.probeText("hello"));
+        assertEquals("0123456789", ServerManager.probeText("0123456789…"));
+        assertEquals("", ServerManager.probeText(null));
+    }
+
+    @Test
     public void messageUrl_tailLimitPositive() {
         assertTrue(ServerManager.MESSAGE_TAIL_LIMIT >= 1);
         assertTrue(ServerManager.MAX_RESPONSE_BYTES >= 1024 * 1024);

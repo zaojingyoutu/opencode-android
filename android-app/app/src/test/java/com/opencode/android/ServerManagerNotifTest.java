@@ -1,6 +1,7 @@
 package com.opencode.android;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
@@ -140,6 +141,48 @@ public class ServerManagerNotifTest {
     @Test
     public void sseEventKind_null_isEmpty() {
         assertEquals("", ServerManager.sseEventKind(null));
+    }
+
+    @Test
+    public void sseNeedsStatusPoll_partDelta_falseEvenIfCompletedWord() {
+        assertFalse(ServerManager.sseNeedsStatusPoll(
+                "{\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"state\":{\"status\":\"completed\"},\"time\":{\"end\":1}}}}"));
+    }
+
+    @Test
+    public void sseNeedsStatusPoll_messageUpdatedWithoutCompleted_false() {
+        assertFalse(ServerManager.sseNeedsStatusPoll(
+                "{\"type\":\"message.updated\",\"properties\":{\"info\":{\"time\":{\"created\":1}}}}"));
+    }
+
+    @Test
+    public void sseNeedsStatusPoll_completedNull_false() {
+        assertFalse(ServerManager.sseNeedsStatusPoll(
+                "{\"type\":\"message.updated\",\"properties\":{\"info\":{\"time\":{\"completed\":null}}}}"));
+    }
+
+    @Test
+    public void sseNeedsStatusPoll_messageCompleted_true() {
+        assertTrue(ServerManager.sseNeedsStatusPoll(
+                "{\"type\":\"message.updated\",\"properties\":{\"info\":{\"time\":{\"completed\": 1710000000000}}}}"));
+    }
+
+    @Test
+    public void sseNeedsStatusPoll_sessionIdle_true() {
+        assertTrue(ServerManager.sseNeedsStatusPoll("{\"type\":\"session.idle\",\"properties\":{}}"));
+        assertTrue(ServerManager.sseNeedsStatusPoll(
+                "{\"type\":\"session.status\",\"properties\":{\"status\":{\"type\":\"idle\"}}}"));
+    }
+
+    @Test
+    public void sseNeedsStatusPoll_sessionBusy_false() {
+        assertFalse(ServerManager.sseNeedsStatusPoll(
+                "{\"type\":\"session.status\",\"properties\":{\"status\":{\"type\":\"busy\"}}}"));
+    }
+
+    @Test
+    public void sseNeedsStatusPoll_null_false() {
+        assertFalse(ServerManager.sseNeedsStatusPoll(null));
     }
 
     @Test

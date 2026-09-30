@@ -196,6 +196,8 @@ public class ServerManager {
     private final Object statusLock = new Object();
     private long cachedUpdated = Long.MIN_VALUE;
     private String cachedSid = null;
+    /** 上次看到的最新会话所在目录。回前台只查这个目录和 /workspace, 不再扫全部子项目 */
+    private String cachedDirectory = "";
     private Status cachedStatus;
     private int pendingTicks;
     /** pending 期间每隔几轮强制全量拉取一次 (防缓存与真实状态长期背离), 默认 5 轮 */
@@ -217,24 +219,51 @@ public class ServerManager {
      * @param forceFull true 跳过缓存强制全量拉取 (恢复前台对齐等要求最新值的场景)
      */
     public Status status(boolean forceFull) {
-        org.json.JSONArray sessions;
+        try {
+            return finishStatus(listSessionsAll(), forceFull);
+        } catch (Exception e) {
+            return new Status(-1, "", "", false, false, false, "", false, "");
+        }
+    }
+
+    /** 回前台对齐用: 只查上次会话所在目录和 /workspace。
+     *  还不知道目录时退回全量。通知看护仍用 status() 扫全部子项目。 */
+    public Status statusFocused() {
+        String dir;
+        synchronized (statusLock) {
+            dir = cachedDirectory;
+        }
+        if (dir == null || dir.isEmpty()) return status(true);
+        try {
+            return finishStatus(listSessionsIn(focusDirectories(dir)), true);
+        } catch (Exception e) {
+            return new Status(-1, "", "", false, false, false, "", false, "");
+        }
+    }
+
+    /** 回前台要查的目录: 已知的会话目录, 再加上 /workspace。空目录只查 /workspace。 */
+    static java.util.List<String> focusDirectories(String cached) {
+        java.util.ArrayList<String> dirs = new java.util.ArrayList<>();
+        if (cached != null && !cached.isEmpty() && !"/workspace".equals(cached)) {
+            dirs.add(cached);
+        }
+        dirs.add("/workspace");
+        return dirs;
+    }
+
+    private Status finishStatus(org.json.JSONArray sessions, boolean forceFull) throws Exception {
         long updated;
         String sid;
         String sidDirectory = "";
-        try {
-            sessions = listSessionsAll();
-            int li = latestSessionIndex(sessions);
-            updated = -1;
-            sid = "";
-            if (li >= 0) {
-                org.json.JSONObject latest = sessions.optJSONObject(li);
-                org.json.JSONObject t = latest.optJSONObject("time");
-                updated = t != null ? t.optLong("updated", -1) : -1;
-                sid = latest.optString("id", "");
-                sidDirectory = latest.optString("directory", "");
-            }
-        } catch (Exception e) {
-            return new Status(-1, "", "", false, false, false, "", false, "");
+        int li = latestSessionIndex(sessions);
+        updated = -1;
+        sid = "";
+        if (li >= 0) {
+            org.json.JSONObject latest = sessions.optJSONObject(li);
+            org.json.JSONObject t = latest.optJSONObject("time");
+            updated = t != null ? t.optLong("updated", -1) : -1;
+            sid = latest.optString("id", "");
+            sidDirectory = latest.optString("directory", "");
         }
         // 缓存命中检查（仅加锁比对，不持锁做网络）
         synchronized (statusLock) {
@@ -259,6 +288,7 @@ public class ServerManager {
             pendingTicks = 0;
             cachedUpdated = updated;
             cachedSid = sid;
+            if (sidDirectory != null && !sidDirectory.isEmpty()) cachedDirectory = sidDirectory;
             cachedStatus = s;
         }
         return s;
@@ -290,9 +320,14 @@ public class ServerManager {
      *  directory 逐个请求并按 id 去重合并，保证任何子项目的待批
      *  请求都能被轮询到。 */
     private org.json.JSONArray listSessionsAll() {
+        return listSessionsIn(workspaceDirectories());
+    }
+
+    private org.json.JSONArray listSessionsIn(java.util.List<String> dirs) {
         java.util.Set<String> seen = new java.util.HashSet<>();
         org.json.JSONArray merged = new org.json.JSONArray();
-        for (String dir : workspaceDirectories()) {
+        if (dirs == null) return merged;
+        for (String dir : dirs) {
             try {
                 String url = serverUrl() + "/session?directory="
                         + java.net.URLEncoder.encode(dir, "UTF-8");
@@ -432,6 +467,13 @@ public class ServerManager {
             return input.isEmpty() ? tool : tool + " " + input;
         }
         return "";
+    }
+
+    /** 通知摘要里的省略号不能拿去对页面, 页面正文没有这个字符, 对不上会误判掉队并刷新。 */
+    static String probeText(String lastText) {
+        if (lastText == null || lastText.isEmpty()) return "";
+        if (lastText.endsWith("…")) return lastText.substring(0, lastText.length() - 1);
+        return lastText;
     }
 
     /** 最后一条 text part 的文本摘要 (通知展示用): 折叠空白, 截断 100 字 */
@@ -606,6 +648,38 @@ public class ServerManager {
         if (json.contains("question.asked")) return "question";
         if (json.contains("message.updated") || json.contains("message.part.updated")) return "message";
         return "";
+    }
+
+    /**
+     * 这条 SSE 是否值得再打 HTTP 做完成检测。
+     * 流式 part 增量 (含工具 part 的 status=completed) 只服务于页面渲染, 返回 false。
+     * 仅会话进入 idle, 或 message.updated 带上数字时间戳的 completed, 才返回 true。
+     */
+    public static boolean sseNeedsStatusPoll(String json) {
+        if (json == null || json.isEmpty()) return false;
+        if (json.contains("message.part.updated")) return false;
+        if (json.contains("session.idle")) return true;
+        if (json.contains("\"type\":\"idle\"") || json.contains("\"type\": \"idle\"")) return true;
+        if (!json.contains("message.updated")) return false;
+        int from = 0;
+        while (from < json.length()) {
+            int key = json.indexOf("\"completed\"", from);
+            if (key < 0) return false;
+            int colon = json.indexOf(':', key + 11);
+            if (colon < 0) return false;
+            int j = colon + 1;
+            while (j < json.length()) {
+                char c = json.charAt(j);
+                if (c != ' ' && c != '\n' && c != '\r' && c != '\t') break;
+                j++;
+            }
+            if (j < json.length()) {
+                char c = json.charAt(j);
+                if (c >= '0' && c <= '9') return true;
+            }
+            from = colon + 1;
+        }
+        return false;
     }
 
     /** SSE permission 事件 → 带 id 的请求对象 (properties 扁平结构容错); 无 id 返回 null */

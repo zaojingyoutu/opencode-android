@@ -95,6 +95,11 @@ public class ServerService extends Service {
     /** SSE 健康时跳过 HTTP 轮询的节流: 每 6 轮仍做一次全量心跳, 防静默背离 */
     private int sseSkipTicks = 0;
     private static final int SSE_HEARTBEAT_EVERY = 6;
+    /** 完成边沿唤醒看护线程; 看护线程是唯一会打 status HTTP 的线程, SSE 读循环只发信号 */
+    private final Object notifyLock = new Object();
+    private boolean notifyForceRequested;
+    /** 收到收尾信号后稍等再查, 把单线程 server 先让给页面渲染最终内容 */
+    private static final long NOTIFY_SETTLE_DELAY_MS = 1500;
     private Thread notifyWatcher;
     private volatile boolean notifyWatcherRunning;
     /** 上一轮快照状态, 用于检测"回复结束"边沿 (发完成通知) */
@@ -125,6 +130,8 @@ public class ServerService extends Service {
     static final int PERM_EMPTY = 0;
     static final int PERM_NONEMPTY = 1;
     static volatile int lastPermState = PERM_UNKNOWN;
+    /** 待回答问题三态, 含义同 lastPermState。提问卡和审批卡一样只靠实时事件出现。 */
+    static volatile int lastQuestionState = PERM_UNKNOWN;
 
     /** perms 聚合结果 → 三态 (纯函数, 可单元测试): null=拉取失败未知数;
      *  空=server 确认无待批 (此时页面里还挂着审批卡就是僵尸)。 */
@@ -263,20 +270,50 @@ public class ServerService extends Service {
 
     private void stopNotifyWatcher() {
         notifyWatcherRunning = false;
+        synchronized (notifyLock) {
+            notifyLock.notifyAll();
+        }
         if (notifyWatcher != null) notifyWatcher.interrupt();
         stopSseSubscription();
     }
 
+    /** SSE 读线程调用: 只置位并唤醒看护线程, 自己立刻回去读下一条事件。 */
+    private void requestForcedNotify() {
+        synchronized (notifyLock) {
+            notifyForceRequested = true;
+            notifyLock.notifyAll();
+        }
+    }
+
     private void notifyWatcherLoop() {
         while (notifyWatcherRunning) {
-            try {
-                Thread.sleep(notifyIntervalMs);
-            } catch (InterruptedException e) {
-                break;
+            boolean force = false;
+            synchronized (notifyLock) {
+                if (!notifyForceRequested) {
+                    try {
+                        notifyLock.wait(notifyIntervalMs);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+                if (!notifyWatcherRunning) break;
+                force = notifyForceRequested;
+                notifyForceRequested = false;
             }
-            if (!notifyWatcherRunning) break;
+            if (force) {
+                try {
+                    Thread.sleep(NOTIFY_SETTLE_DELAY_MS);
+                } catch (InterruptedException e) {
+                    break;
+                }
+                if (!notifyWatcherRunning) break;
+                // 等待期间重复的收尾信号并成这一次查询, 避免收尾时连扫两轮目录
+                synchronized (notifyLock) {
+                    notifyForceRequested = false;
+                }
+            }
             try {
-                notifyTick();
+                notifyTick(force);
             } catch (Exception e) {
                 Log.w(TAG, "notifyTick error", e);
             }
@@ -291,7 +328,6 @@ public class ServerService extends Service {
     private volatile boolean sseRunning;
     private volatile java.net.HttpURLConnection sseConn;
     private volatile String lastSessionTitle = "";
-    private volatile long lastSseCheckMs;
 
     private void startSseSubscription() {
         if (sseRunning) return;
@@ -372,11 +408,15 @@ public class ServerService extends Service {
     }
 
     /** 处理 server 事件: permission.asked 直接触发通知 (负载自带请求字段, 零 HTTP);
-     *  message.updated 触发一次完成检测 (节流)。
+     *  回复收尾 (session idle / message.completed) 只唤醒看护线程做一次完成检测。
+     *  message.part.updated 是页面渲染用的流式增量, 这里不解析、不打 HTTP:
+     *  读循环一旦同步去扫多目录状态, 单线程 server 就没法把下一块内容写给 WebView。
      *  兼容全局事件包装: /global/event 的 data 是 {directory, payload:{type,...}},
      *  而 /event 的 data 直接就是 {type,...}。 */
     private void handleServerEvent(String json) {
         try {
+            if (json != null && json.contains("message.part.updated")) return;
+            boolean pollStatus = ServerManager.sseNeedsStatusPoll(json);
             String effectiveJson = json;
             String eventDirectory = null;
             try {
@@ -421,17 +461,14 @@ public class ServerService extends Service {
                     if (!questionNotifiedKey.contains(id + ",")) {
                         questionNotifiedKey += id + ",";
                         hasPendingApproval = true;
+                        lastQuestionState = PERM_NONEMPTY;
                         notifyQuestionNeeded(q);
                     }
                 }
-            } else if ("message".equals(kind)) {
-                long now = android.os.SystemClock.elapsedRealtime();
-                if (now - lastSseCheckMs > 2000) {
-                    lastSseCheckMs = now;
-                    // 立刻跑一次检测 (完成边沿); server 刚发完事件必然活着, 查询很快.
-                    // 注意必须 force: 此时 sseFresh 刚更新, 非 force 会被短路跳过
-                    notifyTick(true);
-                }
+            }
+            if (pollStatus) {
+                // 不在读线程上查状态。force 才能越过 SSE 健康短路, 否则完成边沿会被跳过
+                requestForcedNotify();
             }
         } catch (Exception e) {
             Log.w(TAG, "handle event error", e);
@@ -500,6 +537,7 @@ public class ServerService extends Service {
         org.json.JSONArray quests = server.listPendingQuestions();
         // 三态快照供页面内僵尸审批卡自愈: server 确认空但页面还挂着卡 = 僵尸
         lastPermState = permStateOf(perms);
+        lastQuestionState = permStateOf(quests);
         if (perms != null || quests != null) {
             // 审批与提问同为"等用户才继续"的阻塞点, 任一存在都持锁 (防 Doze 漏通知)
             hasPendingApproval = (perms != null && perms.length() > 0)

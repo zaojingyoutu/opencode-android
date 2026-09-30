@@ -66,11 +66,16 @@ public class MainActivity extends Activity {
     private boolean pageFailed = false;
     /** 当前页面 URL (onPageStarted 在 UI 线程更新; 供 JS 桥后台线程做来源校验) */
     private volatile String webViewUrl;
-    private long lastPauseElapsed;
     /** 进入后台时的墙上时间, 用于和 server 侧会话更新时间比较, 判断离开期间有无进展 */
     private long lastPauseWall;
-    // 后台超过该时长才在回前台时刷新页面 (快速切回/文件选择返回不打断使用)
-    private static final long BG_REFRESH_THRESHOLD_MS = 30_000;
+    /** 回前台先让页面自己重连并画出内容, 再查 server。并行查会占满单线程 server, 页面像没返回数据 */
+    private static final long RESYNC_DEFER_MS = 1500;
+    /** 待批请求已在 server 上、页面却没有审批卡时, 先留这点时间给还活着的 SSE 自己画出来 */
+    private static final long PERM_CARD_GRACE_MS = 1000;
+    /** 取消过期的回前台对齐 (再次进后台时递增) */
+    private int resyncGen;
+    /** 取消过期的审批卡对账 (深链已经整页跳走, 或又一次进入后台) */
+    private int permReconcileGen;
     private static final int FILECHOOSER_RESULT_CODE = 1001;
     private ValueCallback<Uri[]> filePathCallback;
     // 深链：来自审批横幅的目录/会话，点开后 WebView 需切到对应项目/会话
@@ -97,9 +102,18 @@ public class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         handlePermissionIntent(intent);
-        // 若 WebView 已就绪，直接尝试深链跳转；否则 pending 会在 onPageFinished 时消费
-        if (webView != null && pendingDirectory != null) {
-            webView.evaluateJavascript(pendingDeepLinkJs(), null);
+        // 若 WebView 已就绪，直接尝试深链跳转；否则 pending 会在 onPageFinished 时消费。
+        // 已经停在目标会话上时跳转是空操作, 漏掉的审批卡要靠对账补一次刷新。
+        if (webView != null && pendingSessionId != null) {
+            webView.evaluateJavascript(pendingDeepLinkJs(), v -> {
+                if ("true".equals(v)) {
+                    permReconcileGen++;
+                    return;
+                }
+                schedulePromptReconcile();
+            });
+        } else {
+            schedulePromptReconcile();
         }
     }
 
@@ -125,14 +139,68 @@ public class MainActivity extends Activity {
         // 无会话只有目录时不动当前页 (避免正常启动被误跳空白), 目录靠请求头透传。
         return "(function(){try{"
                 + "var d='" + dir + "';var s='" + sess + "';"
-                + "if(!s)return;"
-                + "if(d){"
+                + "if(!s)return false;"
+                + "if(!d)return false;"
                 + "var b=btoa(unescape(encodeURIComponent(d)))"
                 + ".replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=/g,'');"
                 + "var target='/'+b+'/session/'+encodeURIComponent(s);"
-                + "if(location.pathname!==target)location.href=target;"
-                + "}"
-                + "}catch(e){}})()";
+                + "if(location.pathname!==target){location.href=target;return true;}"
+                + "return false;"
+                + "}catch(e){return false}})()";
+    }
+
+    /** server 快照里还有审批或提问、页面 1 秒后仍没有对应卡片 → 先再问一次 server, 确认后才刷新。
+     *  快照在 SSE 健康时最多大约一分钟才更新, 页面里刚批完不能拿旧快照直接刷新。 */
+    private void schedulePromptReconcile() {
+        if (webView == null) return;
+        final boolean permSnap = ServerService.lastPermState == ServerService.PERM_NONEMPTY;
+        final boolean questionSnap = ServerService.lastQuestionState == ServerService.PERM_NONEMPTY;
+        if (!permSnap && !questionSnap) return;
+        final int gen = ++permReconcileGen;
+        handler.postDelayed(() -> {
+            if (gen != permReconcileGen || isFinishing() || isDestroyed() || webView == null) return;
+            webView.evaluateJavascript(
+                    "(function(){try{var p=document.querySelector('[data-kind=\"permission\"]')?1:0;"
+                            + "var q=document.querySelector('[data-kind=\"question\"]')?2:0;"
+                            + "return p+q}catch(e){return 0}})()",
+                    v -> {
+                        if (gen != permReconcileGen || isFinishing() || isDestroyed() || webView == null) {
+                            return;
+                        }
+                        int flags = 0;
+                        try {
+                            flags = Integer.parseInt(v);
+                        } catch (Exception ignored) {}
+                        final boolean needPerm = permSnap && (flags & 1) == 0;
+                        final boolean needQuestion = questionSnap && (flags & 2) == 0;
+                        if (!needPerm && !needQuestion) return;
+                        new Thread(() -> {
+                            boolean stillPerm = false;
+                            boolean stillQuestion = false;
+                            if (needPerm) {
+                                int state = ServerService.permStateOf(embedded.listPendingPermissions());
+                                ServerService.lastPermState = state;
+                                stillPerm = state == ServerService.PERM_NONEMPTY;
+                            }
+                            if (needQuestion) {
+                                int state = ServerService.permStateOf(embedded.listPendingQuestions());
+                                ServerService.lastQuestionState = state;
+                                stillQuestion = state == ServerService.PERM_NONEMPTY;
+                            }
+                            if (!stillPerm && !stillQuestion) return;
+                            runOnUiThread(() -> {
+                                if (gen != permReconcileGen || isFinishing() || isDestroyed()
+                                        || webView == null) {
+                                    return;
+                                }
+                                Log.i("MainActivity", "pending prompt missing on page, reload");
+                                permReconcileGen++;
+                                resyncGen++;
+                                webView.reload();
+                            });
+                        }, "opencode-prompt").start();
+                    });
+        }, PERM_CARD_GRACE_MS);
     }
 
     private void buildUI() {
@@ -855,7 +923,7 @@ public class MainActivity extends Activity {
         check[0] = () -> {
             if (isFinishing() || isDestroyed() || webView == null) return;
             webView.evaluateJavascript(
-                    "(function(){try{var t=document.body?document.body.innerText.replace(/\\s+/g,' ').trim():'';return t.length}catch(e){return -1}})()",
+                    "(function(){try{var t=document.body?document.body.textContent.trim():'';return t.length}catch(e){return -1}})()",
                     v -> {
                         if (isFinishing() || isDestroyed() || webView == null) return;
                         boolean ready = false;
@@ -1012,7 +1080,8 @@ public class MainActivity extends Activity {
         // 不暂停 WebView: 保留页面 DOM/滚动位置, 后台回来不闪白、不整页重载。
         // 后台耗电由 ServerService 看护兜底 (空闲释放唤醒锁 / 长时间空闲自动停止 server)。
         wasBackgrounded = true;
-        lastPauseElapsed = SystemClock.elapsedRealtime();
+        resyncGen++;
+        permReconcileGen++;
         lastPauseWall = System.currentTimeMillis();
     }
 
@@ -1033,11 +1102,10 @@ public class MainActivity extends Activity {
         hadAllFilesAccess = granted;
         if (wasBackgrounded) {
             wasBackgrounded = false;
-            // 文件选择器返回 / 快速切回: 无需任何处理
-            if (pendingFileChooser ||
-                    SystemClock.elapsedRealtime() - lastPauseElapsed < BG_REFRESH_THRESHOLD_MS) {
-                return;
-            }
+            // 文件选择器返回不打断当前页。其余回到前台都唤醒并对齐正文,
+            // 离开多久都一样: 短时间切走时 WebView 也可能被冻住, 漏掉的回复不会自己补上。
+            if (pendingFileChooser) return;
+            schedulePromptReconcile();
             if (embedded.isRunning()) {
                 resyncAfterBackground();
             } else {
@@ -1056,61 +1124,70 @@ public class MainActivity extends Activity {
      * 页面就停在断掉的 SSE 订阅上永远显示"思考中"。
      *
      * 对齐动作 (全部以 server 最新状态为准, 拒绝用 body 长度猜):
+     *   - 立刻轻唤醒页面, 让它自己重连 SSE 并先画出内容;
+     *   - 等一小段再查 server。立刻并行 status() 会按目录扇出占满单线程 server,
+     *     页面请求排不上, 看起来像没有返回、也没有渲染;
      *   - 无未完成且离开期间无新结果 → 不动;
-     *   - 否则立刻轻唤醒页面 (不等 status 拉完, 让页面 SSE 重连与 server 查询并行),
-     *     再用 server 文本做内容探针, 1s 一次、命中即停:
-     *       · 页面已有该文本 → 已同步, 零 reload、零 abort (局部刷新的等价效果);
-     *       · 5s 还没追上 → 走原有对齐判定 (重拉新鲜状态决定 reload/abort)。
-     *   固定等 5s 再判是"每次回来都等很久"的主因之一; 另一个是误判孤儿后 abort
-     *   杀掉正在跑的回复 (任务重做, 等得更久)。探针命中即停同时消除这两项。
+     *   - 否则用 textContent 对一下最新文本 (不用 innerText, 那会强制整页布局, 绘制被卡住):
+     *       · 页面已有该文本 → 已同步, 零 reload、零 abort;
+     *       · 再等一轮仍没有 → 走对齐判定 (reload/abort)。
      *
      * HTTP 探测必须放子线程: 主线程上 HttpURLConnection 会抛 NetworkOnMainThreadException,
      * 之前直接在 onResume 里调用, 异常被 catch 吞掉后恒等于"没在回复", 于是每次回来都整页
      * reload (既闪白又让回复中分支成了死代码)。
      */
     private void resyncAfterBackground() {
+        final int gen = ++resyncGen;
         final long pausedAtWall = lastPauseWall;
-        // 先唤醒不等查: 页面 SSE 重连与下面 status 查询并行, 省 ~1s
         nudgePage();
-        new Thread(() -> {
-            ServerManager.Status st = embedded.status(true); // 恢复对齐要求最新值, 跳过缓存
-            runOnUiThread(() -> {
-                if (isFinishing() || isDestroyed() || webView == null) return;
-                if (!st.pending && !(st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall)) {
-                    return; // 无未完成且离开期间无新结果: 页面即最新, 不打扰
-                }
-                final String snippet = st.lastText != null ? st.lastText : "";
-                if (snippet.isEmpty()) {
-                    // 纯工具进度无文本可比对: 沿用 body 变化检测, 冻结才走对齐
-                    nudgePageAndCheckIfFrozen(() -> alignPageWithServer());
-                    return;
-                }
-                // 快速探针: 页面追上即停, 5s 未追上才走重对齐 (reload/abort 判定)
-                probeSnippetLoop(snippet, 0);
-            });
-        }, "opencode-resync").start();
-    }
-
-    /** 内容探针循环: 页面出现目标文本即停 (已同步, 不打扰);
-     *  1s 一次、最多约 5s, 仍未出现则判定掉队走 alignPageWithServer。
-     *  用 status 快照里的文本做探针: 流式回复只会追加, 页面活着必在几秒内追上;
-     *  追不上 = 事件流真死了, reload 才有意义。 */
-    private void probeSnippetLoop(final String snippet, final int attempt) {
-        if (isFinishing() || isDestroyed() || webView == null) return;
-        webView.evaluateJavascript(
-                "(function(){try{var t=document.body?document.body.innerText.replace(/\\s+/g,' '):'';"
-                        + "return t.indexOf(" + org.json.JSONObject.quote(snippet) + ")>=0"
-                        + "}catch(e){return false}})()",
-                v -> {
-                    if (isFinishing() || isDestroyed() || webView == null) return;
-                    if ("true".equals(v)) return; // 追上了, 不打扰
-                    if (attempt >= 4) {
-                        alignPageWithServer();
+        handler.postDelayed(() -> {
+            if (gen != resyncGen || isFinishing() || isDestroyed() || webView == null) return;
+            new Thread(() -> {
+                ServerManager.Status st = embedded.statusFocused();
+                runOnUiThread(() -> {
+                    if (gen != resyncGen || isFinishing() || isDestroyed() || webView == null) return;
+                    if (!st.pending && !(st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall)) {
+                        return; // 无未完成且离开期间无新结果: 页面即最新, 不打扰
+                    }
+                    final String snippet = ServerManager.probeText(st.lastText);
+                    if (snippet.isEmpty()) {
+                        // 纯工具进度无文本可比对: 沿用文本长度变化检测, 冻结才走对齐
+                        nudgePageAndCheckIfFrozen(() -> alignPageWithServer());
                         return;
                     }
-                    new Handler(Looper.getMainLooper()).postDelayed(
-                            () -> probeSnippetLoop(snippet, attempt + 1), 1000);
+                    probeSnippetLoop(gen, snippet, 0);
                 });
+            }, "opencode-resync").start();
+        }, RESYNC_DEFER_MS);
+    }
+
+    /** 内容探针: 页面出现目标文本即停 (已同步, 不打扰);
+     *  用 textContent, 不触发整页布局。查两次, 间隔 2s, 仍没有才走 alignPageWithServer。
+     *  追不上 = 事件流真死了, reload 才有意义。 */
+    private void probeSnippetLoop(final int gen, final String snippet, final int attempt) {
+        if (gen != resyncGen || isFinishing() || isDestroyed() || webView == null) return;
+        webView.evaluateJavascript(pageHasSnippetJs(snippet), v -> {
+            if (gen != resyncGen || isFinishing() || isDestroyed() || webView == null) return;
+            if ("true".equals(v)) return;
+            if (attempt >= 1) {
+                alignPageWithServer();
+                return;
+            }
+            handler.postDelayed(() -> probeSnippetLoop(gen, snippet, attempt + 1), 2000);
+        });
+    }
+
+    /** 页面是否包含片段。只读最近几条时间线, 不拷整页正文, 也不用 innerText 强制布局。
+     *  没有时间线节点时才退回整页 textContent。 */
+    private static String pageHasSnippetJs(String snippet) {
+        return "(function(){try{"
+                + "var nodes=document.querySelectorAll('[data-timeline-part-id]');"
+                + "var t='';"
+                + "if(nodes.length){var i=Math.max(0,nodes.length-8);for(;i<nodes.length;i++)t+=nodes[i].textContent||'';}"
+                + "else if(document.body)t=document.body.textContent||'';"
+                + "t=t.replace(/\\s+/g,' ');"
+                + "return t.indexOf(" + org.json.JSONObject.quote(snippet) + ")>=0"
+                + "}catch(e){return false}})()";
     }
 
     /** 轻唤醒页面 (派发 visibilitychange/focus 让页面自己重连 SSE/拉取), 只唤醒不判断 */
@@ -1133,8 +1210,8 @@ public class MainActivity extends Activity {
     private void alignPageWithServer() {
         new Thread(() -> {
             // 判定必须用等窗后的最新值: 5s 内回复可能已完成, 拿旧快照会误判
-            final ServerManager.Status fresh = embedded.status(true);
-            final String snippet = fresh.lastText != null ? fresh.lastText : "";
+            final ServerManager.Status fresh = embedded.statusFocused();
+            final String snippet = ServerManager.probeText(fresh.lastText);
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed() || webView == null) return;
                 if (snippet.isEmpty()) {
@@ -1142,10 +1219,7 @@ public class MainActivity extends Activity {
                     nudgePageAndCheckIfFrozen(() -> decideStalledFresh(fresh));
                     return;
                 }
-                webView.evaluateJavascript(
-                        "(function(){try{var t=document.body?document.body.innerText.replace(/\\s+/g,' '):'';"
-                        + "return t.indexOf(" + org.json.JSONObject.quote(snippet) + ")>=0"
-                        + "}catch(e){return false}})()",
+                webView.evaluateJavascript(pageHasSnippetJs(snippet),
                         v -> {
                             if (isFinishing() || isDestroyed() || webView == null) return;
                             if ("true".equals(v)) return; // 页面已有最新内容, 不打扰
@@ -1167,7 +1241,7 @@ public class MainActivity extends Activity {
         if (webView == null) return;
         webView.evaluateJavascript(
                 "(function(){try{" +
-                "window.__ocBodyLen=document.body?document.body.innerText.length:-1;" +
+                "window.__ocBodyLen=document.body?document.body.textContent.length:-1;" +
                 "document.dispatchEvent(new Event('visibilitychange'));" +
                 "window.dispatchEvent(new Event('focus'));" +
                 "}catch(e){}})()", null);
@@ -1175,7 +1249,7 @@ public class MainActivity extends Activity {
             if (isFinishing() || isDestroyed() || webView == null) return;
             webView.evaluateJavascript(
                     "(function(){try{" +
-                    "return window.__ocBodyLen===document.body.innerText.length" +
+                    "return window.__ocBodyLen===document.body.textContent.length" +
                     "}catch(e){return false}})()",
                     v -> {
                         if (isFinishing() || isDestroyed() || webView == null) return;
