@@ -272,6 +272,12 @@ public class MainActivity extends Activity {
                     view.evaluateJavascript(
                             healJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
                 }
+                // 输入栏刷新: 发送按钮左侧, SPA 重绘后轮询补回; 模型名过长时省略
+                String refreshJs = refreshInjectJs();
+                if (refreshJs != null) {
+                    view.evaluateJavascript(
+                            refreshJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
+                }
                 // 深链：审批横幅点进来的目录/会话，切到对应项目并打开会话
                 if (pendingDirectory != null || pendingSessionId != null) {
                     String deepJs = pendingDeepLinkJs();
@@ -844,6 +850,7 @@ public class MainActivity extends Activity {
     private String chatImagesJsCache;
     private String mobileCssCache;
     private String permHealJsCache;
+    private String refreshJsCache;
 
     /** 读取注入脚本 (assets/inject/lan.js), 缺失时返回 null 静默跳过 */
     private String lanInjectJs() {
@@ -888,6 +895,21 @@ public class MainActivity extends Activity {
             permHealJsCache = "";
         }
         return permHealJsCache.isEmpty() ? null : permHealJsCache;
+    }
+
+    /** 读取注入脚本 (assets/inject/refresh.js): 发送按钮左侧的手动刷新 */
+    private String refreshInjectJs() {
+        if (refreshJsCache != null) return refreshJsCache.isEmpty() ? null : refreshJsCache;
+        try (InputStream in = getAssets().open("inject/refresh.js")) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(2048);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            refreshJsCache = bos.toString("UTF-8");
+        } catch (Exception e) {
+            refreshJsCache = "";
+        }
+        return refreshJsCache.isEmpty() ? null : refreshJsCache;
     }
 
     /** 读取移动端适配 CSS (assets/inject/mobile.css), 缺失返回 null 静默跳过 */

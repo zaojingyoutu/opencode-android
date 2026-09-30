@@ -18,3 +18,43 @@ img, video, canvas, svg { max-width: 100% !important; }
 
 /* 输入区字号兜底: 部分 ROM 的 WebView 对小字号输入框聚焦时整页缩放 */
 input, textarea { font-size: 16px; }
+
+/* 输入栏: 模型名是唯一可收缩项, 操作按钮保持固定尺寸 */
+[data-component="prompt-model-control"] {
+  min-width: 0;
+  flex: 1 1 0%;
+  overflow: hidden;
+}
+[data-component="prompt-model-control"] > * {
+  min-width: 0;
+  max-width: 100%;
+  display: block;
+}
+[data-action="prompt-model"] {
+  max-width: 100% !important;
+  min-width: 0 !important;
+  overflow: hidden;
+}
+[data-component="prompt-agent-control"],
+[data-component="prompt-variant-control"],
+[data-action="prompt-attach"],
+[data-action="prompt-submit"],
+[data-oc-refresh] {
+  flex-shrink: 0;
+}
+[data-oc-refresh] {
+  flex: none;
+  box-sizing: border-box;
+  width: 32px;
+  height: 32px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
