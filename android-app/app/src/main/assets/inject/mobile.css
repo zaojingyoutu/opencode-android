@@ -42,7 +42,8 @@ input, textarea { font-size: 16px; }
 [data-oc-refresh] {
   flex-shrink: 0;
 }
-[data-oc-refresh] {
+[data-oc-refresh],
+[data-oc-more] {
   flex: none;
   box-sizing: border-box;
   width: 32px;
@@ -57,4 +58,39 @@ input, textarea { font-size: 16px; }
   background: transparent;
   color: inherit;
   cursor: pointer;
+}
+
+/* 窄屏: 输入栏只留模型名, 智能体和变体收到「更多」。
+   侧栏、文件树、审查面板由页面自己的断点收起, 这里不动标题栏菜单。 */
+@media (max-width: 640px) {
+  [data-oc-dock] {
+    height: auto !important;
+    min-height: 28px;
+    flex-wrap: wrap;
+    align-items: center;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  [data-oc-dock] [data-component="prompt-agent-control"],
+  [data-oc-dock] [data-component="prompt-variant-control"] {
+    display: none !important;
+  }
+  [data-oc-dock][data-oc-open] [data-component="prompt-agent-control"],
+  [data-oc-dock][data-oc-open] [data-component="prompt-variant-control"] {
+    display: block !important;
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 100%;
+  }
+  [data-action="prompt-submit"],
+  [data-action="prompt-attach"],
+  [data-oc-refresh] {
+    width: 40px !important;
+    height: 40px !important;
+    min-width: 40px;
+    min-height: 40px;
+  }
+}
+
+@media (min-width: 641px) {
+  [data-oc-more] { display: none !important; }
 }

@@ -212,7 +212,9 @@ public class MainActivity extends Activity {
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
         ws.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
-        ws.setBuiltInZoomControls(true);
+        // 整页缩放会按错误宽度重排窄屏布局。代码块自己横向滚动, 不靠捏合放大。
+        ws.setSupportZoom(false);
+        ws.setBuiltInZoomControls(false);
         ws.setDisplayZoomControls(false);
         // 响应式页面按 viewport meta 排版, 不再整体缩小适配 (字小/布局挤的主因之一)
         ws.setLoadWithOverviewMode(false);
@@ -271,6 +273,19 @@ public class MainActivity extends Activity {
                 if (healJs != null) {
                     view.evaluateJavascript(
                             healJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
+                }
+                // 删除/更新请求补上目录参数。页面只在 GET 上带 directory,
+                // 写请求会落到容器默认目录, 会话删不掉。
+                String dirJs = directoryInjectJs();
+                if (dirJs != null) {
+                    view.evaluateJavascript(
+                            dirJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
+                }
+                // 触摸点菜单项后，补发的 click 会打在刚打开的确认框遮罩上，把弹窗立刻关掉
+                String touchMenuJs = touchMenuInjectJs();
+                if (touchMenuJs != null) {
+                    view.evaluateJavascript(
+                            touchMenuJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
                 }
                 // 输入栏刷新: 发送按钮左侧, SPA 重绘后轮询补回; 模型名过长时省略
                 String refreshJs = refreshInjectJs();
@@ -851,6 +866,8 @@ public class MainActivity extends Activity {
     private String mobileCssCache;
     private String permHealJsCache;
     private String refreshJsCache;
+    private String directoryJsCache;
+    private String touchMenuJsCache;
 
     /** 读取注入脚本 (assets/inject/lan.js), 缺失时返回 null 静默跳过 */
     private String lanInjectJs() {
@@ -895,6 +912,36 @@ public class MainActivity extends Activity {
             permHealJsCache = "";
         }
         return permHealJsCache.isEmpty() ? null : permHealJsCache;
+    }
+
+    /** 读取注入脚本 (assets/inject/directory.js): 写请求补上会话所在目录 */
+    private String directoryInjectJs() {
+        if (directoryJsCache != null) return directoryJsCache.isEmpty() ? null : directoryJsCache;
+        try (InputStream in = getAssets().open("inject/directory.js")) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(2048);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            directoryJsCache = bos.toString("UTF-8");
+        } catch (Exception e) {
+            directoryJsCache = "";
+        }
+        return directoryJsCache.isEmpty() ? null : directoryJsCache;
+    }
+
+    /** 读取注入脚本 (assets/inject/touch-menu.js): 丢掉菜单项触摸后补发的 click */
+    private String touchMenuInjectJs() {
+        if (touchMenuJsCache != null) return touchMenuJsCache.isEmpty() ? null : touchMenuJsCache;
+        try (InputStream in = getAssets().open("inject/touch-menu.js")) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(2048);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            touchMenuJsCache = bos.toString("UTF-8");
+        } catch (Exception e) {
+            touchMenuJsCache = "";
+        }
+        return touchMenuJsCache.isEmpty() ? null : touchMenuJsCache;
     }
 
     /** 读取注入脚本 (assets/inject/refresh.js): 发送按钮左侧的手动刷新 */
