@@ -136,7 +136,7 @@ sh scripts/build-all.sh              # 正式 debug 包
 # 输出 android-app/app/build/outputs/apk/debug/app-debug.apk, 拷到 /workspace/app-beta.apk 即可在手机上装
 ```
 
-- 版本号自动推导 (与 CI 同算法): versionCode = 2000000 + 总提交数 (每次递增);
+- 版本号自动推导 (与 CI 同算法): versionCode = 2200000 + 总提交数 (每次递增);
   versionName = HEAD 所在/最近 vX.Y.Z tag (tag 构建用 tag 名, 保证 tag==versionName)
 - Alpine 上自动注入 aarch64 aapt2 + musl JDK apkzlib 补丁; 持久化 Gradle/SDK 缓存到 /workspace,
   容器重启后不再重复下载 (首次构建约几分钟, 之后 20-30s)
