@@ -91,6 +91,52 @@ public class ServerManagerStatusTest {
         assertFalse(s.error);
     }
 
+    // ---- 已完成的回复也要带出正文和完成时刻 ----
+    // 回归: 这两样之前在 completed 分支被硬编码成空串/0, 导致
+    //   1) 「已完成但页面没渲染 → reload」的唯一正解永远走不到 (内容探针拿到空串)
+    //   2) 回前台门槛只看 session.time.updated, 而它完成时不推进 (实测落后数分钟),
+    //      后台刚跑完的回复被判成"页面已是最新"而直接跳过对齐。
+
+    @Test
+    public void completedMessage_keepsLastTextAndCompletedTime() throws Exception {
+        String parts = "[{\"type\":\"text\",\"text\":\"后台跑完的结果\"}]";
+        String msgs = "[" + msg("assistant", NOW - MIN, true, false, parts) + "]";
+        ServerManager.Status s = parse("[" + session("ses_1", "t", NOW) + "]", msgs);
+        assertEquals("后台跑完的结果", s.lastText);
+        assertEquals(NOW - MIN + 1000, s.lastCompletedMs);
+    }
+
+    @Test
+    public void completedMessage_completedTimeAheadOfSessionUpdated() throws Exception {
+        // 真机形态: session.updated 落后于消息完成时刻数分钟, 两者不能混为一谈
+        long staleSessionUpdate = NOW - 5 * MIN;
+        String parts = "[{\"type\":\"text\",\"text\":\"x\"}]";
+        String msgs = "[" + msg("assistant", NOW - MIN, true, false, parts) + "]";
+        ServerManager.Status s = parse(
+                "[" + session("ses_1", "t", staleSessionUpdate) + "]", msgs);
+        assertEquals(staleSessionUpdate, s.sessionUpdated);
+        assertTrue(s.lastCompletedMs > s.sessionUpdated);
+    }
+
+    @Test
+    public void erroredMessage_keepsLastTextAndCompletedTime() throws Exception {
+        String parts = "[{\"type\":\"text\",\"text\":\"跑了一半\"}]";
+        String msgs = "[" + msg("assistant", NOW - MIN, false, true, parts) + "]";
+        ServerManager.Status s = parse("[" + session("ses_1", "t", NOW) + "]", msgs);
+        assertTrue(s.error);
+        assertEquals("跑了一半", s.lastText);
+    }
+
+    @Test
+    public void pendingMessage_hasNoCompletedTime() throws Exception {
+        String parts = "[{\"type\":\"text\",\"time\":{\"start\":" + (NOW - 30_000)
+                + "},\"text\":\"生成中\"}]";
+        String msgs = "[" + msg("assistant", NOW - 30_000, false, false, parts) + "]";
+        ServerManager.Status s = parse("[" + session("ses_1", "t", NOW) + "]", msgs);
+        assertTrue(s.pending);
+        assertEquals(0L, s.lastCompletedMs);
+    }
+
     @Test
     public void erroredMessage_errorFlag() throws Exception {
         String msgs = "[" + msg("assistant", NOW - MIN, false, true, "[]") + "]";

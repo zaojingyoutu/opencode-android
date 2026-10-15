@@ -173,10 +173,24 @@ public class ServerManager {
         public final boolean waitingApproval;
         /** 待批准工具的摘要 (工具名+输入, 通知展示用); 无为空串 */
         public final String permissionText;
+        /** 最后一条消息的 time.completed (ms 墙上时间); 无完成消息为 0。
+         *
+         *  为什么需要它: 实测 session.time.updated 在消息完成时**不会**推进 (真机实测
+         *  落后完成时刻约 4 分钟), 所以「离开前台期间有没有新结果」不能只看
+         *  sessionUpdated, 否则后台刚跑完的回复会被误判成"页面已是最新"而跳过对齐,
+         *  表现就是回前台正文永远停在后台断掉的那一帧。completed 是真正推进的字段。 */
+        public final long lastCompletedMs;
 
         Status(long sessionUpdated, String sessionId, String sessionTitle,
                 boolean pending, boolean replying, boolean error, String lastText,
                 boolean waitingApproval, String permissionText) {
+            this(sessionUpdated, sessionId, sessionTitle, pending, replying, error,
+                    lastText, waitingApproval, permissionText, 0L);
+        }
+
+        Status(long sessionUpdated, String sessionId, String sessionTitle,
+                boolean pending, boolean replying, boolean error, String lastText,
+                boolean waitingApproval, String permissionText, long lastCompletedMs) {
             this.sessionUpdated = sessionUpdated;
             this.sessionId = sessionId;
             this.sessionTitle = sessionTitle;
@@ -186,6 +200,7 @@ public class ServerManager {
             this.lastText = lastText;
             this.waitingApproval = waitingApproval;
             this.permissionText = permissionText;
+            this.lastCompletedMs = lastCompletedMs;
         }
     }
 
@@ -376,6 +391,9 @@ public class ServerManager {
                 if (dirs.size() >= 30) break;
             }
         }
+        // 公共目录也算工作区: 在 Download/Documents 里干活时, 通知看护和审批横幅
+        // 同样要能看到对应会话, 否则那边完全没有提醒。
+        dirs.addAll(publicProjectDirectories());
         return dirs;
     }
 
@@ -420,11 +438,20 @@ public class ServerManager {
         org.json.JSONObject info = msg != null ? msg.optJSONObject("info") : null;
         if (info == null) return new Status(updated, sid, title, false, false, false, "", false, "");
         org.json.JSONObject time = info.optJSONObject("time");
-        if (time != null && time.has("completed"))
-            return new Status(updated, sid, title, false, false, false, "", false, "");
-        if (!info.isNull("error"))
-            return new Status(updated, sid, title, false, false, true, "", false, "");
+        long completed = time != null ? time.optLong("completed", 0L) : 0L;
         org.json.JSONArray parts = msg.optJSONArray("parts");
+        // 已完成的回复也要带出正文和 completed 时刻:
+        // - lastText: 之前这里硬编码空串, 导致「已完成但页面没渲染 → reload」这段
+        //   唯一的正解在 completed 分支永远走不到 (探针拿到空 snippet 直接跳过),
+        //   回前台丢内容是必然而不是偶发。
+        // - lastCompletedMs: session.time.updated 完成时不推进 (实测落后数分钟),
+        //   只有 completed 能可靠回答「离开前台期间有没有新结果」。
+        if (time != null && time.has("completed"))
+            return new Status(updated, sid, title, false, false, false,
+                    lastTextOf(parts), false, "", completed);
+        if (!info.isNull("error"))
+            return new Status(updated, sid, title, false, false, true,
+                    lastTextOf(parts), false, "", completed);
         long progress = Math.max(time != null ? time.optLong("created", -1) : -1,
                 latestPartTs(parts));
         // 关键: 长命令 (构建/安装/测试/下载) 执行期间不会产生任何时间戳更新,
@@ -1720,16 +1747,64 @@ public class ServerManager {
     }
 
     /** 项目目录: 固定 /sdcard/opencode (卸载不丢, 文件管理器可见);
-     *  未授予"所有文件访问"权限或创建失败时回退 app 专属外部目录 (卸载会删) */
+     *  未授予"所有文件访问"权限或创建失败时回退 app 专属外部目录 (卸载会删)。
+     *
+     *  注意: 这只是 opencode 的**默认**项目根。整个共享存储另行挂到容器内 /sdcard
+     *  (见 externalRootDir), 公共目录都可以直接当项目用, 不必往这里搬。 */
     private File projectsDir() {
-        File pub = new File(Environment.getExternalStorageDirectory(), "opencode");
-        if ((pub.exists() || pub.mkdirs()) && pub.isDirectory()) {
-            seedReadme(pub);
-            return pub;
+        // externalRootDir() 可能为 null (取不到共享存储), 此时 new File(null, "opencode")
+        // 会变成相对路径 "opencode", 必须显式跳过, 否则工作目录落在进程 CWD 上。
+        File sd = externalRootDir();
+        if (sd != null) {
+            File pub = new File(sd, "opencode");
+            // mkdirs() 在无权限时会抛 SecurityException 而不是返回 false, 必须兜住,
+            // 否则回退路径 (app 专属目录) 根本走不到, 异常直接冒到轮询/启动线程上。
+            try {
+                if ((pub.exists() || pub.mkdirs()) && pub.isDirectory()) {
+                    seedReadme(pub);
+                    return pub;
+                }
+            } catch (SecurityException ignored) {
+            }
         }
         File appExternal = ctx.getExternalFilesDir(null);
         if (appExternal != null) appExternal.mkdirs();
         return new File(appExternal != null ? appExternal : dataRoot(), "Projects");
+    }
+
+    /** 共享存储根 (通常是 /sdcard, 实体上 /storage/emulated/0)。
+     *  以容器内 /sdcard 挂进容器, agent 可以 cd 到 Download/Documents/DCIM 等任意公共目录。
+     *  返回 null 表示不可用 (取不到路径, 或未授权导致列不出来), 此时不挂载。 */
+    private File externalRootDir() {
+        try {
+            File root = Environment.getExternalStorageDirectory();
+            if (root == null) return null;
+            String[] probe = root.list();
+            // 未授予"所有文件访问"时 scoped storage 会让 list() 返回 null;
+            // 这种情况下挂了也读不到, 不如不挂, 免得 agent 看到一堆读不了的空目录
+            return probe != null ? root : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 除 /workspace 外, 也轮询这些公共目录下的会话, 否则在公共目录里干活时
+     *  完成通知/审批横幅全都收不到 (通知看护只扫 workspaceDirectories 的结果)。
+     *  取常见几个而不是全量枚举: 10s 一轮轮询, 目录越多越费电。 */
+    private static final String[] PUBLIC_PROJECT_DIRS = {
+            "Download", "Documents", "Pictures", "DCIM", "Music", "Movies",
+    };
+
+    /** 公共目录在容器内的绝对路径 (存在的才返回), 供轮询枚举用。 */
+    private java.util.List<String> publicProjectDirectories() {
+        java.util.List<String> dirs = new java.util.ArrayList<>();
+        File sd = externalRootDir();
+        if (sd == null) return dirs;
+        for (String name : PUBLIC_PROJECT_DIRS) {
+            File d = new File(sd, name);
+            if (d.isDirectory()) dirs.add("/sdcard/" + name);
+        }
+        return dirs;
     }
 
     /** 首次使用在公开目录放一个说明文件, 提示用户项目都放这里 */
@@ -1758,6 +1833,9 @@ public class ServerManager {
         File projects = projectsDir();
         projects.mkdirs();
         home.mkdirs();
+        // 整个共享存储 → 容器内 /sdcard: Download/Documents/DCIM 等公共目录都能直接用。
+        // 与 /workspace (默认项目根) 并存, 不改变已有会话的路径语义。
+        File sdcardRoot = externalRootDir();
         logFile = new File(root, "server.log");
         // 日志轮转: 超过 5MB 归档为 .old (覆盖旧归档), 防止长期使用占满存储
         if (logFile.length() > 5 * 1024 * 1024L) {
@@ -1779,28 +1857,45 @@ public class ServerManager {
         writeResolvConf();
 
         File nativeLibDir = bin.getParentFile();
-        ProcessBuilder pb = new ProcessBuilder(
-                bin.getAbsolutePath(),
-                "-0",                                   // 容器内所有文件看起来属主为 root
-                "-r", rootfs.getAbsolutePath(),
-                "-b", projects.getAbsolutePath() + ":/workspace",
-                "-b", home.getAbsolutePath() + ":/root",
-                "-b", new File(root, "resolv.conf").getAbsolutePath() + ":/etc/resolv.conf",
-                "-b", "/dev",
-                "-b", "/proc",
-                "-b", "/sys",
-                "-w", "/workspace",
-                "--kill-on-exit",
-                "/bin/sh", "-c",
-                // LD_PRELOAD 必须写在容器内命令上而不是 proot 进程的环境里:
-                // proot 是 bionic 链接的 Android 二进制, 不能吃 musl/glibc 垫片。
-                // 原因: opencode musl 版内嵌的终端 pty 原生库是 glibc 链接的,
-                // Bun dlopen 时在 musl 下解析不到 glibc 符号 → /pty 接口 500 →
-                // Web UI 终端永远空白。gcompat 垫片先载入全局作用域后实测
-                // pty 建会话 + WS 流式输出全部正常 (沙盒端到端验证过)。
-                "LD_PRELOAD=/lib/libc.so.6:/lib/libpthread.so.0:/lib/libutil.so.1:/lib/libdl.so.2 " +
-                "opencode serve --port " + PORT + " --hostname "
+        // proot 参数用列表拼, 因为共享存储挂载是条件性的 (未授权/取不到就不挂)
+        java.util.List<String> args = new java.util.ArrayList<>();
+        args.add(bin.getAbsolutePath());
+        args.add("-0");         // 容器内所有文件看起来属主为 root
+        args.add("-r");
+        args.add(rootfs.getAbsolutePath());
+        args.add("-b");
+        args.add(projects.getAbsolutePath() + ":/workspace");
+        args.add("-b");
+        args.add(home.getAbsolutePath() + ":/root");
+        // 共享存储 → 容器内 /sdcard: 公共目录 (Download/Documents/DCIM…) 直接可用,
+        // 不必先拷进 /workspace。与 /workspace 并存, 不改变已有会话的路径语义。
+        if (sdcardRoot != null) {
+            args.add("-b");
+            args.add(sdcardRoot.getAbsolutePath() + ":/sdcard");
+        }
+        args.add("-b");
+        args.add(new File(root, "resolv.conf").getAbsolutePath() + ":/etc/resolv.conf");
+        args.add("-b");
+        args.add("/dev");
+        args.add("-b");
+        args.add("/proc");
+        args.add("-b");
+        args.add("/sys");
+        args.add("-w");
+        args.add("/workspace");
+        args.add("--kill-on-exit");
+        args.add("/bin/sh");
+        args.add("-c");
+        // LD_PRELOAD 必须写在容器内命令上而不是 proot 进程的环境里:
+        // proot 是 bionic 链接的 Android 二进制, 不能吃 musl/glibc 垫片。
+        // 原因: opencode musl 版内嵌的终端 pty 原生库是 glibc 链接的,
+        // Bun dlopen 时在 musl 下解析不到 glibc 符号 → /pty 接口 500 →
+        // Web UI 终端永远空白。gcompat 垫片先载入全局作用域后实测
+        // pty 建会话 + WS 流式输出全部正常 (沙盒端到端验证过)。
+        args.add("LD_PRELOAD=/lib/libc.so.6:/lib/libpthread.so.0:/lib/libutil.so.1:/lib/libdl.so.2 "
+                + "opencode serve --port " + PORT + " --hostname "
                 + (isLanEnabled() ? "0.0.0.0" : "127.0.0.1"));
+        ProcessBuilder pb = new ProcessBuilder(args);
         pb.redirectErrorStream(true);
         // proot 的 -w 会覆盖 cwd, 这里不设也无妨
         pb.directory(projects);

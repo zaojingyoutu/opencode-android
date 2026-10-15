@@ -1215,7 +1215,12 @@ public class MainActivity extends Activity {
                 ServerManager.Status st = embedded.statusFocused();
                 runOnUiThread(() -> {
                     if (gen != resyncGen || isFinishing() || isDestroyed() || webView == null) return;
-                    if (!st.pending && !(st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall)) {
+                    // 门槛只看 sessionUpdated 会漏: 实测 session.time.updated 在消息完成时不推进
+                    // (真机落后完成时刻约 4 分钟), 后台刚跑完的回复会被判成"页面已是最新"直接返回,
+                    // 表现就是回前台正文永远停在后台断掉的那一帧。completed 才是真正推进的字段, 拿它兜底。
+                    boolean newerBySession = st.sessionUpdated > 0 && st.sessionUpdated > pausedAtWall;
+                    boolean newerByCompleted = st.lastCompletedMs > 0 && st.lastCompletedMs > pausedAtWall;
+                    if (!st.pending && !newerBySession && !newerByCompleted) {
                         return; // 无未完成且离开期间无新结果: 页面即最新, 不打扰
                     }
                     final String snippet = ServerManager.probeText(st.lastText);
@@ -1303,8 +1308,13 @@ public class MainActivity extends Activity {
         }, "opencode-align").start();
     }
 
+    /** 冻结判定的轮次: 长度连续这么多轮不变才认定页面冻住; 用尽轮数仍判不出就默认 reload */
+    private static final int FREEZE_ROUNDS = 1;
+    /** 每轮冻结检查之间的等待 (ms) */
+    private static final long FREEZE_WAIT_MS = 5000;
+
     /** 轻唤醒页面 (派发 visibilitychange/focus 让页面自己重连 SSE/拉取),
-     *  5s 后检查 body 是否有变化; 无变化视为冻结, 回调 onFrozen (通常整页 reload)。
+     *  之后检查 body 是否变化; 连续多轮无变化视为冻结, 回调 onFrozen (通常整页 reload)。
      *  比直接 reload 温和: 不重建 SPA, 不会触发 tab 状态重建。 */
     private void nudgePageAndCheckIfFrozen(final Runnable onFrozen) {
         if (webView == null) return;
@@ -1314,27 +1324,46 @@ public class MainActivity extends Activity {
                 "document.dispatchEvent(new Event('visibilitychange'));" +
                 "window.dispatchEvent(new Event('focus'));" +
                 "}catch(e){}})()", null);
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            if (isFinishing() || isDestroyed() || webView == null) return;
-            webView.evaluateJavascript(
-                    "(function(){try{" +
-                    "return window.__ocBodyLen===document.body.textContent.length" +
-                    "}catch(e){return false}})()",
-                    v -> {
-                        if (isFinishing() || isDestroyed() || webView == null) return;
-                        if (!"true".equals(v)) return; // 页面在自己恢复/流式输出中, 不打扰
-                        onFrozen.run();
-                    });
-        }, 5000);
+        // 冻结判定: 原先只看「5s 内长度一字不差」, 但 inject 脚本每秒重绘 DOM,
+        // 长度几乎必然变化 → 假阴性 → 静默放弃且不打日志, 页面永远停在后台那一帧。
+        // 现在多测一轮; 仍判不出冻结就默认 reload (宁可多刷一次也不停在旧帧)。
+        checkFrozen(0, onFrozen);
     }
 
-    /** 页面卡死在有未完成消息的状态: 按 server 侧最新状态决定 reload 还是 abort+reload。
-     *  注意入参必须是等窗后的新鲜快照 (alignPageWithServer 里重拉的), 不能拿 5s 前的旧值:
-     *  旧值 pending 而实际已完成时, 按旧逻辑会走 CPU 空检甚至 abort,  reload 闪白不说,
-     *  abort 打到已落定会话虽无害, 但纯属多余扰动 */
+    /** 第 attempt 轮冻结检查: body 文本长度连续 FREEZE_ROUNDS 轮不变才算冻结;
+     *  轮数用尽 (attempt >= FREEZE_ROUNDS) 说明既没冻结也没在动, 一律按"掉队"处理。 */
+    private void checkFrozen(int attempt, final Runnable onFrozen) {
+        if (isFinishing() || isDestroyed() || webView == null) return;
+        if (attempt >= FREEZE_ROUNDS) {
+            // 判不出冻结: 宁可多刷一次, 也不要停在旧帧让用户以为回复丢了
+            Log.i("MainActivity", "resume: page not provably alive, reload to be safe");
+            onFrozen.run();
+            return;
+        }
+        webView.evaluateJavascript(
+                "(function(){try{" +
+                "return window.__ocBodyLen===document.body.textContent.length" +
+                "}catch(e){return false}})()",
+                v -> {
+                    if (isFinishing() || isDestroyed() || webView == null) return;
+                    if (!"true".equals(v)) return; // 页面在自己恢复/流式输出中, 不打扰
+                    handler.postDelayed(() -> checkFrozen(attempt + 1, onFrozen), FREEZE_WAIT_MS);
+                });
+    }
+
+    /** 页面卡死时的收尾: 按 server 侧最新状态决定 reload 还是 abort+reload。
+     *  注意入参必须是等窗后的新鲜快照 (alignPageWithServer 里重拉的), 不能拿 5s 前的旧值。
+     *  已完成的会话 (pending=false) 只 reload, 不发 abort —— 没有孤儿可收。 */
     private void decideStalledFresh(ServerManager.Status fresh) {
         if (fresh.replying) {
             // 回复活跃: 重订阅 SSE 即可, 绝不能 abort (会杀掉正在跑的任务)
+            webView.reload();
+            return;
+        }
+        if (!fresh.pending) {
+            // 已完成 (无未完成消息且不在回复): 没有孤儿可收, reload 把结果拉下来即可。
+            // 之前这里会继续走 CPU 空检并对已落定的会话发 abort, 纯属多余扰动。
+            Log.i("MainActivity", "resume: already finished, reload only");
             webView.reload();
             return;
         }
