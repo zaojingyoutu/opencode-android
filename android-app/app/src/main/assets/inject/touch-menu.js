@@ -10,9 +10,14 @@
     if (!e.pointerType || e.pointerType === 'mouse') return;
     var node = e.target;
     if (!node || !node.closest) return;
-    if (!node.closest('[role="menuitem"],[role="menuitemradio"]')) return;
+    var item = node.closest('[role="menuitem"],[role="menuitemradio"]');
+    if (!item) return;
     var kill = function (ev) {
       document.removeEventListener('click', kill, true);
+      // 只挡落在菜单项之外(遮罩/背景)的那下补发 click (菜单项已卸载时 click 会落到遮罩上,
+      // 把刚打开的确认框关掉)。菜单项自己的 click 必须放行, 否则依赖 click 触发的动作
+      // (如 + → 附件 打开文件选择) 会被整条吞掉, 表现为"点了没反应"。
+      if (ev.target && item.contains(ev.target)) return;
       ev.preventDefault();
       ev.stopPropagation();
     };

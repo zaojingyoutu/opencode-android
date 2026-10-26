@@ -13,6 +13,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.provider.MediaStore;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.KeyEvent;
@@ -63,6 +64,8 @@ public class MainActivity extends Activity {
     /** App 是否在前台 (供 ServerService 看护线程判断"用户是否在看", 决定要不要发完成通知) */
     public static volatile boolean foreground;
     private boolean pendingFileChooser = false;
+    /** 刚从文件选择器返回: 短时间内的回前台不做对齐/刷新 (选附件不该打断页面) */
+    private boolean skipResyncOnce = false;
     private boolean pageFailed = false;
     /** 当前页面 URL (onPageStarted 在 UI 线程更新; 供 JS 桥后台线程做来源校验) */
     private volatile String webViewUrl;
@@ -77,7 +80,11 @@ public class MainActivity extends Activity {
     /** 取消过期的审批卡对账 (深链已经整页跳走, 或又一次进入后台) */
     private int permReconcileGen;
     private static final int FILECHOOSER_RESULT_CODE = 1001;
+    /** 页面脚本通过 OcLan.pickFiles() 拉起系统相册 (绕开 WebView 吞掉 chooser 的 ROM) */
+    private static final int PICK_FILES_JS_CODE = 1002;
     private ValueCallback<Uri[]> filePathCallback;
+    /** 最近一次 WebView 自己触发 onShowFileChooser 的时刻 (elapsedRealtime) */
+    private volatile long lastChooserElapsed;
     // 深链：来自审批横幅的目录/会话，点开后 WebView 需切到对应项目/会话
     private String pendingDirectory;
     private String pendingSessionId;
@@ -287,6 +294,13 @@ public class MainActivity extends Activity {
                     view.evaluateJavascript(
                             touchMenuJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
                 }
+                // 附件修复: 点菜单「图片和文件」时直接走原生相册, 选完回注 File
+                // (本机 WebView 的 input.click() 不触发 onShowFileChooser, chooser 被静默丢弃)
+                String attachFixJs = attachFixJs();
+                if (attachFixJs != null) {
+                    view.evaluateJavascript(
+                            attachFixJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
+                }
                 // 输入栏刷新: 发送按钮左侧, SPA 重绘后轮询补回; 模型名过长时省略
                 String refreshJs = refreshInjectJs();
                 if (refreshJs != null) {
@@ -433,13 +447,22 @@ public class MainActivity extends Activity {
                 }
                 filePathCallback = cb;
                 pendingFileChooser = true;
+                skipResyncOnce = true;
+                lastChooserElapsed = SystemClock.elapsedRealtime();
+                Intent launch = buildFileChooserIntent(params);
                 try {
-                    startActivityForResult(params.createIntent(), FILECHOOSER_RESULT_CODE);
+                    startActivityForResult(launch, FILECHOOSER_RESULT_CODE);
                     return true;
                 } catch (Exception e) {
-                    filePathCallback.onReceiveValue(null);
-                    filePathCallback = null;
-                    return false;
+                    // 选择器启动失败时退回 WebView 自带的文档选择
+                    try {
+                        startActivityForResult(params.createIntent(), FILECHOOSER_RESULT_CODE);
+                        return true;
+                    } catch (Exception e2) {
+                        filePathCallback.onReceiveValue(null);
+                        filePathCallback = null;
+                        return false;
+                    }
                 }
             }
         });
@@ -676,6 +699,11 @@ public class MainActivity extends Activity {
     /** 文件选择器结果回传: 单选/多选均支持, 取消则返回 null */
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == PICK_FILES_JS_CODE) {
+            pendingFileChooser = false;
+            if (resultCode == RESULT_OK) deliverPickedFiles(data);
+            return;
+        }
         if (requestCode != FILECHOOSER_RESULT_CODE) {
             super.onActivityResult(requestCode, resultCode, data);
             return;
@@ -696,6 +724,233 @@ public class MainActivity extends Activity {
         }
         filePathCallback.onReceiveValue(results);
         filePathCallback = null;
+    }
+
+    /**
+     * 原生相册选择结果: 压缩成 JPEG + base64 后交给页面脚本注入 composer。
+     * 走 WebView 自身 chooser 的机型根本到不了这里; 本机 chooser 被 ROM 吞掉,
+     * 只能由页面 tap 菜单项时主动调 OcLan.pickFiles()。
+     */
+    private void deliverPickedFiles(Intent data) {
+        java.util.List<Uri> uris = new java.util.ArrayList<>();
+        try {
+            if (data.getClipData() != null) {
+                int n = data.getClipData().getItemCount();
+                for (int i = 0; i < n; i++) uris.add(data.getClipData().getItemAt(i).getUri());
+            } else if (data.getData() != null) {
+                uris.add(data.getData());
+            }
+        } catch (Exception ignored) {
+        }
+        if (uris.isEmpty()) return;
+        org.json.JSONArray arr = new org.json.JSONArray();
+        long totalBytes = 0;
+        boolean tooLarge = false;
+        for (int i = 0; i < uris.size(); i++) {
+            try {
+                Uri u = uris.get(i);
+                String mime = getContentResolver().getType(u);
+                String name = queryDisplayName(u);
+                if (name == null || name.trim().isEmpty()) name = "file_" + (i + 1);
+                byte[] bytes = null;
+                boolean animatedOrVector = "image/gif".equals(mime) || "image/svg+xml".equals(mime);
+                if (mime != null && mime.startsWith("image/") && !animatedOrVector) {
+                    bytes = compressToJpeg(u, 1568, 85);
+                    if (bytes != null) {
+                        int dot = name.lastIndexOf('.');
+                        if (dot > 0) name = name.substring(0, dot);
+                        name = name + ".jpg";
+                        mime = "image/jpeg";
+                    }
+                }
+                if (bytes == null) {
+                    bytes = readAllBytes(u, 8 * 1024 * 1024);
+                    if (bytes == null) {
+                        tooLarge = true;
+                        continue;
+                    }
+                    if (mime == null || mime.trim().isEmpty()) mime = "application/octet-stream";
+                }
+                // evaluateJavascript 的字符串要过 IPC, 加个总闸防止超大附件把传输卡死
+                totalBytes += bytes.length;
+                if (totalBytes > 20L * 1024 * 1024) {
+                    tooLarge = true;
+                    break;
+                }
+                arr.put(new org.json.JSONObject()
+                        .put("name", name)
+                        .put("mime", mime)
+                        .put("data", android.util.Base64.encodeToString(
+                                bytes, android.util.Base64.NO_WRAP)));
+            } catch (Exception ignored) {
+            }
+        }
+        if (tooLarge) {
+            android.widget.Toast.makeText(this, "部分文件过大, 已跳过 (单个最大 8MB)",
+                    android.widget.Toast.LENGTH_LONG).show();
+        }
+        if (arr.length() == 0) return;
+        try {
+            webView.evaluateJavascript(
+                    "window.__ocPickedFiles && window.__ocPickedFiles(" + arr + ");", null);
+        } catch (Exception e) {
+            android.widget.Toast.makeText(this, "附件注入失败",
+                    android.widget.Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /** 解码 + 纠正 EXIF 方向 + 缩放到 maxDim 内, 压成 JPEG */
+    private byte[] compressToJpeg(Uri uri, int maxDim, int quality) {
+        try {
+            android.graphics.BitmapFactory.Options bounds =
+                    new android.graphics.BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in == null) return null;
+                android.graphics.BitmapFactory.decodeStream(in, null, bounds);
+            }
+            int w = bounds.outWidth, h = bounds.outHeight;
+            if (w <= 0 || h <= 0) return null;
+            int sample = 1;
+            while (Math.max(w / sample, h / sample) > maxDim * 2) sample *= 2;
+            android.graphics.BitmapFactory.Options opts =
+                    new android.graphics.BitmapFactory.Options();
+            opts.inSampleSize = sample;
+            android.graphics.Bitmap bmp;
+            try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in == null) return null;
+                bmp = android.graphics.BitmapFactory.decodeStream(in, null, opts);
+            }
+            if (bmp == null) return null;
+            int rotate = 0;
+            try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in != null) {
+                    android.media.ExifInterface exif = new android.media.ExifInterface(in);
+                    int o = exif.getAttributeInt(
+                            android.media.ExifInterface.TAG_ORIENTATION,
+                            android.media.ExifInterface.ORIENTATION_NORMAL);
+                    if (o == android.media.ExifInterface.ORIENTATION_ROTATE_90) rotate = 90;
+                    else if (o == android.media.ExifInterface.ORIENTATION_ROTATE_180) rotate = 180;
+                    else if (o == android.media.ExifInterface.ORIENTATION_ROTATE_270) rotate = 270;
+                }
+            } catch (Exception ignored) {
+            }
+            float scale = Math.min(1f, (float) maxDim / Math.max(bmp.getWidth(), bmp.getHeight()));
+            int tw = Math.max(1, Math.round(bmp.getWidth() * scale));
+            int th = Math.max(1, Math.round(bmp.getHeight() * scale));
+            android.graphics.Bitmap scaled =
+                    android.graphics.Bitmap.createScaledBitmap(bmp, tw, th, true);
+            if (scaled != bmp) bmp.recycle();
+            android.graphics.Matrix m = new android.graphics.Matrix();
+            if (rotate != 0) m.postRotate(rotate);
+            android.graphics.Bitmap out = android.graphics.Bitmap.createBitmap(
+                    scaled, 0, 0, scaled.getWidth(), scaled.getHeight(), m, true);
+            if (out != scaled) scaled.recycle();
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            out.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, bos);
+            out.recycle();
+            return bos.toByteArray();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 读整个文件; 超过 max 字节返回 null (太大不适合走 base64 注入) */
+    private byte[] readAllBytes(Uri uri, int max) {
+        try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) return null;
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[16 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                if (bos.size() + n > max) return null;
+                bos.write(buf, 0, n);
+            }
+            return bos.toByteArray();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String queryDisplayName(Uri uri) {
+        try (android.database.Cursor c = getContentResolver().query(uri,
+                new String[]{android.provider.OpenableColumns.DISPLAY_NAME},
+                null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0) return c.getString(idx);
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    /**
+     * 组装文件选择 Intent:
+     * Web UI 的 accept 是一长串混合类型 (图片/PDF/文本/代码), WebView 生成的选择器
+     * 在部分 ROM 上只开文档界面, 相册里的图片不可见。页面要图片时改为
+     * 系统相册选择器 (Android 13+ 的 photo picker) 为主, 文档选择作为备选。
+     */
+    private Intent buildFileChooserIntent(WebChromeClient.FileChooserParams params) {
+        boolean wantsImage = false;
+        try {
+            String[] types = params.getAcceptTypes();
+            if (types != null) {
+                for (String t : types) {
+                    if (t == null) continue;
+                    String s = t.trim().toLowerCase();
+                    if (s.isEmpty()) continue;
+                    if (s.equals("*/*") || s.startsWith("image/")) {
+                        wantsImage = true;
+                        break;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        boolean multiple = false;
+        try {
+            multiple = params.getMode() == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE;
+        } catch (Exception ignored) {
+        }
+        Intent documents = null;
+        try {
+            documents = params.createIntent();
+        } catch (Exception ignored) {
+        }
+        if (!wantsImage) {
+            if (documents != null) return documents;
+            Intent any = new Intent(Intent.ACTION_GET_CONTENT);
+            any.addCategory(Intent.CATEGORY_OPENABLE);
+            any.setType("*/*");
+            return any;
+        }
+        Intent photos = photoPickerIntent(multiple);
+        if (documents == null) return photos;
+        // 图片为主入口, 文档界面收进 chooser 的"其他"里
+        Intent chooser = Intent.createChooser(photos, "选择图片或文件");
+        chooser.putExtra(Intent.EXTRA_INITIAL_INTENTS, new Intent[]{documents});
+        return chooser;
+    }
+
+    /** 系统相册: Android 13+ 用 photo picker, 低版本退回 image/* 的 GET_CONTENT */
+    private Intent photoPickerIntent(boolean multiple) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            Intent pick = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            if (multiple) {
+                pick.putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, 20);
+            }
+            if (pick.resolveActivity(getPackageManager()) != null) return pick;
+        }
+        return fallbackImageIntent(multiple);
+    }
+
+    private Intent fallbackImageIntent(boolean multiple) {
+        Intent get = new Intent(Intent.ACTION_GET_CONTENT);
+        get.addCategory(Intent.CATEGORY_OPENABLE);
+        get.setType("image/*");
+        if (multiple) get.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        return get;
     }
 
     // ------------------------------------------------------------------
@@ -859,6 +1114,36 @@ public class MainActivity extends Activity {
                         android.widget.Toast.LENGTH_SHORT).show();
             });
         }
+
+
+        /** WebView 自己最近是否触发过文件选择 (部分 ROM 会静默丢弃, 页面据此决定是否走原生桥) */
+        @android.webkit.JavascriptInterface
+        public boolean chooserSeenRecently() {
+            if (!guard()) return false;
+            return SystemClock.elapsedRealtime() - lastChooserElapsed < 2500;
+        }
+
+        /** 页面请求拉起选择器 (图片走相册, 其他文件走文档); 选完回注 __ocPickedFiles */
+        @android.webkit.JavascriptInterface
+        public boolean pickFiles() {
+            if (!guard()) return false;
+            runOnUiThread(() -> {
+                if (SystemClock.elapsedRealtime() - lastChooserElapsed < 2500) return;
+                skipResyncOnce = true;
+                // 直接用文档选择器: 它本身就能选图片和其他文件, 不需要先问"图片还是文件"
+                Intent it = new Intent(Intent.ACTION_GET_CONTENT);
+                it.addCategory(Intent.CATEGORY_OPENABLE);
+                it.setType("*/*");
+                it.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                try {
+                    startActivityForResult(it, PICK_FILES_JS_CODE);
+                } catch (Exception e) {
+                    android.widget.Toast.makeText(MainActivity.this, "无法打开文件选择器",
+                            android.widget.Toast.LENGTH_SHORT).show();
+                }
+            });
+            return true;
+        }
     }
 
     private String lanInjectJsCache;
@@ -868,6 +1153,7 @@ public class MainActivity extends Activity {
     private String refreshJsCache;
     private String directoryJsCache;
     private String touchMenuJsCache;
+    private String attachFixJsCache;
 
     /** 读取注入脚本 (assets/inject/lan.js), 缺失时返回 null 静默跳过 */
     private String lanInjectJs() {
@@ -942,6 +1228,21 @@ public class MainActivity extends Activity {
             touchMenuJsCache = "";
         }
         return touchMenuJsCache.isEmpty() ? null : touchMenuJsCache;
+    }
+
+    /** 读取注入脚本 (assets/inject/attach-fix.js): 附件入口改走原生相册 (绕开被 ROM 吞掉的 chooser) */
+    private String attachFixJs() {
+        if (attachFixJsCache != null) return attachFixJsCache.isEmpty() ? null : attachFixJsCache;
+        try (InputStream in = getAssets().open("inject/attach-fix.js")) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(2048);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            attachFixJsCache = bos.toString("UTF-8");
+        } catch (Exception e) {
+            attachFixJsCache = "";
+        }
+        return attachFixJsCache.isEmpty() ? null : attachFixJsCache;
     }
 
     /** 读取注入脚本 (assets/inject/refresh.js): 发送按钮左侧的手动刷新 */
@@ -1171,6 +1472,12 @@ public class MainActivity extends Activity {
         hadAllFilesAccess = granted;
         if (wasBackgrounded) {
             wasBackgrounded = false;
+            // 刚选完附件回来: 2 分钟内不刷新, 页面状态本身就是新的
+            if (skipResyncOnce && System.currentTimeMillis() - lastPauseWall < 120_000) {
+                skipResyncOnce = false;
+                return;
+            }
+            skipResyncOnce = false;
             // 文件选择器返回不打断当前页。其余回到前台都唤醒并对齐正文,
             // 离开多久都一样: 短时间切走时 WebView 也可能被冻住, 漏掉的回复不会自己补上。
             if (pendingFileChooser) return;

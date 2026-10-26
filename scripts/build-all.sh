@@ -33,7 +33,7 @@ fi
 # aarch64 aapt2 备份在项目目录内 (非缓存，随项目保留)；/usr/local/bin 是 tmpfs 重启丢失
 PERSISTENT_AAPT2="$SCRIPT_DIR/../.local/env/aapt2-arm64/aapt2.real"
 PERSISTENT_AAPT2_SHIM="$SCRIPT_DIR/../.local/env/aapt2-arm64/aapt2shim.so"
-if [ ! -x "/usr/local/bin/aapt2" ] && [ -x "$PERSISTENT_AAPT2" ]; then
+if [ ! -x "/usr/local/bin/aapt2" ] && [ -f "$PERSISTENT_AAPT2" ]; then
     mkdir -p /usr/local/bin /usr/local/lib 2>/dev/null
     cp "$PERSISTENT_AAPT2" /usr/local/bin/aapt2.real 2>/dev/null
     cp "$PERSISTENT_AAPT2_SHIM" /usr/local/lib/aapt2shim.so 2>/dev/null
@@ -41,7 +41,8 @@ if [ ! -x "/usr/local/bin/aapt2" ] && [ -x "$PERSISTENT_AAPT2" ]; then
 #!/bin/sh
 exec env LD_PRELOAD=/usr/local/lib/aapt2shim.so /usr/local/bin/aapt2.real "$@"
 EOS_AAPT2
-    chmod +x /usr/local/bin/aapt2 2>/dev/null
+    # /workspace (sdcard) 挂载不带 exec 位, 复制后必须补上
+    chmod +x /usr/local/bin/aapt2 /usr/local/bin/aapt2.real 2>/dev/null
     echo "    恢复 aapt2 aarch64: /usr/local/bin/aapt2"
 fi
 # JDK 持久化恢复：容器重启后 /usr 丢失，需重装（走本地 apkcache 秒装）
