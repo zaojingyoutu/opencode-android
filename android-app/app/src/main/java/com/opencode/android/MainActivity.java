@@ -294,6 +294,12 @@ public class MainActivity extends Activity {
                     view.evaluateJavascript(
                             touchMenuJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
                 }
+                // 项目目录弹窗: 手机端没有 Tab 键进入子目录, 也没有"新建文件夹", 这里补上
+                String drillJs = folderDrillJs();
+                if (drillJs != null) {
+                    view.evaluateJavascript(
+                            drillJs.replace("__SERVER_URL__", embedded.serverUrl()), null);
+                }
                 // 附件修复: 点菜单「图片和文件」时直接走原生相册, 选完回注 File
                 // (本机 WebView 的 input.click() 不触发 onShowFileChooser, chooser 被静默丢弃)
                 String attachFixJs = attachFixJs();
@@ -1144,6 +1150,63 @@ public class MainActivity extends Activity {
             });
             return true;
         }
+
+        /** 目录弹窗里"新建"项目文件夹: 原生输入名字, 建好后页面自动选中打开 */
+        @android.webkit.JavascriptInterface
+        public boolean newProjectFolder(String basePath) {
+            if (!guard()) return false;
+            String base = basePath == null ? "" : basePath.trim();
+            if (!base.equals("/workspace") && !base.startsWith("/workspace/")) return false;
+            final String parent = base.endsWith("/") ? base : base + "/";
+            runOnUiThread(() -> {
+                android.widget.EditText edit = new android.widget.EditText(MainActivity.this);
+                edit.setSingleLine(true);
+                edit.setHint("文件夹名 (如 my-app)");
+                android.widget.FrameLayout box = new android.widget.FrameLayout(MainActivity.this);
+                int pad = dp(20);
+                box.setPadding(pad, dp(8), pad, 0);
+                box.addView(edit, new android.widget.FrameLayout.LayoutParams(
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.FrameLayout.LayoutParams.WRAP_CONTENT));
+                AlertDialog dlg = new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("新建项目文件夹")
+                        .setView(box)
+                        .setNegativeButton("取消", null)
+                        .setPositiveButton("创建", (d, w) -> {
+                            String name = edit.getText().toString().trim();
+                            if (name.isEmpty() || name.length() > 64
+                                    || name.equals(".") || name.equals("..")
+                                    || name.matches(".*[/\\\\:*?\"<>|].*")) {
+                                android.widget.Toast.makeText(MainActivity.this,
+                                        "名字不合法", android.widget.Toast.LENGTH_SHORT).show();
+                                return;
+                            }
+                            String serverPath = parent + name;
+                            try {
+                                java.io.File target = new java.io.File(
+                                        embedded.hostProjectsDir(),
+                                        serverPath.substring("/workspace/".length()));
+                                boolean ok = target.isDirectory() || target.mkdirs();
+                                if (!ok) {
+                                    android.widget.Toast.makeText(MainActivity.this,
+                                            "创建失败", android.widget.Toast.LENGTH_SHORT).show();
+                                    return;
+                                }
+                                webView.evaluateJavascript(
+                                        "window.__ocFolderCreated && window.__ocFolderCreated("
+                                                + org.json.JSONObject.quote(serverPath) + ");", null);
+                            } catch (Exception e) {
+                                android.widget.Toast.makeText(MainActivity.this,
+                                        "创建失败", android.widget.Toast.LENGTH_SHORT).show();
+                            }
+                        })
+                        .create();
+                dlg.getWindow().setSoftInputMode(
+                        android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE);
+                dlg.show();
+            });
+            return true;
+        }
     }
 
     private String lanInjectJsCache;
@@ -1154,6 +1217,7 @@ public class MainActivity extends Activity {
     private String directoryJsCache;
     private String touchMenuJsCache;
     private String attachFixJsCache;
+    private String folderDrillJsCache;
 
     /** 读取注入脚本 (assets/inject/lan.js), 缺失时返回 null 静默跳过 */
     private String lanInjectJs() {
@@ -1228,6 +1292,21 @@ public class MainActivity extends Activity {
             touchMenuJsCache = "";
         }
         return touchMenuJsCache.isEmpty() ? null : touchMenuJsCache;
+    }
+
+    /** 读取注入脚本 (assets/inject/folder-drill.js): 目录弹窗加"进入下一级/新建文件夹" */
+    private String folderDrillJs() {
+        if (folderDrillJsCache != null) return folderDrillJsCache.isEmpty() ? null : folderDrillJsCache;
+        try (InputStream in = getAssets().open("inject/folder-drill.js")) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(2048);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            folderDrillJsCache = bos.toString("UTF-8");
+        } catch (Exception e) {
+            folderDrillJsCache = "";
+        }
+        return folderDrillJsCache.isEmpty() ? null : folderDrillJsCache;
     }
 
     /** 读取注入脚本 (assets/inject/attach-fix.js): 附件入口改走原生相册 (绕开被 ROM 吞掉的 chooser) */

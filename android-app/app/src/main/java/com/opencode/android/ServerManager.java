@@ -1772,6 +1772,13 @@ public class ServerManager {
         return new File(appExternal != null ? appExternal : dataRoot(), "Projects");
     }
 
+    /** 容器内 /workspace 对应的宿主目录; JS 桥"新建项目文件夹"用 */
+    public File hostProjectsDir() {
+        File d = projectsDir();
+        d.mkdirs();
+        return d;
+    }
+
     /** 共享存储根 (通常是 /sdcard, 实体上 /storage/emulated/0)。
      *  以容器内 /sdcard 挂进容器, agent 可以 cd 到 Download/Documents/DCIM 等任意公共目录。
      *  返回 null 表示不可用 (取不到路径, 或未授权导致列不出来), 此时不挂载。 */
