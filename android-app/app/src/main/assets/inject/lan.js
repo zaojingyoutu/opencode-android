@@ -98,7 +98,6 @@
       makeSwitch(!!d.enabled, function (v) { window.OcLan.setEnabled(v); })));
 
     if (d.enabled) {
-      // 地址行
       var urlDesc = el('div');
       urlDesc.textContent = d.url || '(未获取到 Wi-Fi IP)';
       urlDesc.style.userSelect = 'text';
@@ -108,80 +107,116 @@
       var urlRow = list.lastChild;
       var urlCtrl = urlRow.querySelector('[data-slot="settings-v2-row-control"]');
       urlCtrl.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end;min-width:0';
+      urlCtrl.appendChild(urlDesc);
       urlCtrl.appendChild(miniBtn('复制', function () { window.OcLan.copy(); }));
-
-      // 密码行: 当前密码 + 自定义输入 + 保存/随机
-      var pwInput = document.createElement('input');
-      pwInput.type = 'text';
-      pwInput.placeholder = '输入新密码 (至少 6 位)';
-      // 自适应宽度: 不写死, 允许随容器收缩; 窄屏时与"保存"按钮自动换行
-      pwInput.style.cssText = 'flex:1 1 auto;min-width:96px;max-width:180px;font-size:12px;padding:3px 8px;color:inherit;' +
-        'background:transparent;border:1px solid color-mix(in srgb, currentColor 30%, transparent);' +
-        'border-radius:8px';
-      var pwCtl = el('div');
-      pwCtl.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end;min-width:0';
-      pwCtl.appendChild(pwInput);
-      pwCtl.appendChild(miniBtn('保存', function () {
-        var v = pwInput.value.trim();
-        if (v.length < 6 || v.length > 64) {
-          pwInput.value = '';
-          pwInput.placeholder = '密码长度需 6~64 位';
-          return;
-        }
-        window.OcLan.setPassword(v);
-      }));
-      list.appendChild(row('访问密码', '当前: ' + d.password, pwCtl));
     }
+
+    // 本机自动登录和局域网共用这一份密码，不打开局域网也能改
+    var pwInput = document.createElement('input');
+    pwInput.type = 'text';
+    pwInput.placeholder = '输入新密码 (至少 6 位)';
+    pwInput.style.cssText = 'flex:1 1 auto;min-width:96px;max-width:180px;font-size:12px;padding:3px 8px;color:inherit;' +
+      'background:transparent;border:1px solid color-mix(in srgb, currentColor 30%, transparent);' +
+      'border-radius:8px';
+    var pwCtl = el('div');
+    pwCtl.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end;min-width:0';
+    pwCtl.appendChild(pwInput);
+    pwCtl.appendChild(miniBtn('保存', function () {
+      var v = pwInput.value.trim();
+      if (v.length < 6 || v.length > 64) {
+        pwInput.value = '';
+        pwInput.placeholder = '密码长度需 6~64 位';
+        return;
+      }
+      window.OcLan.setPassword(v);
+    }));
+    list.appendChild(row('访问密码', '当前: ' + d.password + '。本机登录也用它，保存后会重启服务', pwCtl));
 
     sec.appendChild(list);
     return sec;
   }
-  function findSettingsPanel() {
-    // 找"通用"tab (设置弹窗的 tab 用 role=tab; 兼容 aria-selected 的按钮)
-    var tabs = document.querySelectorAll('[role="tab"], [aria-selected]');
-    var generalTab = null;
-    for (var i = 0; i < tabs.length; i++) {
-      var label = (tabs[i].textContent || '').trim();
-      if (label === 'General' || label === '通用') { generalTab = tabs[i]; break; }
+  function tabLabel(el) {
+    return (el.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+  function isHostTab(el) {
+    var label = tabLabel(el);
+    return label === '服务器' || /^servers$/i.test(label) ||
+        label === '通用' || /^general$/i.test(label);
+  }
+  function hostTabs() {
+    function collect(selector) {
+      var nodes = document.querySelectorAll(selector);
+      var tabs = [];
+      for (var i = 0; i < nodes.length; i++) {
+        if (isHostTab(nodes[i])) tabs.push(nodes[i]);
+      }
+      return tabs;
     }
-    if (!generalTab) return null;
-    // 从 tab 向上找内容容器: 优先 .settings-v2-tab-body (带 40px 内边距,
-    // 设置弹窗的真实内容区), 否则回退 [role=tabpanel]。注: 设置弹窗用的是
-    // .settings-v2-tab-body, 没有 role=tabpanel (那是 session 面板的),
-    // 之前 append 到 role=tabpanel 会缺失水平内边距 → 区块贴左。
-    var anc = generalTab;
+    var tabs = collect('[role="tab"]');
+    if (tabs.length) return tabs;
+    return collect('button, a');
+  }
+  function tabSelected(tab) {
+    if (tab.getAttribute('aria-selected') === 'true') return true;
+    var current = tab.getAttribute('aria-current');
+    return current === 'page' || current === 'true';
+  }
+  function contentFor(tab) {
+    var id = tab.getAttribute('aria-controls');
+    if (id) {
+      var byId = document.getElementById(id);
+      if (byId) return byId;
+    }
+    if (tab.id && /^[\w:-]+$/.test(tab.id)) {
+      var labelled = document.querySelector('[role="tabpanel"][aria-labelledby="' + tab.id + '"]');
+      if (labelled) return labelled;
+    }
+    var root = tab.closest('[role="dialog"]') || tab.closest('dialog') || document.body;
+    var panels = root.querySelectorAll('[role="tabpanel"]');
+    for (var i = 0; i < panels.length; i++) {
+      var panel = panels[i];
+      if (panel.hasAttribute('hidden')) continue;
+      var st = getComputedStyle(panel);
+      if (st.display === 'none' || st.visibility === 'hidden') continue;
+      return panel;
+    }
+    var anc = tab;
     while (anc && anc !== document.body) {
       var bodies = anc.querySelectorAll('.settings-v2-tab-body');
       for (var b = 0; b < bodies.length; b++) {
-        var st = getComputedStyle(bodies[b]);
-        if (st.display !== 'none') return bodies[b];
+        if (getComputedStyle(bodies[b]).display !== 'none') return bodies[b];
       }
-      var p = anc.querySelector('[role="tabpanel"]');
-      if (p) return p;
       anc = anc.parentElement;
     }
     return null;
   }
   function tryInject() {
-    // 只在"通用"tab 下显示: 所有 tab 共用同一个 tabpanel 容器 (切换只换内容),
-    // 不判断的话节会出现在每个 tab 里。用隐藏而非删除, 保住输入中的密码状态
-    var sel = document.querySelector('[role="tab"][aria-selected="true"]');
-    var isGeneral = !!sel &&
-            /^(general|通用)$/i.test((sel.textContent || '').trim());
+    var tabs = hostTabs();
+    var active = null;
+    for (var i = 0; i < tabs.length; i++) {
+      if (tabSelected(tabs[i])) { active = tabs[i]; break; }
+    }
+    var d = info();
     var sec = document.querySelector('.oc-lan-sec');
-    if (!isGeneral) {
+    if (!active || !d) {
       if (sec) sec.style.display = 'none';
       return;
+    }
+    var on = d.enabled ? '1' : '0';
+    if (sec && sec.getAttribute('data-on') !== on) {
+      sec.remove();
+      sec = null;
     }
     if (sec) {
       sec.style.display = '';
       return;
     }
-    var panel = findSettingsPanel();
+    var panel = contentFor(active);
     if (!panel) return;
     var s = mkSection();
     if (!s) return;
     s.className += ' oc-lan-sec';
+    s.setAttribute('data-on', on);
     panel.appendChild(s);
   }
   // 轮询注入: 每秒检查一次 (设置面板打开且节缺失时补注)。

@@ -99,18 +99,41 @@ public class ServerManagerNotifTest {
 
     @Test
     public void permissionReplyUrl_buildsEndpoint() {
-        assertEquals("http://127.0.0.1:18888/permission/req_9/reply",
-                ServerManager.permissionReplyUrl("http://127.0.0.1:18888", "req_9"));
+        assertEquals("http://127.0.0.1:18888/api/session/ses_1/permission/req_9/reply",
+                ServerManager.permissionReplyUrl("http://127.0.0.1:18888", "ses_1", "req_9"));
+    }
+
+    @Test
+    public void permissionListUrl_scopedAndPlain() {
+        assertEquals("http://127.0.0.1:18888/api/permission/request?location%5Bdirectory%5D=%2Fworkspace",
+                ServerManager.permissionListUrl("http://127.0.0.1:18888", "/workspace"));
+        assertEquals("http://127.0.0.1:18888/api/permission/request",
+                ServerManager.permissionListUrl("http://127.0.0.1:18888", ""));
     }
 
     @Test
     public void permissionReplyBody_once() {
-        assertEquals("{\"reply\":\"once\"}", ServerManager.permissionReplyBody("once"));
+        assertEquals("{\"decision\":\"once\"}", ServerManager.permissionReplyBody("once"));
     }
 
     @Test
     public void permissionReplyBody_reject() {
-        assertEquals("{\"reply\":\"reject\"}", ServerManager.permissionReplyBody("reject"));
+        assertEquals("{\"decision\":\"reject\"}", ServerManager.permissionReplyBody("reject"));
+    }
+
+    @Test
+    public void parsePermissionList_unwrapsDataAndRenamesFields() throws Exception {
+        org.json.JSONArray arr = ServerManager.parsePermissionList(
+                "{\"location\":{\"directory\":\"/workspace/app\"},\"data\":["
+                        + "{\"requestID\":\"r9\",\"sessionID\":\"s1\",\"action\":\"bash\",\"resources\":[\"ls\"]}"
+                        + "]}");
+        assertEquals(1, arr.length());
+        org.json.JSONObject item = arr.getJSONObject(0);
+        assertEquals("r9", item.getString("id"));
+        assertEquals("s1", item.getString("sessionID"));
+        assertEquals("bash", item.getString("permission"));
+        assertEquals("ls", item.getJSONArray("patterns").getString(0));
+        assertEquals("/workspace/app", item.getString("__directory"));
     }
 
     // ---- 聊天框接收: SSE 事件分类 + 权限事件 payload 提取 ----
@@ -131,6 +154,11 @@ public class ServerManagerNotifTest {
     public void sseEventKind_partUpdated_isMessage() {
         assertEquals("message",
                 ServerManager.sseEventKind("{\"type\":\"message.part.updated\",\"properties\":{}}"));
+    }
+
+    @Test
+    public void sseEventKind_formCreated_isQuestion() {
+        assertEquals("question", ServerManager.sseEventKind("{\"type\":\"form.created\",\"properties\":{\"id\":\"f1\"}}"));
     }
 
     @Test
@@ -204,6 +232,22 @@ public class ServerManagerNotifTest {
     }
 
     @Test
+    public void ssePermissionPayload_requestIdRenamed() throws Exception {
+        JSONObject p = ServerManager.ssePermissionPayload(
+                "{\"type\":\"permission.asked\",\"properties\":{\"requestID\":\"r4\",\"sessionID\":\"s4\",\"action\":\"edit\"}}");
+        assertEquals("r4", p.optString("id"));
+        assertEquals("s4", p.optString("sessionID"));
+        assertEquals("edit", p.optString("permission"));
+    }
+
+    @Test
+    public void actionablePermission_rejectsEventBusId() throws Exception {
+        assertFalse(ServerManager.actionablePermission(new JSONObject().put("id", "evt_18bc")));
+        assertTrue(ServerManager.actionablePermission(new JSONObject().put("id", "per_18bc")));
+        assertFalse(ServerManager.actionablePermission(null));
+    }
+
+    @Test
     public void ssePermissionPayload_noId_returnsNull() throws Exception {
         assertNull(ServerManager.ssePermissionPayload("{\"type\":\"permission.asked\",\"properties\":{}}"));
     }
@@ -249,6 +293,15 @@ public class ServerManagerNotifTest {
         java.util.List<JSONObject> out = ServerManager.pendingNotifications(perms, "req_a,");
         assertEquals(1, out.size());
         assertEquals("req_b", out.get(0).optString("id"));
+    }
+
+    @Test
+    public void pendingNotifications_acceptsRequestId() throws Exception {
+        JSONArray perms = new org.json.JSONArray()
+                .put(new JSONObject().put("requestID", "req_c"));
+        java.util.List<JSONObject> out = ServerManager.pendingNotifications(perms, "");
+        assertEquals(1, out.size());
+        assertEquals("req_c", out.get(0).optString("id"));
     }
 
     @Test

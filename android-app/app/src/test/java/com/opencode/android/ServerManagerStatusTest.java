@@ -325,6 +325,8 @@ public class ServerManagerStatusTest {
                 ServerManager.permReplyAction(200, true));
         assertEquals(ServerManager.PermReplyAction.DISMISS_DONE,
                 ServerManager.permReplyAction(200, false));
+        assertEquals(ServerManager.PermReplyAction.DISMISS_DONE,
+                ServerManager.permReplyAction(204, true));
     }
 
     @Test

@@ -21,6 +21,9 @@ val appIdSuffix = (project.findProperty("appIdSuffix") as String?)?.takeIf { it.
 val applicationIdFull = "com.opencode.android" + (appIdSuffix?.let { ".$it" } ?: "")
 val serverPort = ((project.findProperty("port") as String?)?.toIntOrNull()) ?: 18888
 val appLabel = if (appIdSuffix != null) "OpenCode $appIdSuffix" else "OpenCode"
+// 打进安装包的服务程序版本。已有产物只在 version.txt 记录的就是这个版本时跳过下载。
+val opencodeVersion = (project.findProperty("opencodeVersion") as String?)?.takeIf { it.isNotBlank() }
+    ?: "v2.2.2"
 
 /** 简单重试: 网络抖动/限流导致的偶发失败不再让整个构建挂掉 (指数退避) */
 fun <T> retry(times: Int = 3, delayMs: Long = 5000, block: () -> T): T {
@@ -223,7 +226,10 @@ tasks.register("downloadRootfs") {
     outputs.file("$outputDir/version.txt")
     onlyIf {
         val v = File("$outputDir/version.txt")
-        !v.exists() || !v.readText().contains("opencode=") ||
+        val recorded = if (v.exists()) {
+            Regex("(?m)^opencode=(\\S+)").find(v.readText())?.groupValues?.get(1)
+        } else null
+        recorded != opencodeVersion ||
                 !file("$outputDir/base.tar").exists() || !file("$outputDir/opencode-bin").exists()
     }
     doLast {
@@ -234,30 +240,36 @@ tasks.register("downloadRootfs") {
         val work = build.dir("rootfs-work").get().asFile
         work.mkdirs()
 
-        // ---- 1. opencode 二进制 ----
-        var tag: String? = null
-        var dl: String? = null
-        try {
-            val api = "https://api.github.com/repos/anomalyco/opencode/releases/latest"
-            val json = httpGet(api)
-            tag = Regex("\"tag_name\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)
-            dl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*linux-arm64-musl[^\"]*tar\\.gz)\"")
-                .find(json)?.groupValues?.get(1)
-        } catch (e: Exception) {
-            logger.lifecycle("GitHub API failed (${e.message}), fallback to v1.18.25")
-        }
-        if (tag == null || dl == null) {
-            tag = "v1.18.25"
-            dl = "https://github.com/anomalyco/opencode/releases/download/$tag/opencode-linux-arm64-musl.tar.gz"
-        }
+        // ---- 1. opencode 二进制 (指定版本, 不回落到旧版本) ----
+        val tag = opencodeVersion
+        val dl = "https://github.com/anomalyco/opencode/releases/download/$tag/opencode-linux-arm64-musl.tar.gz"
         val tarball = File(work, "opencode-$tag.tar.gz")
         download(dl, tarball)
+        File(work, "opencode").takeIf { it.exists() }?.delete()
         copy {
             from(tarTree(project.resources.gzip(tarball))) { include("**/opencode") }
             into(work)
         }
-        val bin = File(work, "opencode")
-        require(bin.exists()) { "opencode binary not extracted" }
+        val bin = work.walkTopDown().firstOrNull { it.isFile && it.name == "opencode" }
+        require(bin != null && bin.isFile) { "opencode binary not extracted from $tag" }
+        fun sha8(f: File): String =
+            MessageDigest.getInstance("SHA-256").digest(f.readBytes())
+                .take(8).joinToString("") { "%02x".format(it) }
+        // 基础系统已在时只换程序。重做 base.tar 会改变指纹, 下次启动整包重装, 容器里另装的工具会被清掉。
+        val baseOut = File(outputDir.asFile, "base.tar")
+        val binOut = File(outputDir.asFile, "opencode-bin")
+        val versionFile = file("$outputDir/version.txt")
+        if (baseOut.exists()) {
+            bin.copyTo(binOut, overwrite = true)
+            val old = if (versionFile.exists()) versionFile.readText() else ""
+            val baseHash = Regex("(?m)^base=(\\S+)").find(old)?.groupValues?.get(1)
+                ?: sha8(baseOut)
+            val binHash = sha8(binOut)
+            versionFile.writeText("base=$baseHash\nbin=$binHash\nopencode=$tag\n")
+            logger.lifecycle("opencode bin updated (base=$baseHash bin=$binHash opencode=$tag): " +
+                    "${binOut.length()} bytes")
+            return@doLast
+        }
 
         // ---- 2. alpine minirootfs (busybox + apk + musl) ----
         // 固定版本保证构建可复现 (升级需手动改这里); 用版本分支路径,
@@ -284,8 +296,6 @@ tasks.register("downloadRootfs") {
         // 拆成两份: base.tar 是基础系统 (minirootfs+git+libs+certs, ~26MB),
         // opencode-bin 是独立二进制 (~190MB)。ServerManager 据此实现增量升级:
         // 只有二进制变化时原位覆盖, 用户在容器内 apk add 的工具得以保留。
-        val baseOut = File(outputDir.asFile, "base.tar")
-        val binOut = File(outputDir.asFile, "opencode-bin")
         val libArgs = libApkFiles.flatMap { listOf("--lib-apk", it.absolutePath) }
         runPython(scriptsDir.resolve("build_rootfs.py").absolutePath,
                 "--minirootfs", miniTarball.absolutePath,
@@ -304,9 +314,6 @@ tasks.register("downloadRootfs") {
 
         // version.txt: base=基础系统指纹, bin=二进制指纹 (均取 SHA-256 前 8 字节)。
         // ServerManager 分别比对: base 变了才整删重装, 只有 bin 变则原位覆盖。
-        fun sha8(f: File): String =
-            MessageDigest.getInstance("SHA-256").digest(f.readBytes())
-                .take(8).joinToString("") { "%02x".format(it) }
         val baseHash = sha8(baseOut)
         val binHash = sha8(binOut)
         file("$outputDir/version.txt")

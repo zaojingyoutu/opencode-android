@@ -63,6 +63,20 @@ public class MainActivity extends Activity {
     private boolean wasBackgrounded = false;
     /** App 是否在前台 (供 ServerService 看护线程判断"用户是否在看", 决定要不要发完成通知) */
     public static volatile boolean foreground;
+    /** 人正在看页面时，系统不弹顶部横幅。由页面自己在顶部显示同一条审批。 */
+    public interface ApprovalBanner {
+        void show(String id, String title, String text, String dir, String session);
+        void dismiss(String id);
+        void dismissAll();
+    }
+    public static volatile ApprovalBanner approvalBanner;
+    private final ApprovalBanner bannerSink = new ApprovalBanner() {
+        @Override public void show(String id, String title, String text, String dir, String session) {
+            MainActivity.this.show(id, title, text, dir, session);
+        }
+        @Override public void dismiss(String id) { MainActivity.this.dismiss(id); }
+        @Override public void dismissAll() { MainActivity.this.dismissAll(); }
+    };
     private boolean pendingFileChooser = false;
     /** 刚从文件选择器返回: 短时间内的回前台不做对齐/刷新 (选附件不该打断页面) */
     private boolean skipResyncOnce = false;
@@ -210,9 +224,12 @@ public class MainActivity extends Activity {
         }, PERM_CARD_GRACE_MS);
     }
 
+    private FrameLayout contentRoot;
+    private LinearLayout approvalHost;
+
     private void buildUI() {
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(0xFF0E1116);
+        contentRoot = new FrameLayout(this);
+        contentRoot.setBackgroundColor(0xFF0E1116);
 
         webView = new WebView(this);
         WebSettings ws = webView.getSettings();
@@ -258,9 +275,8 @@ public class MainActivity extends Activity {
                 // 否则出现"覆盖层消失→白屏→UI 突然出现"的闪烁 (白屏投诉主因之一)
                 view.evaluateJavascript(mobileCssJs(), null);
                 waitForSpaReady();
-                // 注入 "局域网访问" 设置节: 脚本在 assets/inject/lan.js (node --check 验证过语法),
-                // MutationObserver 检测设置面板打开 (role=tab 文本 General) 后在 tabpanel
-                // 底部追加一节, 样式贴近其暗色主题; 走 OcLan JS 桥操作
+                // 注入 "局域网访问": 挂在设置页签「服务器」(旧页仍认「通用」),
+                // 底部追加开关和改密码。走 OcLan JS 桥。
                 String lanJs = lanInjectJs();
                 if (lanJs != null) {
                     view.evaluateJavascript(
@@ -337,8 +353,13 @@ public class MainActivity extends Activity {
                 // 主文档: opencode Web UI 缺 viewport meta, 窄屏按桌面宽度排版导致
                 // 布局错乱/字小。提交前把 meta 拼进 <head>; 任何失败返回 null 走原生加载
                 if (request.isForMainFrame() && isLocalUrl(u)) {
-                    android.webkit.WebResourceResponse doc = injectViewport(u);
-                    if (doc != null) return doc;
+                    // 配对换来的地址要由 WebView 自己打开，才能收下 Set-Cookie。
+                    // 这里把响应读走再交回去，cookie 进不了页面。
+                    String path = u.getPath();
+                    if (path == null || !path.startsWith("/auth/connect/")) {
+                        android.webkit.WebResourceResponse doc = injectViewport(u);
+                        if (doc != null) return doc;
+                    }
                 }
                 String path = u.getPath();
                 // 只补 ghostty 光标; 不要代理全部 /assets/*
@@ -473,7 +494,7 @@ public class MainActivity extends Activity {
             }
         });
 
-        root.addView(webView);
+        contentRoot.addView(webView);
 
         // 顶部细进度条 (Web UI 页面加载)
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
@@ -485,7 +506,7 @@ public class MainActivity extends Activity {
         pbp.gravity = android.view.Gravity.TOP;
         progressBar.setLayoutParams(pbp);
         progressBar.setVisibility(View.GONE);
-        root.addView(progressBar);
+        contentRoot.addView(progressBar);
 
         // 启动覆盖层: 渐变底 + Logo + 状态
         GradientDrawable bg = new GradientDrawable(
@@ -553,9 +574,144 @@ public class MainActivity extends Activity {
         box.addView(statusView);
 
         startupOverlay.addView(box);
-        root.addView(startupOverlay);
+        contentRoot.addView(startupOverlay);
 
-        setContentView(root);
+        setContentView(contentRoot);
+    }
+
+    /** 页面顶部的审批条。系统在本应用处于前台时不弹横幅，按钮仍直接回复。 */
+    public void show(String id, String title, String text, String dir, String session) {
+        runOnUiThread(() -> {
+            if (contentRoot == null || id == null || id.isEmpty()) return;
+            if (approvalHost == null) {
+                approvalHost = new LinearLayout(this);
+                approvalHost.setOrientation(LinearLayout.VERTICAL);
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+                lp.gravity = android.view.Gravity.TOP;
+                lp.topMargin = dp(8);
+                lp.leftMargin = dp(12);
+                lp.rightMargin = dp(12);
+                approvalHost.setLayoutParams(lp);
+                contentRoot.addView(approvalHost);
+            }
+            View existing = approvalHost.findViewWithTag(id);
+            if (existing != null) {
+                setTreeClickable(existing, true);
+                approvalHost.bringToFront();
+                return;
+            }
+            approvalHost.addView(approvalCard(id, title, text, dir, session));
+            approvalHost.bringToFront();
+        });
+    }
+
+    public void dismiss(String id) {
+        runOnUiThread(() -> {
+            if (approvalHost == null || id == null) return;
+            View card = approvalHost.findViewWithTag(id);
+            if (card != null) approvalHost.removeView(card);
+        });
+    }
+
+    public void dismissAll() {
+        runOnUiThread(() -> {
+            if (approvalHost != null) approvalHost.removeAllViews();
+        });
+    }
+
+    private View approvalCard(String id, String title, String text, String dir, String session) {
+        LinearLayout card = new LinearLayout(this);
+        card.setTag(id);
+        card.setClickable(true);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(14), dp(12), dp(14), dp(12));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xF2FFFFFF);
+        bg.setCornerRadius(dp(16));
+        card.setBackground(bg);
+        card.setElevation(dp(10));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        clp.bottomMargin = dp(8);
+        card.setLayoutParams(clp);
+
+        TextView heading = new TextView(this);
+        heading.setText("需要批准 · " + (title == null ? "" : title));
+        heading.setTextColor(0xFF111111);
+        heading.setTextSize(15);
+        heading.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        card.addView(heading);
+
+        TextView body = new TextView(this);
+        body.setText(text == null ? "" : text);
+        body.setTextColor(0xFF333333);
+        body.setTextSize(13);
+        body.setMaxLines(3);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(4);
+        body.setLayoutParams(blp);
+        card.addView(body);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(android.view.Gravity.END);
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        rlp.topMargin = dp(10);
+        row.setLayoutParams(rlp);
+        TextView reject = approvalChip("拒绝", 0xFFC0392B);
+        TextView approve = approvalChip("批准", 0xFF1F8A3B);
+        reject.setOnClickListener(v -> {
+            reject.setClickable(false);
+            approve.setClickable(false);
+            sendApproval(id, "reject", dir, session);
+        });
+        approve.setOnClickListener(v -> {
+            approve.setClickable(false);
+            reject.setClickable(false);
+            sendApproval(id, "once", dir, session);
+        });
+        row.addView(reject);
+        row.addView(approve);
+        card.addView(row);
+        return card;
+    }
+
+    private TextView approvalChip(String label, int color) {
+        TextView tv = new TextView(this);
+        tv.setText(label);
+        tv.setTextColor(0xFFFFFFFF);
+        tv.setTextSize(14);
+        tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        tv.setPadding(dp(18), dp(8), dp(18), dp(8));
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(color);
+        d.setCornerRadius(dp(20));
+        tv.setBackground(d);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = dp(8);
+        tv.setLayoutParams(lp);
+        return tv;
+    }
+
+    private void setTreeClickable(View v, boolean clickable) {
+        v.setClickable(clickable);
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) setTreeClickable(g.getChildAt(i), clickable);
+        }
+    }
+
+    private void sendApproval(String id, String reply, String dir, String session) {
+        Intent i = new Intent(this, ServerService.class).setAction(ServerService.ACTION_PERM_REPLY);
+        i.putExtra("perm_id", id);
+        i.putExtra("perm_reply", reply);
+        if (dir != null && !dir.isEmpty()) i.putExtra("perm_dir", dir);
+        if (session != null && !session.isEmpty()) i.putExtra("perm_session", session);
+        startService(i);
     }
 
     /** 显示启动覆盖层 */
@@ -684,7 +840,21 @@ public class MainActivity extends Activity {
     private void load() {
         busy("正在加载界面...");
         // Activity 可能在 ping 返回前后被销毁 (webView 已置空), 此时不能再碰
-        if (webView != null) webView.loadUrl(embedded.serverUrl());
+        if (webView == null) return;
+        safeExecute(() -> {
+            final String cookie = embedded.browserSessionCookie();
+            runOnUiThread(() -> {
+                if (webView == null) return;
+                if (cookie != null) {
+                    android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+                    cm.setAcceptCookie(true);
+                    cm.setAcceptThirdPartyCookies(webView, true);
+                    cm.setCookie(embedded.serverUrl(), cookie);
+                    cm.flush();
+                }
+                webView.loadUrl(embedded.serverUrl() + "/");
+            });
+        });
     }
 
     /** 点击覆盖层/状态文字重试 */
@@ -1498,7 +1668,8 @@ public class MainActivity extends Activity {
     private boolean ping(String url) {
         HttpURLConnection conn = null;
         try {
-            URL u = new URL(url + "/api/health");
+            // v2 没有 /api/health。探活不返回 200 时页面不会 loadUrl。
+            URL u = new URL(url + "/api/info");
             conn = (HttpURLConnection) u.openConnection();
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(2500);
@@ -1526,6 +1697,7 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         foreground = false;
+        if (approvalBanner == bannerSink) approvalBanner = null;
         // 不暂停 WebView: 保留页面 DOM/滚动位置, 后台回来不闪白、不整页重载。
         // 后台耗电由 ServerService 看护兜底 (空闲释放唤醒锁 / 长时间空闲自动停止 server)。
         wasBackgrounded = true;
@@ -1538,6 +1710,8 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         foreground = true;
+        approvalBanner = bannerSink;
+        ServerService.replayApprovals();
         embedded.noteClientActivity();
         // 从"所有文件访问"设置页返回: 授权后重启服务以生效公开项目目录
         boolean granted = Environment.isExternalStorageManager();

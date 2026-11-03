@@ -616,6 +616,7 @@ public class ServerManager {
      *  详情为空时正文是 "AI 请求" + 权限类型 (无类型则 "批准操作") */
     public static PermissionNotice permissionNotice(org.json.JSONObject req, String sessionTitle) {
         if (req == null) return new PermissionNotice("", "OpenCode", "AI 请求批准操作");
+        normalizePermissionRequest(req);
         String reqId = req.optString("id", "");
         String permType = req.optString("permission", "");
         String detail = "";
@@ -638,14 +639,114 @@ public class ServerManager {
         return "reject".equals(reply) ? "已拒绝" : "已批准";
     }
 
-    /** 权限回复接口 URL: baseUrl + "/permission/<id>/reply" */
-    public static String permissionReplyUrl(String baseUrl, String requestId) {
-        return baseUrl + "/permission/" + requestId + "/reply";
+    /** 权限回复接口 URL: /api/session/<sessionID>/permission/<id>/reply */
+    public static String permissionReplyUrl(String baseUrl, String sessionId, String requestId) {
+        return baseUrl + "/api/session/" + urlPath(sessionId)
+                + "/permission/" + urlPath(requestId) + "/reply";
     }
 
-    /** 权限回复请求体 JSON: {"reply":"once"} */
+    /** 待批列表: /api/permission/request，按目录过滤时带 location[directory] */
+    public static String permissionListUrl(String baseUrl, String directory) {
+        return scopedGetUrl(baseUrl, "/api/permission/request", directory);
+    }
+
+    static String scopedGetUrl(String baseUrl, String path, String directory) {
+        if (directory == null || directory.isEmpty()) return baseUrl + path;
+        try {
+            return baseUrl + path + "?location%5Bdirectory%5D="
+                    + java.net.URLEncoder.encode(directory, "UTF-8");
+        } catch (java.io.UnsupportedEncodingException e) {
+            return baseUrl + path;
+        }
+    }
+
+    private static String urlPath(String value) {
+        if (value == null) return "";
+        try {
+            return java.net.URLEncoder.encode(value, "UTF-8").replace("+", "%20");
+        } catch (java.io.UnsupportedEncodingException e) {
+            return value;
+        }
+    }
+
+    /** 权限回复请求体 JSON: {"decision":"once"}。取值仍是 once / always / reject */
     public static String permissionReplyBody(String reply) {
-        return "{\"reply\":\"" + reply + "\"}";
+        return "{\"decision\":\"" + reply + "\"}";
+    }
+
+    /**
+     * 待批列表正文 → 请求数组。兼容裸数组，以及 {data:[...]} / {location, data}。
+     * 顺手把 requestID、action、resources 补成通知和回复用的 id、permission、patterns。
+     */
+    public static org.json.JSONArray parsePermissionList(String body) throws org.json.JSONException {
+        org.json.JSONArray out = new org.json.JSONArray();
+        if (body == null) return out;
+        String trimmed = body.trim();
+        if (trimmed.isEmpty()) return out;
+        if (trimmed.charAt(0) == '[') {
+            org.json.JSONArray arr = new org.json.JSONArray(trimmed);
+            for (int i = 0; i < arr.length(); i++) {
+                org.json.JSONObject obj = arr.optJSONObject(i);
+                if (obj == null) continue;
+                normalizePermissionRequest(obj);
+                out.put(obj);
+            }
+            return out;
+        }
+        org.json.JSONObject wrapped = new org.json.JSONObject(trimmed);
+        org.json.JSONArray data = wrapped.optJSONArray("data");
+        if (data == null) {
+            if (wrapped.has("id") || wrapped.has("requestID")) {
+                normalizePermissionRequest(wrapped);
+                out.put(wrapped);
+            }
+            return out;
+        }
+        String loc = locationDirectory(wrapped.opt("location"));
+        for (int i = 0; i < data.length(); i++) {
+            org.json.JSONObject obj = data.optJSONObject(i);
+            if (obj == null) continue;
+            normalizePermissionRequest(obj);
+            if (!loc.isEmpty() && !obj.has("__directory")) {
+                obj.put("__directory", loc);
+            }
+            out.put(obj);
+        }
+        return out;
+    }
+
+    private static String locationDirectory(Object location) {
+        if (location instanceof String) return (String) location;
+        if (location instanceof org.json.JSONObject) {
+            return ((org.json.JSONObject) location).optString("directory", "");
+        }
+        return "";
+    }
+
+    /** 把 2.0 请求字段补成横幅和回复已经在用的名字。原地修改。 */
+    static void normalizePermissionRequest(org.json.JSONObject obj) {
+        if (obj == null) return;
+        try {
+            if (obj.optString("id", "").isEmpty()) {
+                String id = obj.optString("requestID", "");
+                if (id.isEmpty()) id = obj.optString("formID", "");
+                if (!id.isEmpty()) obj.put("id", id);
+            }
+            if (obj.optString("permission", "").isEmpty()) {
+                String action = obj.optString("action", "");
+                if (!action.isEmpty()) obj.put("permission", action);
+            }
+            if (obj.optJSONArray("patterns") == null) {
+                org.json.JSONArray resources = obj.optJSONArray("resources");
+                if (resources != null) obj.put("patterns", resources);
+            }
+            if (obj.optString("sessionID", "").isEmpty()) {
+                String session = obj.optString("sessionId", "");
+                if (session.isEmpty()) session = obj.optString("session_id", "");
+                if (!session.isEmpty()) obj.put("sessionID", session);
+            }
+        } catch (org.json.JSONException ignored) {
+        }
     }
 
     /** 从待批准请求列表里挑出"尚未通知过"的请求 (按 id 逐条去重)。
@@ -661,6 +762,7 @@ public class ServerManager {
         for (int i = 0; i < perms.length(); i++) {
             org.json.JSONObject req = perms.optJSONObject(i);
             if (req == null) continue;
+            normalizePermissionRequest(req);
             String id = req.optString("id", "");
             if (id.isEmpty() || known.contains(id + ",")) continue;
             out.add(req);
@@ -668,11 +770,11 @@ public class ServerManager {
         return out;
     }
 
-    /** SSE 事件分类: "permission" / "question" / "message" / "" */
+    /** SSE 事件分类: "permission" / "question" / "message" / ""。提问在 2.0 里是 form.created */
     public static String sseEventKind(String json) {
         if (json == null) return "";
         if (json.contains("permission.asked")) return "permission";
-        if (json.contains("question.asked")) return "question";
+        if (json.contains("question.asked") || json.contains("form.created")) return "question";
         if (json.contains("message.updated") || json.contains("message.part.updated")) return "message";
         return "";
     }
@@ -714,8 +816,20 @@ public class ServerManager {
             throws org.json.JSONException {
         org.json.JSONObject req = new org.json.JSONObject(json);
         org.json.JSONObject p = req.optJSONObject("properties");
-        if (p == null || !p.has("id")) p = req;
+        if (p != null) normalizePermissionRequest(p);
+        if (p == null || p.optString("id", "").isEmpty()) {
+            p = req;
+            normalizePermissionRequest(p);
+        }
         return p.optString("id", "").isEmpty() ? null : p;
+    }
+
+    /** 事件总线自己的记录（evt_）不是能回复的审批。这种记录去拉待批列表，不要拿来弹横幅。 */
+    public static boolean actionablePermission(org.json.JSONObject req) {
+        if (req == null) return false;
+        normalizePermissionRequest(req);
+        String id = req.optString("id", "");
+        return !id.isEmpty() && !id.startsWith("evt_");
     }
 
     /** SSE question 事件 → 请求对象 (结构与 permission 同形); 无 id 返回 null */
@@ -752,100 +866,63 @@ public class ServerManager {
         return new PermissionNotice(reqId, title, text);
     }
 
-    /** 查询待批准的权限请求 (GET /permission, 含 request id 供通知按钮直接回复),
+    /** 查询待批准的权限请求 (GET /api/permission/request),
      *  <b>子线程调用</b>; 失败返回 null。
-     *  聚合多目录: 见 listSessionsAll 注释，单目录轮询会漏子项目 */
+     *  聚合多目录: 不带范围的列表可能不含子项目，漏了横幅就没了 */
     public org.json.JSONArray listPendingPermissions() {
+        return listScoped("/api/permission/request", "permissions");
+    }
+
+    /** 查询待回答的问题 (GET /api/form), 多目录聚合; 失败返回 null。
+     *  <b>子线程调用</b>。提问与审批同为"等用户才继续"的阻塞点 */
+    public org.json.JSONArray listPendingQuestions() {
+        return listScoped("/api/form", "questions");
+    }
+
+    /** 按工作区目录拉一份列表，空了再试一次不带目录的。任一请求成功才返回数组，全失败返回 null */
+    private org.json.JSONArray listScoped(String path, String label) {
         java.util.Set<String> seen = new java.util.HashSet<>();
         org.json.JSONArray merged = new org.json.JSONArray();
         boolean anySuccess = false;
         for (String dir : workspaceDirectories()) {
             try {
-                String url = serverUrl() + "/permission?directory="
-                        + java.net.URLEncoder.encode(dir, "UTF-8");
-                org.json.JSONArray arr = new org.json.JSONArray(httpGet(url));
+                String body = httpGet(scopedGetUrl(serverUrl(), path, dir), dir);
                 anySuccess = true;
-                for (int i = 0; i < arr.length(); i++) {
-                    org.json.JSONObject obj = arr.optJSONObject(i);
-                    if (obj == null) continue;
-                    String id = obj.optString("id", "");
-                    if (id.isEmpty() || !seen.add(id)) continue;
-                    // 记下该请求归属的目录，供后续 reply 时带上 directory 参数
-                    try { obj.put("__directory", dir); } catch (Exception ignored) {}
-                    merged.put(obj);
-                }
-            } catch (Exception ignored) {}
+                appendListed(merged, seen, parsePermissionList(body), dir);
+            } catch (Exception ignored) {
+            }
         }
-        // 兜底旧接口: 仅当聚合为空时尝试，减少新版 server 的重复请求
         if (merged.length() == 0) {
             try {
-                org.json.JSONArray arr = new org.json.JSONArray(httpGet(serverUrl() + "/permission"));
+                String body = httpGet(scopedGetUrl(serverUrl(), path, null), null);
                 anySuccess = true;
-                for (int i = 0; i < arr.length(); i++) {
-                    org.json.JSONObject obj = arr.optJSONObject(i);
-                    if (obj == null) continue;
-                    String id = obj.optString("id", "");
-                    if (id.isEmpty() || !seen.add(id)) continue;
-                    if (!obj.has("__directory")) try { obj.put("__directory", "/workspace"); } catch (Exception ignored) {}
-                    merged.put(obj);
-                }
+                appendListed(merged, seen, parsePermissionList(body), null);
             } catch (Exception e) {
                 if (!anySuccess) {
-                    Log.w(TAG, "list pending permissions failed: " + e);
+                    Log.w(TAG, "list pending " + label + " failed: " + e);
                     return null;
                 }
             }
-        } else {
-            anySuccess = true;
         }
         return merged;
     }
 
-    /** 查询待回答的问题 (GET /question), 多目录聚合; 失败返回 null。
-     *  <b>子线程调用</b>。question 与 permission 同为"等用户才继续"的阻塞点,
-     *  后台必须同样弹系统通知, 否则任务静默卡死 */
-    public org.json.JSONArray listPendingQuestions() {
-        java.util.Set<String> seen = new java.util.HashSet<>();
-        org.json.JSONArray merged = new org.json.JSONArray();
-        boolean anySuccess = false;
-        for (String dir : workspaceDirectories()) {
+    private static void appendListed(org.json.JSONArray merged, java.util.Set<String> seen,
+            org.json.JSONArray arr, String dir) {
+        if (arr == null) return;
+        for (int i = 0; i < arr.length(); i++) {
+            org.json.JSONObject obj = arr.optJSONObject(i);
+            if (obj == null) continue;
+            String id = obj.optString("id", "");
+            if (id.isEmpty() || !seen.add(id)) continue;
             try {
-                String url = serverUrl() + "/question?directory="
-                        + java.net.URLEncoder.encode(dir, "UTF-8");
-                org.json.JSONArray arr = new org.json.JSONArray(httpGet(url));
-                anySuccess = true;
-                for (int i = 0; i < arr.length(); i++) {
-                    org.json.JSONObject obj = arr.optJSONObject(i);
-                    if (obj == null) continue;
-                    String id = obj.optString("id", "");
-                    if (id.isEmpty() || !seen.add(id)) continue;
-                    try { obj.put("__directory", dir); } catch (Exception ignored) {}
-                    merged.put(obj);
+                if (dir != null && !dir.isEmpty() && !obj.has("__directory")) {
+                    obj.put("__directory", dir);
                 }
-            } catch (Exception ignored) {}
-        }
-        if (merged.length() == 0) {
-            try {
-                org.json.JSONArray arr = new org.json.JSONArray(httpGet(serverUrl() + "/question"));
-                anySuccess = true;
-                for (int i = 0; i < arr.length(); i++) {
-                    org.json.JSONObject obj = arr.optJSONObject(i);
-                    if (obj == null) continue;
-                    String id = obj.optString("id", "");
-                    if (id.isEmpty() || !seen.add(id)) continue;
-                    if (!obj.has("__directory")) try { obj.put("__directory", "/workspace"); } catch (Exception ignored) {}
-                    merged.put(obj);
-                }
-            } catch (Exception e) {
-                if (!anySuccess) {
-                    Log.w(TAG, "list pending questions failed: " + e);
-                    return null;
-                }
+            } catch (Exception ignored) {
             }
-        } else {
-            anySuccess = true;
+            merged.put(obj);
         }
-        return merged;
     }
 
     /** 回复结果: 成功 / 请求已不在 (server 重启等导致僵尸审批) / 未知失败 (服务挂/超时) */
@@ -853,38 +930,33 @@ public class ServerManager {
     static final int REPLY_GONE = 404;
     static final int REPLY_UNKNOWN = -1;
 
-    /** 回复权限请求: reply = "once"(批准一次) / "reject"(拒绝), <b>子线程调用</b>;
-     *  成功返回 true。兼容旧调用: 依次尝试已知的目录直到成功 */
-    public boolean replyPermission(String requestId, String reply) {
-        return replyPermissionDetailed(requestId, reply, null) == REPLY_OK;
+    /** 回复权限请求。2.0 的地址要 sessionID，没有就按请求 id 到待批列表里找。
+     *  200/204 成功; 404=请求已失效; 抛异常=未知失败。
+     *  通知里带的 session 对不上时，再用待批列表里的 session 试一次。 */
+    public int replyPermissionDetailed(String requestId, String reply, String directory, String sessionId) {
+        String sid = sessionId;
+        if (sid == null || sid.isEmpty()) sid = sessionIdForRequest(requestId);
+        int code = replyPermissionWithDirectory(requestId, reply, directory, sid);
+        if (code == REPLY_GONE && sessionId != null && !sessionId.isEmpty()) {
+            String looked = sessionIdForRequest(requestId);
+            if (looked != null && !looked.equals(sessionId)) {
+                code = replyPermissionWithDirectory(requestId, reply, directory, looked);
+            }
+        }
+        return code;
     }
 
-    /** 带 directory 的回复 (只试该目录; 调用方自行决定是否回落全目录) */
-    public boolean replyPermission(String requestId, String reply, String directory) {
-        return replyPermissionWithDirectory(requestId, reply, directory) == REPLY_OK;
-    }
-
-    /** 带 HTTP 码的回复: 200 成功; 全部尝试 404=请求已失效;
-     *  全部抛异常=未知失败。directory!=null 时只试该目录 (供调用方逐个回落)。 */
-    public int replyPermissionDetailed(String requestId, String reply, String directory) {
-        if (directory != null && !directory.isEmpty()) {
-            return replyPermissionWithDirectory(requestId, reply, directory);
+    private String sessionIdForRequest(String requestId) {
+        if (requestId == null || requestId.isEmpty()) return null;
+        org.json.JSONArray pending = listPendingPermissions();
+        if (pending == null) return null;
+        for (int i = 0; i < pending.length(); i++) {
+            org.json.JSONObject obj = pending.optJSONObject(i);
+            if (obj == null || !requestId.equals(obj.optString("id", ""))) continue;
+            String sid = obj.optString("sessionID", "");
+            if (!sid.isEmpty()) return sid;
         }
-        // 先尝试不带目录 (旧 server 兼容)
-        int code = replyPermissionWithDirectory(requestId, reply, null);
-        if (code == REPLY_OK) return REPLY_OK;
-        int last = code;
-        // 再按已知目录逐个尝试
-        for (String dir : workspaceDirectories()) {
-            code = replyPermissionWithDirectory(requestId, reply, dir);
-            if (code == REPLY_OK) return REPLY_OK;
-            last = code;
-        }
-        if (last != REPLY_UNKNOWN) {
-            Log.w(TAG, "permission reply failed for all directories: " + requestId
-                    + " last=" + last);
-        }
-        return last;
+        return null;
     }
 
     /** 审批横幅动作决策 (纯函数, 可单元测试):
@@ -893,17 +965,18 @@ public class ServerManager {
     enum PermReplyAction { DISMISS_DONE, DISMISS_GONE, KEEP_RETRY_DOWN, KEEP_RETRY_MAYBE }
 
     static PermReplyAction permReplyAction(int code, boolean serverHealthy) {
-        if (code == REPLY_OK) return PermReplyAction.DISMISS_DONE;
+        if (code == REPLY_OK || code == 204) return PermReplyAction.DISMISS_DONE;
         if (code == REPLY_GONE) return PermReplyAction.DISMISS_GONE;
         return serverHealthy ? PermReplyAction.KEEP_RETRY_MAYBE : PermReplyAction.KEEP_RETRY_DOWN;
     }
 
-    private int replyPermissionWithDirectory(String requestId, String reply, String directory) {
+    private int replyPermissionWithDirectory(String requestId, String reply, String directory, String sessionId) {
+        if (sessionId == null || sessionId.isEmpty()) {
+            Log.w(TAG, "permission reply missing session: " + requestId);
+            return REPLY_UNKNOWN;
+        }
         try {
-            String url = permissionReplyUrl(serverUrl(), requestId);
-            if (directory != null && !directory.isEmpty()) {
-                url += "?directory=" + java.net.URLEncoder.encode(directory, "UTF-8");
-            }
+            String url = permissionReplyUrl(serverUrl(), sessionId, requestId);
             HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
             try {
                 conn.setRequestMethod("POST");
@@ -920,7 +993,9 @@ public class ServerManager {
                 conn.getOutputStream().write(body);
                 int code = conn.getResponseCode();
                 Log.i(TAG, "permission reply " + requestId + " " + reply
+                        + " sess=" + sessionId
                         + (directory != null ? " dir=" + directory : "") + ": http " + code);
+                if (code == 204) return REPLY_OK;
                 return code;
             } finally {
                 conn.disconnect();
@@ -947,12 +1022,19 @@ public class ServerManager {
 
     /** GET 指定 URL 返回响应体字符串, 失败抛异常 (自带 Basic 认证) */
     private String httpGet(String url) throws IOException {
+        return httpGet(url, null);
+    }
+
+    private String httpGet(String url, String directory) throws IOException {
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
         try {
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(3000);
             conn.setReadTimeout(3000);
             conn.setRequestProperty("Authorization", basicAuth());
+            if (directory != null && !directory.isEmpty()) {
+                conn.setRequestProperty("x-opencode-directory", directory);
+            }
             int code = conn.getResponseCode();
             try (java.io.InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream()) {
                 String body = in == null ? "" : readText(in);
@@ -1045,12 +1127,13 @@ public class ServerManager {
     }
 
     /** 探测 server 是否响应 (2 秒超时), <b>子线程调用</b>。
-     *  用于检测挂死: opencode 这版在权限待批等场景会卡死事件循环 (ServeError),
-     *  此时所有接口超时, 通知检测永久失效, 需要靠它触发自动重启 */
+     *  用于检测挂死: 权限待批等场景会卡死事件循环 (ServeError),
+     *  此时所有接口超时, 通知检测永久失效, 需要靠它触发自动重启。
+     *  v2 没有 /api/health, 探活打到不存在的路径会被当成挂死并重启。 */
     public boolean isHealthy() {
         try {
             HttpURLConnection conn = (HttpURLConnection) new URL(
-                    serverUrl() + "/api/health").openConnection();
+                    serverUrl() + "/api/info").openConnection();
             try {
                 conn.setRequestMethod("GET");
                 conn.setConnectTimeout(2000);
@@ -1120,6 +1203,102 @@ public class ServerManager {
         String cred = LAN_USER + ":" + lanPassword();
         return "Basic " + android.util.Base64.encodeToString(
                 cred.getBytes(StandardCharsets.UTF_8), android.util.Base64.NO_WRAP);
+    }
+
+    /**
+     * v2 网页不沿用这次 Basic 认证，会停在配对页。
+     * 用已保存的密码换一次性连接码，再由本机兑换成会话 cookie。
+     * 不要把一次性地址交给 WebView：它可能读走响应，cookie 进不了页面。
+     * 失败返回 null。子线程调用。
+     */
+    public String browserSessionCookie() {
+        String code = pairingCode();
+        if (code == null) return null;
+        HttpURLConnection conn = null;
+        try {
+            String url = serverUrl() + "/auth/connect/"
+                    + java.net.URLEncoder.encode(code, "UTF-8");
+            conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setInstanceFollowRedirects(false);
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(4000);
+            conn.setReadTimeout(4000);
+            conn.setRequestProperty("Accept", "text/html");
+            conn.setRequestProperty("Authorization", basicAuth());
+            int status = conn.getResponseCode();
+            String cookie = sessionCookie(conn);
+            if (cookie == null) Log.w(TAG, "connect status " + status + " no session cookie");
+            return cookie;
+        } catch (Exception e) {
+            Log.w(TAG, "connect failed: " + e.getMessage());
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private static String sessionCookie(HttpURLConnection conn) {
+        Map<String, List<String>> headers = conn.getHeaderFields();
+        if (headers == null) return null;
+        for (Map.Entry<String, List<String>> entry : headers.entrySet()) {
+            if (entry.getKey() == null || !entry.getKey().equalsIgnoreCase("Set-Cookie")) continue;
+            List<String> values = entry.getValue();
+            if (values == null) continue;
+            for (String value : values) {
+                if (value != null && value.contains("opencode_session")) return value;
+            }
+        }
+        return null;
+    }
+
+    /** 用已保存的密码换一次性连接码。失败返回 null。子线程调用。 */
+    private String pairingCode() {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(serverUrl() + "/api/pair").openConnection();
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(4000);
+            conn.setReadTimeout(4000);
+            conn.setDoOutput(true);
+            conn.setFixedLengthStreamingMode(0);
+            conn.setRequestProperty("Authorization", basicAuth());
+            conn.setRequestProperty("Accept", "application/json");
+            conn.getOutputStream().close();
+            if (conn.getResponseCode() != 200) {
+                Log.w(TAG, "pair status " + conn.getResponseCode());
+                return null;
+            }
+            String body;
+            try (InputStream in = conn.getInputStream()) {
+                body = readLimited(in, 4096);
+            }
+            org.json.JSONObject o = new org.json.JSONObject(body);
+            String code = o.optString("code", "");
+            org.json.JSONObject data = o.optJSONObject("data");
+            if (code.isEmpty() && data != null) code = data.optString("code", "");
+            if (code.isEmpty()) {
+                Log.w(TAG, "pair missing code, keys=" + o.names());
+                return null;
+            }
+            return code;
+        } catch (Exception e) {
+            Log.w(TAG, "pair failed: " + e.getMessage());
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private static String readLimited(InputStream in, int max) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[1024];
+        int total = 0;
+        int n;
+        while (total < max && (n = in.read(buf, 0, Math.min(buf.length, max - total))) != -1) {
+            bos.write(buf, 0, n);
+            total += n;
+        }
+        return bos.toString(StandardCharsets.UTF_8.name());
     }
 
     /** 局域网访问地址 (取站点内 IPv4), 未开启/取不到 IP 返回空串 */

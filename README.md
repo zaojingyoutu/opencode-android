@@ -70,8 +70,8 @@ cd android-app
 - server 默认只监听 127.0.0.1, 不暴露到局域网; 需要大屏使用可在通知栏/设置面板
   开启局域网访问 (此时绑 0.0.0.0, 带 HTTP Basic 认证, 密码首启随机生成)
 - 容器运行时拆成两份 (增量升级): `base.tar` (minirootfs+git+libs+certs, ~26MB) +
-  `opencode-bin` (独立二进制, ~190MB)。升级时只有二进制变化则原位覆盖, 用户在容器内
-  `apk add` 的工具全部保留; 基础系统变化才整删重装
+  `opencode-bin` (独立二进制)。打进包里的程序版本默认 `v2.2.2`，可用 `-PopencodeVersion=vX.Y.Z` 更换。
+  升级时只有二进制变化则原位覆盖, 用户在容器内 `apk add` 的工具全部保留; 基础系统变化才整删重装
 - 容器目录映射:
   - `/workspace` = 手机存储 `/sdcard/opencode`
     (容器内的工作/项目目录, opencode Web UI 的文件浏览根目录;
@@ -120,9 +120,11 @@ cd android-app
 ```
 
 构建任务:
-- `downloadRootfs`: 下载 opencode release、alpine-minirootfs、git + libcurl 依赖闭包 (alpine v3.24),
-  用 `scripts/build_rootfs.py` 流式组装成 `assets/opencode/base.tar` (纯 tar, 不落盘宿主文件系统,
-  无需本地工具链) + 独立 `opencode-bin`, 并写 `version.txt` (base/bin 指纹)。已有产物时跳过 (不联网)
+- `downloadRootfs`: 按 `-PopencodeVersion`（默认 `v2.2.2`）下载对应的 linux-arm64-musl 程序。
+  `version.txt` 里记录的已经是这个版本、且 `base.tar` 和 `opencode-bin` 都在时才跳过。
+  基础系统已在时只替换 `opencode-bin` 并更新二进制指纹，不重做 `base.tar`。
+  基础系统缺失时才下载 alpine-minirootfs、git 与 libcurl 依赖 (alpine v3.24)，
+  用 `scripts/build_rootfs.py` 组装 `base.tar`
 - `downloadProot`: 下载 termux 的 proot 及依赖 deb, 用 `scripts/prepare_proot.py` 解出
   `jniLibs/arm64-v8a/libproot*.so` 与 `assets/opencode/proot/*.so`
 

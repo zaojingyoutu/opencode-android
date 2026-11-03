@@ -46,7 +46,7 @@ public class ServerService extends Service {
     private static final String TASK_CHANNEL_ID = "opencode_task2";
     private static final int NOTIF_ID_TASK = 1002;
     /** 待批准提醒渠道 (AI 等用户批准工具调用): 高优先级横幅+声音, 与完成提醒分开便于分别管理 */
-    private static final String PERMISSION_CHANNEL_ID = "opencode_permission";
+    private static final String PERMISSION_CHANNEL_ID = "opencode_permission2";
     private static final int NOTIF_ID_PERMISSION = 1003;
 
     // ---- 空闲看护参数 ----
@@ -71,6 +71,9 @@ public class ServerService extends Service {
     private ServerManager server;
     private DeviceBridge deviceBridge;
     private final Handler main = new Handler(Looper.getMainLooper());
+    /** 还没处理完的审批。系统在本应用前台时不弹顶部横幅，页面用这份列表自己画。 */
+    private static final java.util.LinkedHashMap<String, String[]> openApprovals =
+            new java.util.LinkedHashMap<>();
 
     private Thread watchdog;
     private volatile boolean watchdogRunning;
@@ -352,42 +355,42 @@ public class ServerService extends Service {
                     Thread.sleep(60_000);
                     continue;
                 }
-                // 优先订阅全局事件流 (/global/event): 包含所有目录的 permission.asked，
-                // 单目录的 /event 只返回默认 /workspace 的事件 → 子项目不弹横幅。
-                // 若全局订阅失败 (旧版 server 无此路由) 回退到 /event。
-                String url = server.serverUrl() + "/global/event";
+                // 只订 /api/event。网页路由 /event 也会 200，但马上结束，
+                // 会把事件流标成健康，待批轮询被跳过，横幅就出不来。
+                String url = server.serverUrl() + "/api/event";
                 conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
                 sseConn = conn;
                 conn.setRequestProperty("Authorization", server.basicAuth());
+                conn.setRequestProperty("Accept", "text/event-stream");
                 conn.setConnectTimeout(5000);
                 // 读超时 60s: 静默 server 不必每 15s 断开重连一次 (重连风暴省 4 倍);
                 // 挂死检测不靠它 (isHealthy 独立 10s 探测), 半开连接靠 sseFreshMs 过期兜底
                 conn.setReadTimeout(60_000);
                 int code = conn.getResponseCode();
-                if (code != 200) {
-                    try { conn.disconnect(); } catch (Exception ignored) {}
-                    // 回退旧端点
-                    conn = (java.net.HttpURLConnection) new java.net.URL(
-                            server.serverUrl() + "/event").openConnection();
-                    sseConn = conn;
-                    conn.setRequestProperty("Authorization", server.basicAuth());
-                    conn.setConnectTimeout(5000);
-                    conn.setReadTimeout(60_000);
-                    if (conn.getResponseCode() != 200) {
-                        Thread.sleep(5000);
-                        continue;
-                    }
+                String contentType = conn.getContentType();
+                if (code != 200 || (contentType != null && contentType.contains("text/html"))) {
+                    Log.w(TAG, "sse http " + code
+                            + (contentType == null ? "" : " type=" + contentType));
+                    Thread.sleep(5000);
+                    continue;
                 }
                 Log.i(TAG, "sse subscribed (" + url + ")");
-                sseFreshMs = android.os.SystemClock.elapsedRealtime();
                 java.io.BufferedReader reader = new java.io.BufferedReader(
                         new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
                 String line;
+                String eventName = "";
                 while (sseRunning && (line = reader.readLine()) != null) {
-                    // 任何行 (含保活注释) 都是存活证明: 供 notifyTick 短路 HTTP 轮询用
-                    sseFreshMs = android.os.SystemClock.elapsedRealtime();
-                    if (line.startsWith("data:")) {
-                        handleServerEvent(line.substring(5).trim());
+                    // 只有事件流自己的行才算存活。网页正文不能把轮询短路掉
+                    if (line.startsWith("data:") || line.startsWith("event:") || line.startsWith(":")) {
+                        sseFreshMs = android.os.SystemClock.elapsedRealtime();
+                    }
+                    if (line.startsWith("event:")) {
+                        eventName = line.substring(6).trim();
+                    } else if (line.startsWith("data:")) {
+                        handleServerEvent(eventName, line.substring(5).trim());
+                        eventName = "";
+                    } else if (line.isEmpty()) {
+                        eventName = "";
                     }
                 }
             } catch (InterruptedException e) {
@@ -411,9 +414,9 @@ public class ServerService extends Service {
      *  回复收尾 (session idle / message.completed) 只唤醒看护线程做一次完成检测。
      *  message.part.updated 是页面渲染用的流式增量, 这里不解析、不打 HTTP:
      *  读循环一旦同步去扫多目录状态, 单线程 server 就没法把下一块内容写给 WebView。
-     *  兼容全局事件包装: /global/event 的 data 是 {directory, payload:{type,...}},
-     *  而 /event 的 data 直接就是 {type,...}。 */
-    private void handleServerEvent(String json) {
+     *  兼容带 directory 的包装: data 是 {directory, payload:{type,...}}，
+     *  也可能直接就是 {type,...}。event 行上的类型名同样认。 */
+    private void handleServerEvent(String eventName, String json) {
         try {
             if (json != null && json.contains("message.part.updated")) return;
             boolean pollStatus = ServerManager.sseNeedsStatusPoll(json);
@@ -434,9 +437,10 @@ public class ServerService extends Service {
             } catch (Exception ignore) {}
 
             String kind = ServerManager.sseEventKind(effectiveJson);
+            if (kind.isEmpty()) kind = ServerManager.sseEventKind(eventName);
             if ("permission".equals(kind)) {
                 org.json.JSONObject p = ServerManager.ssePermissionPayload(effectiveJson);
-                if (p != null) {
+                if (p != null && ServerManager.actionablePermission(p)) {
                     if (eventDirectory != null && !p.has("__directory")) {
                         try { p.put("__directory", eventDirectory); } catch (Exception ignored) {}
                     }
@@ -449,6 +453,9 @@ public class ServerService extends Service {
                         lastPermState = PERM_NONEMPTY;
                         notifyPermissionFromEvent(p);
                     }
+                } else {
+                    // 事件总线上的记录不是待批请求。立刻拉列表，用真正的请求发横幅
+                    requestForcedNotify();
                 }
             } else if ("question".equals(kind)) {
                 // AI 提问等用户选选项: 同审批一样阻塞, 必须弹系统通知 (后台靠它唤醒用户)
@@ -863,20 +870,13 @@ public class ServerService extends Service {
         final String id = intent.getStringExtra("perm_id");
         final String reply = intent.getStringExtra("perm_reply");
         final String dir = intent.getStringExtra("perm_dir");
+        final String sess = intent.getStringExtra("perm_session");
         if (id == null || reply == null) return;
         final String label = ServerManager.permReplyLabel(reply);
         new Thread(() -> {
             int code;
             try {
-                if (dir != null && !dir.isEmpty()) {
-                    code = server.replyPermissionDetailed(id, reply, dir);
-                    // 指定目录 404 可能是归属目录不对, 回落全目录重试一次
-                    if (code == ServerManager.REPLY_GONE) {
-                        code = server.replyPermissionDetailed(id, reply, null);
-                    }
-                } else {
-                    code = server.replyPermissionDetailed(id, reply, null);
-                }
+                code = server.replyPermissionDetailed(id, reply, dir, sess);
             } catch (Exception e) {
                 Log.w(TAG, "perm reply threw: " + e);
                 code = ServerManager.REPLY_UNKNOWN;
@@ -918,6 +918,9 @@ public class ServerService extends Service {
                             (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
                     nm2.cancel(permissionNotifId(id));
                 } catch (Exception ignored) {}
+                retractApproval(id);
+            } else {
+                replayOne(id);
             }
             // Toast 必须在主线程 (后台线程调用在部分 ROM 会抛异常)
             main.post(() -> android.widget.Toast.makeText(this, toast,
@@ -928,17 +931,7 @@ public class ServerService extends Service {
         }, "opencode-perm-reply").start();
     }
 
-    /** 发"需要批准"通知 (带常驻批准/拒绝按钮的自定义布局), 轮询和 SSE 两条路共用。
-     *  每条待批准请求用独立通知 id (由请求 id 派生), 多个会话/目录同时待批时
-     *  通知栏可并存多条, 每条都能单独批准/拒绝 — 避免只保留一条时新请求盖住旧请求 */
-    private void postPermissionNotification(String reqId, String title, String text) {
-        postPermissionNotification(reqId, title, text, null, null);
-    }
-
-    private void postPermissionNotification(String reqId, String title, String text, String directory) {
-        postPermissionNotification(reqId, title, text, directory, null);
-    }
-
+    /** 发"需要批准"通知。每条待批准请求用独立通知 id，多个会话可以同时各批各的。 */
     private void postPermissionNotification(String reqId, String title, String text, String directory, String sessionId) {
         Intent open = new Intent(this, MainActivity.class);
         open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -957,23 +950,31 @@ public class ServerService extends Service {
                 .setContentIntent(pi)
                 .setAutoCancel(true)
                 .setTicker(text)
+                .setCategory(Notification.CATEGORY_REMINDER)
                 .setPriority(Notification.PRIORITY_HIGH)
                 .setLights(0xFFFF0000, 500, 2000);
+        // 不和前台服务的常驻通知自动成组。成组后组摘要没有 ticker，横幅不会弹出来
+        alertApart(b, "oc-approval-" + reqId);
         if (!reqId.isEmpty()) {
             // 原生按钮: 系统默认样式, 展开通知可见。
             // requestCode 按请求 id 派生: 多条待批准通知并存时, 固定 requestCode 会让
             // FLAG_UPDATE_CURRENT 以最后一次创建的 extra 为准 → 点任意一条都回复最后一个
             // 请求。派生后每条通知的按钮绑定各自的 perm_id, 各批各的。
             // directory 一并传入 PendingIntent，供回复时带上正确目录 (per-directory 实例)
-            b.addAction(0, "批准", permReplyPi(reqId, "once", 5, reqId, directory))
-             .addAction(0, "拒绝", permReplyPi(reqId, "reject", 6, reqId, directory));
+            b.addAction(0, "批准", permReplyPi(reqId, "once", directory, sessionId))
+             .addAction(0, "拒绝", permReplyPi(reqId, "reject", directory, sessionId));
         }
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         // 同一请求重复 post 只静默更新, 不再响铃/震动/弹横幅:
-        // 去重 key 在极端路径 (看护重启等) 被重置时, 兜底不打扰用户
+        // 去重 key 在极端路径 (看护重启等) 被重置时, 兜底不打扰用户。
+        // 先撤掉旧的: 已经被静音分组收进去的同一条，直接更新不会再弹横幅
+        int notifId = permissionNotifId(reqId);
+        nm.cancel(notifId);
         Notification n = b.build();
         n.flags |= Notification.FLAG_ONLY_ALERT_ONCE;
-        nm.notify(permissionNotifId(reqId), n);
+        // 部分系统把顶部横幅做成单独开关，默认关掉。显式要求这条可以悬浮
+        n.extras.putBoolean("miui.enableFloat", true);
+        nm.notify(notifId, n);
     }
 
     /** 请求 id → 通知栏 id: 基准 + 哈希, 保证同一请求稳定占位, 不同请求互不覆盖 */
@@ -983,26 +984,18 @@ public class ServerService extends Service {
                 : NOTIF_ID_PERMISSION + (reqId.hashCode() & 0x3ff);
     }
 
-    /** 通知按钮的 PendingIntent: 转发到本服务 ACTION_PERM_REPLY 直接回复权限请求。
-     *  requestCode 由请求 id 派生, 保证不同请求的按钮 PendingIntent 互不冲突
-     *  (见 postPermissionNotification 的注释) */
-    private PendingIntent permReplyPi(String requestId, String reply, int baseCode, String reqId) {
-        return permReplyPi(requestId, reply, baseCode, reqId, null);
-    }
-
-    /** 按钮 PendingIntent 的 requestCode 分配器: 全局单调唯一。
-     *  之前用 baseCode+(hash&0x3ff) 只有 1024 个桶, 不同请求撞车后 FLAG_UPDATE_CURRENT
-     *  会互相覆盖 extras → 点 A 的批准实际批了 B。改唯一码后彻底杜绝串号
-     *  (PendingIntent 会累积几个, 量极小无妨; 同一请求重发本就该独立占位) */
+    /** 通知按钮的 requestCode。递增分配，避免不同请求的按钮互相覆盖。 */
     private static final java.util.concurrent.atomic.AtomicInteger permPiSeq =
             new java.util.concurrent.atomic.AtomicInteger(100000);
 
-    private PendingIntent permReplyPi(String requestId, String reply, int baseCode, String reqId, String directory) {
+    /** 通知按钮转到本服务直接回复。requestCode 全局递增，避免不同请求的按钮串号。 */
+    private PendingIntent permReplyPi(String requestId, String reply, String directory, String sessionId) {
         Intent i = new Intent(this, ServerService.class)
                 .setAction(ACTION_PERM_REPLY)
                 .putExtra("perm_id", requestId)
                 .putExtra("perm_reply", reply);
         if (directory != null && !directory.isEmpty()) i.putExtra("perm_dir", directory);
+        if (sessionId != null && !sessionId.isEmpty()) i.putExtra("perm_session", sessionId);
         int code = permPiSeq.getAndIncrement();
         return PendingIntent.getService(this, code, i,
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
@@ -1014,17 +1007,18 @@ public class ServerService extends Service {
      *  去重在调用方按请求 id 逐条做 (permissionNotifiedKey), 这里只负责弹横幅 */
     private void notifyPermissionFromEvent(org.json.JSONObject req) {
         try {
-            if (Build.VERSION.SDK_INT >= 33 &&
-                    checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
-                            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                return;
-            }
             ServerManager.PermissionNotice n = ServerManager.permissionNotice(req, lastSessionTitle);
             String dir = req.optString("__directory", "");
             if (dir.isEmpty()) dir = req.optString("directory", "");
             String sess = req.optString("sessionID", "");
             if (sess.isEmpty()) sess = req.optString("sessionId", "");
             if (sess.isEmpty()) sess = req.optString("session_id", "");
+            publishApproval(n.id, n.title, n.text, dir, sess);
+            if (Build.VERSION.SDK_INT >= 33 &&
+                    checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                return;
+            }
             postPermissionNotification(n.id, n.title, n.text, dir.isEmpty() ? null : dir, sess.isEmpty() ? null : sess);
             Log.i(TAG, "permission notice posted (detail=" + n.text + ", req=" + n.id
                     + (dir.isEmpty() ? "" : " dir=" + dir) + (sess.isEmpty() ? "" : " sess=" + sess) + ")");
@@ -1033,8 +1027,60 @@ public class ServerService extends Service {
         }
     }
 
+    /** 页面在前台时系统不弹顶部横幅，把同一条审批画在页面顶部。 */
+    private static void publishApproval(String id, String title, String text, String dir, String session) {
+        if (id == null || id.isEmpty()) return;
+        String t = title == null ? "" : title;
+        String body = text == null ? "" : text;
+        String d = dir == null ? "" : dir;
+        String s = session == null ? "" : session;
+        synchronized (openApprovals) {
+            openApprovals.put(id, new String[]{t, body, d, s});
+        }
+        MainActivity.ApprovalBanner banner = MainActivity.approvalBanner;
+        if (banner != null) banner.show(id, t, body, d, s);
+    }
+
+    private static void retractApproval(String id) {
+        if (id == null) return;
+        synchronized (openApprovals) { openApprovals.remove(id); }
+        MainActivity.ApprovalBanner banner = MainActivity.approvalBanner;
+        if (banner != null) banner.dismiss(id);
+    }
+
+    private static void retractAllApprovals() {
+        synchronized (openApprovals) { openApprovals.clear(); }
+        MainActivity.ApprovalBanner banner = MainActivity.approvalBanner;
+        if (banner != null) banner.dismissAll();
+    }
+
+    /** 回到页面时把还没处理的审批再画出来。调用方在主线程。 */
+    public static void replayApprovals() {
+        MainActivity.ApprovalBanner banner = MainActivity.approvalBanner;
+        if (banner == null) return;
+        String[][] rows;
+        synchronized (openApprovals) {
+            rows = new String[openApprovals.size()][];
+            int i = 0;
+            for (java.util.Map.Entry<String, String[]> e : openApprovals.entrySet()) {
+                String[] v = e.getValue();
+                rows[i++] = new String[]{e.getKey(), v[0], v[1], v[2], v[3]};
+            }
+        }
+        for (String[] r : rows) banner.show(r[0], r[1], r[2], r[3], r[4]);
+    }
+
+    private static void replayOne(String id) {
+        MainActivity.ApprovalBanner banner = MainActivity.approvalBanner;
+        if (banner == null || id == null) return;
+        String[] v;
+        synchronized (openApprovals) { v = openApprovals.get(id); }
+        if (v != null) banner.show(id, v[0], v[1], v[2], v[3]);
+    }
+
     /** 待批准请求已处理/用户回到 App: 撤掉提醒 (未点开过的还会留在通知栏, 正好当常驻提示) */
     private void clearPermissionReminder() {
+        retractAllApprovals();
         if (permissionNotifiedKey.isEmpty()) return;
         permissionNotifiedKey = "";
         try {
@@ -1045,9 +1091,8 @@ public class ServerService extends Service {
         }
     }
 
-    /** 发"AI 提问等你选"横幅通知 (SSE question.asked / 10s 轮询 GET /question 共用入口)。
-     *  提问是多选项, 通知栏按钮答不了 → 点横幅直达对应目录/会话, 进 App 里选。
-     *  去重在调用方按请求 id 逐条做 (questionNotifiedKey) */
+    /** 发"AI 提问等你选"通知。2.0 的事件是 form.created，列表是 GET /api/form。
+     *  提问是多选项，通知里答不了，点开进对应会话再选。 */
     private void notifyQuestionNeeded(org.json.JSONObject req) {
         try {
             if (Build.VERSION.SDK_INT >= 33 &&
@@ -1078,12 +1123,17 @@ public class ServerService extends Service {
                     .setContentIntent(pi)
                     .setAutoCancel(true)
                     .setTicker(n.text)
+                    .setCategory(Notification.CATEGORY_REMINDER)
                     .setPriority(Notification.PRIORITY_HIGH)
                     .setLights(0xFFFF0000, 500, 2000);
+            alertApart(b, "oc-question-" + n.id);
             NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            int notifId = questionNotifId(n.id);
+            nm.cancel(notifId);
             Notification n2 = b.build();
             n2.flags |= Notification.FLAG_ONLY_ALERT_ONCE;
-            nm.notify(questionNotifId(n.id), n2);
+            n2.extras.putBoolean("miui.enableFloat", true);
+            nm.notify(notifId, n2);
             Log.i(TAG, "question notice posted (detail=" + n.text + ", req=" + n.id
                     + (dir.isEmpty() ? "" : " dir=" + dir) + ")");
         } catch (Exception e) {
@@ -1119,6 +1169,8 @@ public class ServerService extends Service {
         // 清理换 ID 前遗留的老渠道 (opencode_task, DEFAULT 级): 不删的话设置里会出现
         // 两个同名"任务提醒", 且老渠道的横幅/声音行为无法升级, 留着只会误导
         nm.deleteNotificationChannel("opencode_task");
+        // 旧渠道没有声音，系统把它和前台通知收成一组后不再弹横幅。换新 id 才能带上声音
+        nm.deleteNotificationChannel("opencode_permission");
         // 完成提醒: HIGH = 亮屏时顶部横幅 (微信式) + 声音震动, 不再只在状态栏留一条
         makeAlertChannel(nm, TASK_CHANNEL_ID, "任务提醒",
                 "AI 回复完成/失败时提醒", new long[]{0, 300, 200, 300});
@@ -1138,6 +1190,19 @@ public class ServerService extends Service {
         ch.enableVibration(true);
         ch.setVibrationPattern(vibrate);
         ch.setLockscreenVisibility(Notification.VISIBILITY_PRIVATE);
+        ch.setSound(android.provider.Settings.System.DEFAULT_NOTIFICATION_URI,
+                new android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build());
         nm.createNotificationChannel(ch);
+    }
+
+    /** 单独成组，避免被前台服务的常驻通知吸进自动分组后横幅消失 */
+    private static void alertApart(Notification.Builder b, String group) {
+        b.setGroup(group);
+        if (Build.VERSION.SDK_INT >= 26) {
+            b.setGroupAlertBehavior(Notification.GROUP_ALERT_ALL);
+        }
     }
 }
